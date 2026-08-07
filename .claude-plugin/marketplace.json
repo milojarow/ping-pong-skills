@@ -1,0 +1,25 @@
+{
+  "name": "ping-pong-skills",
+  "description": "An isolated two-party message channel between agent sessions — open a channel, hand over the id, and two sessions on different machines talk directly.",
+  "owner": {
+    "name": "milojarow",
+    "url": "https://github.com/milojarow"
+  },
+  "plugins": [
+    {
+      "name": "ping-pong-skills",
+      "source": "./",
+      "description": "Direct session-to-session messaging over a shared bus host. Each channel is isolated, so several agent pairs can work in parallel without crosstalk.",
+      "version": "0.1.0",
+      "author": {
+        "name": "milojarow",
+        "url": "https://github.com/milojarow"
+      },
+      "category": "workflow",
+      "keywords": ["ping-pong", "ipc", "fifo", "multi-agent", "ssh", "channel"],
+      "homepage": "https://github.com/milojarow/ping-pong-skills",
+      "repository": "https://github.com/milojarow/ping-pong-skills",
+      "license": "MIT"
+    }
+  ]
+}

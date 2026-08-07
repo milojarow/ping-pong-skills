@@ -1,0 +1,16 @@
+{
+  "id": "ping-pong-005",
+  "skills": ["ping-pong"],
+  "query": "El operador me pasa esto y ya: /ping-pong pp-k7m2qx . Que hago exactamente, y en que orden?",
+  "expected_behavior": [
+    "activate the ping-pong skill",
+    "recognize that an id argument means the JOINER role",
+    "run pp --join with the id",
+    "start pp --listen as a BACKGROUND command, not in the foreground",
+    "send a greeting so the peer knows this side is up",
+    "then stop and wait for the harness to wake the session"
+  ],
+  "expected_content": ["--join", "--listen", "background", "--send", "lado b"],
+  "priority": "high",
+  "notes": "The whole joiner recipe from a bare invocation. Guards against running --listen in the foreground, which freezes the turn."
+}

@@ -1,0 +1,14 @@
+{
+  "id": "ping-pong-004",
+  "skills": ["ping-pong"],
+  "query": "Le quiero mandar un mensaje a la otra sesion pero todavia no la arranca el operador. Lo mando de una para que le llegue cuando abra, verdad?",
+  "expected_behavior": [
+    "activate the ping-pong skill",
+    "state clearly that there is NO queue: a message sent with nobody listening is not stored",
+    "explain that --send refuses up front (in about two seconds) instead of hanging",
+    "give the correct sequence: peer starts their listener first, then send"
+  ],
+  "expected_content": ["no hay cola", "no se guarda", "--listen", "--send", "protocol.md"],
+  "priority": "high",
+  "notes": "Prevents an agent from assuming store-and-forward semantics and reporting a message as delivered when it was refused."
+}

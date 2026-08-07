@@ -1,0 +1,13 @@
+{
+  "name": "ping-pong-skills",
+  "version": "0.1.0",
+  "description": "Direct session-to-session messaging over a shared bus host. Each channel is isolated, so several agent pairs can work in parallel without crosstalk.",
+  "author": {
+    "name": "milojarow",
+    "url": "https://github.com/milojarow"
+  },
+  "license": "MIT",
+  "keywords": ["ping-pong", "ipc", "fifo", "multi-agent", "ssh", "channel"],
+  "repository": "https://github.com/milojarow/ping-pong-skills",
+  "homepage": "https://github.com/milojarow/ping-pong-skills"
+}

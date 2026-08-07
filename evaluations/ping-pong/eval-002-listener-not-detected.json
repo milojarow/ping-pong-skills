@@ -1,0 +1,14 @@
+{
+  "id": "ping-pong-002",
+  "skills": ["ping-pong"],
+  "query": "pp --info dice 'lado b: sin listener' pero yo veo el proceso cat corriendo en la otra maquina. Ya intente con fuser y lsof sobre el FIFO y tampoco muestran nada. Esta roto el canal?",
+  "expected_behavior": [
+    "activate the ping-pong skill",
+    "explain that a process blocked in open(2) on a FIFO holds no file descriptor yet, so fuser/lsof cannot see it",
+    "state that listener presence is recorded with an explicit marker file, not probed",
+    "mention the stale-marker case and --force as the escape hatch"
+  ],
+  "expected_content": ["open(2)", "file descriptor", "listening-", "marker", "--force", "troubleshooting.md"],
+  "priority": "high",
+  "notes": "The non-obvious kernel behavior that made the first implementation report false negatives."
+}

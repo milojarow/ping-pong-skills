@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# pp - ping-pong: an isolated two-party message channel between agent sessions.
+#
+# Two sessions (possibly on different machines) meet on a shared "bus" host and
+# exchange messages through a private pair of FIFOs. Every channel is isolated:
+# two channels never see each other's traffic.
+#
+# Operations are flags. The bare argument is ALWAYS the channel id.
+
+set -uo pipefail
+
+PP_VERSION="0.1.0"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ping-pong"
+BUS_ROOT="${PP_BUS_ROOT:-/tmp/ping-pong}"
+SEND_TIMEOUT="${PP_SEND_TIMEOUT:-60}"
+
+bus_mode=""
+bus_ssh=""
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+die() { printf 'pp: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+
+# ---------------------------------------------------------------- bus plumbing
+
+need_config() {
+  case "$bus_mode" in
+    local) : ;;
+    ssh) [ -n "$bus_ssh" ] || die "bus_mode=ssh pero bus_ssh esta vacio en $CONFIG_FILE" ;;
+    *) die "sin configurar. En la maquina que ALOJA el bus:  pp --setup --bus-local
+                        En la otra maquina:                pp --setup --bus-ssh <alias-ssh>" ;;
+  esac
+}
+
+# bus <snippet>  - short remote/local command, stdin and stdout are forwarded
+bus() {
+  case "$bus_mode" in
+    local) bash -c "$1" ;;
+    ssh) ssh -o BatchMode=yes -o ConnectTimeout=10 "$bus_ssh" "$1" ;;
+  esac
+}
+
+# bus_stream <snippet> - same, but for calls that block for a long time
+bus_stream() {
+  case "$bus_mode" in
+    local) bash -c "$1" ;;
+    ssh) ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=1000 \
+             "$bus_ssh" "$1" ;;
+  esac
+}
+
+bus_label() {
+  case "$bus_mode" in
+    local) printf 'local' ;;
+    ssh) printf 'ssh:%s' "$bus_ssh" ;;
+  esac
+}
+
+# ------------------------------------------------------------------- utilities
+
+gen_id() {
+  local raw
+  raw=$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'abcdefghijkmnpqrstuvwxyz23456789' | cut -c1-6)
+  [ ${#raw} -eq 6 ] || die "no pude generar un id aleatorio"
+  printf 'pp-%s' "$raw"
+}
+
+valid_id() { [[ "${1:-}" =~ ^pp-[a-z0-9]{4,16}$ ]]; }
+
+sanitize() { printf '%s' "${1:-}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | cut -c1-32; }
+
+default_label() { sanitize "${PP_LABEL:-$(hostname -s 2>/dev/null || echo agent)}"; }
+
+side_file() { printf '%s/%s.side' "$STATE_DIR" "$1"; }
+
+my_side() {
+  local id="$1"
+  if [ -n "${PP_SIDE:-}" ]; then printf '%s' "$PP_SIDE"; return 0; fi
+  local f; f=$(side_file "$id")
+  [ -r "$f" ] || die "el canal $id no esta registrado en esta maquina.
+    Si tu abriste el canal, estas en la maquina equivocada.
+    Si te lo compartieron, unete primero:  pp --join $id"
+  tr -d '[:space:]' < "$f"
+}
+
+other_side() { [ "$1" = "a" ] && printf 'b' || printf 'a'; }
+
+require_channel() {
+  local id="$1"
+  bus "test -p '$BUS_ROOT/$id/to-a' && test -p '$BUS_ROOT/$id/to-b'" \
+    || die "el canal $id no existe en el bus ($(bus_label)).
+    Verifica el id, o el bus se reinicio (los canales viven en $BUS_ROOT y no sobreviven un reboot).
+    Canales abiertos:  pp --list"
+}
+
+# ------------------------------------------------------------------- commands
+
+cmd_setup() {
+  mkdir -p "$CONFIG_DIR"
+  case "${1:-}" in
+    --bus-local)
+      printf 'bus_mode=local\nbus_ssh=\n' > "$CONFIG_FILE"
+      say "pp: esta maquina ES el bus. Config en $CONFIG_FILE"
+      ;;
+    --bus-ssh)
+      local alias="${2:-}"
+      [ -n "$alias" ] || die "--bus-ssh necesita el alias ssh del host bus"
+      printf 'bus_mode=ssh\nbus_ssh=%s\n' "$alias" > "$CONFIG_FILE"
+      say "pp: el bus es '$alias' via ssh. Config en $CONFIG_FILE"
+      ssh -o BatchMode=yes -o ConnectTimeout=10 "$alias" 'command -v mkfifo >/dev/null' \
+        && say "pp: conectividad al bus OK" \
+        || say "pp: AVISO - no pude conectar a '$alias' o le falta mkfifo"
+      ;;
+    *) die "uso: pp --setup --bus-local | pp --setup --bus-ssh <alias-ssh>" ;;
+  esac
+}
+
+cmd_open() {
+  local topic="$1" label="$2"
+  need_config
+  local id; id=$(gen_id)
+  local created; created=$(date -u +%FT%TZ)
+
+  printf 'id=%s\ncreated=%s\nside_a=%s\nside_b=\ntopic=%s\n' \
+    "$id" "$created" "$label" "$topic" |
+  bus "set -e
+    umask 077
+    mkdir -p '$BUS_ROOT'
+    if [ ! -O '$BUS_ROOT' ]; then echo 'pp: $BUS_ROOT existe pero no es tuyo' >&2; exit 3; fi
+    chmod 700 '$BUS_ROOT'
+    mkdir -m 700 '$BUS_ROOT/$id'
+    mkfifo -m 600 '$BUS_ROOT/$id/to-a' '$BUS_ROOT/$id/to-b'
+    cat > '$BUS_ROOT/$id/meta'" || die "no pude crear el canal en el bus ($(bus_label))"
+
+  mkdir -p "$STATE_DIR"
+  printf 'a\n' > "$(side_file "$id")"
+
+  say "Canal abierto: $id"
+  say "  bus:   $(bus_label):$BUS_ROOT/$id"
+  say "  yo:    lado a  (label: $label)"
+  [ -n "$topic" ] && say "  tema:  $topic"
+  say ""
+  say "Pasale ESTA linea a la otra sesion:"
+  say "    /ping-pong $id"
+  say ""
+  say "Luego deja tu listener corriendo EN BACKGROUND:"
+  say "    pp --listen $id"
+}
+
+cmd_join() {
+  local id="$1" label="$2"
+  need_config
+  valid_id "$id" || die "id invalido: '$id' (formato esperado: pp-xxxxxx)"
+  require_channel "$id"
+
+  bus "set -e
+    sed -i 's/^side_b=.*/side_b=$label/' '$BUS_ROOT/$id/meta' 2>/dev/null || true" >/dev/null
+
+  mkdir -p "$STATE_DIR"
+  printf 'b\n' > "$(side_file "$id")"
+
+  say "Unido al canal: $id"
+  say "  bus:   $(bus_label):$BUS_ROOT/$id"
+  say "  yo:    lado b  (label: $label)"
+  local topic
+  topic=$(bus "sed -n 's/^topic=//p' '$BUS_ROOT/$id/meta' 2>/dev/null")
+  [ -n "$topic" ] && say "  tema:  $topic"
+  say ""
+  say "Deja tu listener corriendo EN BACKGROUND:"
+  say "    pp --listen $id"
+}
+
+# Un lector bloqueado en open(2) de un FIFO todavia NO tiene descriptor abierto,
+# asi que fuser/lsof no lo ven. El listener deja un marcador explicito y lo borra
+# al salir; es la unica senal confiable de "hay alguien escuchando".
+cmd_listen() {
+  local id="$1" wait_for="$2" label="$3"
+  need_config
+  valid_id "$id" || die "id invalido: '$id'"
+  local side; side=$(my_side "$id")
+  require_channel "$id"
+
+  local reader="cat '$BUS_ROOT/$id/to-$side'"
+  [ "$wait_for" -gt 0 ] 2>/dev/null && reader="timeout $wait_for $reader"
+
+  bus_stream "m='$BUS_ROOT/$id/listening-$side'
+    printf '%s pid=%s desde=%s\n' '$label' \"\$\$\" \"\$(date -u +%FT%TZ)\" > \"\$m\"
+    trap 'rm -f \"\$m\"' EXIT INT TERM HUP
+    $reader"
+  local rc=$?
+
+  if [ $rc -eq 124 ]; then
+    say "pp: nadie escribio en $wait_for s (el canal $id sigue abierto)"
+    exit 124
+  fi
+  return $rc
+}
+
+cmd_send() {
+  local id="$1" body="$2" label="$3" force="$4"
+  need_config
+  valid_id "$id" || die "id invalido: '$id'"
+  local side; side=$(my_side "$id")
+  local out; out=$(other_side "$side")
+  require_channel "$id"
+
+  if [ "$force" != "1" ]; then
+    bus "test -f '$BUS_ROOT/$id/listening-$out'" || die "el lado $out del canal $id no tiene listener.
+    Un envio sin lector se queda colgado hasta el timeout, asi que no lo intento.
+    Pidele a la otra sesion que corra:  pp --listen $id
+    Si sabes que si esta escuchando (marcador viejo), reintenta con:  pp --send $id --force -m ..."
+  fi
+
+  { printf '=== ping-pong %s | de: %s (lado %s) | %s ===\n' \
+      "$id" "$label" "$side" "$(date -u +%FT%TZ)"
+    printf '%s\n' "$body"
+  } | bus_stream "timeout $SEND_TIMEOUT cat > '$BUS_ROOT/$id/to-$out'"
+  local rc=$?
+
+  if [ $rc -eq 124 ]; then
+    die "nadie esta escuchando del otro lado del canal $id (timeout ${SEND_TIMEOUT}s).
+    El mensaje NO se entrego y NO se guardo.
+    Pidele a la otra sesion que corra:  pp --listen $id
+    y vuelve a mandarlo."
+  fi
+  [ $rc -eq 0 ] || die "el envio fallo (rc=$rc) contra el bus ($(bus_label))"
+  say "pp: entregado a lado $out del canal $id"
+}
+
+cmd_list() {
+  need_config
+  local out
+  out=$(bus "for d in '$BUS_ROOT'/pp-*; do
+      [ -d \"\$d\" ] || continue
+      id=\$(basename \"\$d\")
+      topic=\$(sed -n 's/^topic=//p' \"\$d/meta\" 2>/dev/null)
+      a=\$(sed -n 's/^side_a=//p' \"\$d/meta\" 2>/dev/null)
+      b=\$(sed -n 's/^side_b=//p' \"\$d/meta\" 2>/dev/null)
+      created=\$(sed -n 's/^created=//p' \"\$d/meta\" 2>/dev/null)
+      printf '%s\t%s <-> %s\t%s\t%s\n' \"\$id\" \"\${a:-?}\" \"\${b:--}\" \"\$created\" \"\$topic\"
+    done" 2>/dev/null)
+
+  if [ -z "$out" ]; then
+    say "pp: no hay canales abiertos en el bus ($(bus_label):$BUS_ROOT)"
+    return 0
+  fi
+  say "Canales abiertos en $(bus_label):$BUS_ROOT"
+  printf '%s\n' "$out" | while IFS=$'\t' read -r id sides created topic; do
+    local mine=""
+    [ -r "$(side_file "$id")" ] && mine=" (yo: lado $(tr -d '[:space:]' < "$(side_file "$id")"))"
+    printf '  %-12s %-24s %s%s\n' "$id" "$sides" "$created" "$mine"
+    [ -n "$topic" ] && printf '  %-12s tema: %s\n' "" "$topic"
+  done
+}
+
+cmd_info() {
+  local id="$1"
+  need_config
+  valid_id "$id" || die "id invalido: '$id'"
+  require_channel "$id"
+  say "Canal $id  en $(bus_label):$BUS_ROOT/$id"
+  bus "cat '$BUS_ROOT/$id/meta' 2>/dev/null" | sed 's/^/  /'
+  local f; f=$(side_file "$id")
+  if [ -r "$f" ]; then
+    say "  yo soy lado $(tr -d '[:space:]' < "$f") en esta maquina"
+  else
+    say "  esta maquina NO esta registrada en el canal (corre: pp --join $id)"
+  fi
+  local waiting
+  waiting=$(bus "for s in a b; do
+      m='$BUS_ROOT/$id/listening-'\$s
+      if [ -f \"\$m\" ]; then echo \"lado \$s: ESCUCHANDO (\$(cat \"\$m\"))\"; else echo \"lado \$s: sin listener\"; fi
+    done" 2>/dev/null)
+  [ -n "$waiting" ] && printf '%s\n' "$waiting" | sed 's/^/  /'
+}
+
+cmd_close() {
+  local id="$1"
+  need_config
+  valid_id "$id" || die "id invalido: '$id'"
+  bus "rm -rf '$BUS_ROOT/$id'" || die "no pude borrar el canal en el bus"
+  rm -f "$(side_file "$id")"
+  say "pp: canal $id cerrado y borrado del bus"
+}
+
+cmd_install() {
+  local dest="$HOME/.local/bin/pp"
+  mkdir -p "$HOME/.local/bin"
+  cp -f "${BASH_SOURCE[0]}" "$dest" && chmod +x "$dest" \
+    && say "pp: instalado en $dest (v$PP_VERSION). Reinstala tras cada update del plugin." \
+    || die "no pude copiar a $dest"
+}
+
+usage() {
+  cat <<'EOF'
+pp - ping-pong: canal de mensajes aislado entre dos sesiones de agente.
+
+  Las operaciones son FLAGS. El argumento pelon es SIEMPRE el channel id.
+
+  pp --setup --bus-local          esta maquina aloja el bus
+  pp --setup --bus-ssh <alias>    el bus esta en <alias>, alcanzable por ssh
+
+  pp --open [--topic "..."]       abre un canal, imprime el id a compartir
+  pp --join <id>                  se une a un canal existente
+  pp --listen <id> [--wait N]     BLOQUEA hasta recibir UN mensaje, lo imprime y sale
+  pp --send <id> -m "texto"       manda un mensaje (o por stdin, sin -m)
+  pp --list                       canales abiertos en el bus
+  pp --info <id>                  metadata del canal y quien esta escuchando
+  pp --close <id>                 cierra y borra el canal
+
+  --as <label>    etiqueta con la que firmas tus mensajes (default: hostname)
+  --force         manda aunque no se detecte listener del otro lado
+  --wait N        con --listen: rindete tras N segundos (sale 124)
+  --install       copia este script a ~/.local/bin/pp
+  -h, --help      esta ayuda
+  -V, --version   version
+
+  Variables: PP_BUS_ROOT (default /tmp/ping-pong), PP_SEND_TIMEOUT (60),
+             PP_LABEL, PP_SIDE (fuerza el lado a|b, para probar en una sola maquina).
+
+  REGLA DE ORO: tras recibir un mensaje, relanza --listen ANTES de contestar.
+EOF
+}
+
+# ---------------------------------------------------------------------- parser
+
+op="" id="" topic="" body="" label="" wait_for=0 force=0
+setup_args=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|--open) op="open" ;;
+    -j|--join) op="join" ;;
+    -L|--listen) op="listen" ;;
+    -s|--send) op="send" ;;
+    -l|--list) op="list" ;;
+    -i|--info) op="info" ;;
+    -c|--close) op="close" ;;
+    --setup) op="setup" ;;
+    --install) op="install" ;;
+    --bus-local|--bus-ssh) setup_args+=("$1") ;;
+    -t|--topic) shift; topic="${1:-}" ;;
+    -m|--message) shift; body="${1:-}" ;;
+    -a|--as) shift; label="$(sanitize "${1:-}")" ;;
+    -w|--wait) shift; wait_for="${1:-0}" ;;
+    -f|--force) force=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -V|--version) say "pp $PP_VERSION"; exit 0 ;;
+    -*) die "flag desconocida: $1  (pp --help)" ;;
+    *) if [ -z "$id" ]; then id="$1"; else setup_args+=("$1"); fi ;;
+  esac
+  shift
+done
+
+[ -n "$label" ] || label=$(default_label)
+
+case "$op" in
+  setup) cmd_setup "${setup_args[@]:-}" "${id:-}" ;;
+  install) cmd_install ;;
+  open) cmd_open "$topic" "$label" ;;
+  join) [ -n "$id" ] || die "--join necesita el channel id"; cmd_join "$id" "$label" ;;
+  listen) [ -n "$id" ] || die "--listen necesita el channel id"; cmd_listen "$id" "$wait_for" "$label" ;;
+  send)
+    [ -n "$id" ] || die "--send necesita el channel id"
+    if [ -z "$body" ]; then
+      [ -t 0 ] && die "--send sin -m necesita el mensaje por stdin"
+      body=$(cat)
+    fi
+    cmd_send "$id" "$body" "$label" "$force"
+    ;;
+  list) cmd_list ;;
+  info) [ -n "$id" ] || die "--info necesita el channel id"; cmd_info "$id" ;;
+  close) [ -n "$id" ] || die "--close necesita el channel id"; cmd_close "$id" ;;
+  "") usage; exit 1 ;;
+  *) die "operacion no implementada: $op" ;;
+esac
