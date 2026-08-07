@@ -277,13 +277,22 @@ cmd_info() {
   [ -n "$waiting" ] && printf '%s\n' "$waiting" | sed 's/^/  /'
 }
 
+# Borrar el FIFO NO despierta a un lector ya bloqueado en open(2): el open
+# pendiente mantiene vivo el inodo. Por eso, antes de borrar, se le escribe un
+# aviso de cierre a cada lado que tenga listener, para que salga limpio.
 cmd_close() {
   local id="$1"
   need_config
   valid_id "$id" || die "id invalido: '$id'"
-  bus "rm -rf '$BUS_ROOT/$id'" || die "no pude borrar el canal en el bus"
+  bus "for s in a b; do
+      if [ -f '$BUS_ROOT/$id/listening-'\$s ]; then
+        printf '=== ping-pong %s | el otro lado CERRO el canal ===\n' '$id' |
+          timeout 5 cat > '$BUS_ROOT/$id/to-'\$s 2>/dev/null || true
+      fi
+    done
+    rm -rf '$BUS_ROOT/$id'" || die "no pude borrar el canal en el bus"
   rm -f "$(side_file "$id")"
-  say "pp: canal $id cerrado y borrado del bus"
+  say "pp: canal $id cerrado y borrado del bus (se aviso a los listeners activos)"
 }
 
 cmd_install() {

@@ -54,4 +54,15 @@ pp --list                  # what is open
 pp --close pp-k7m2qx       # remove one channel from the bus
 ```
 
-A dead channel with a listener still attached: closing it makes the listener's `cat` fail and exit, which resolves the blocked background task.
+### Releasing a listener that is stuck on a dead channel
+
+Deleting a FIFO does **not** wake a reader already blocked in `open(2)` — the pending open keeps the inode alive, so the reader waits forever on a path that no longer resolves. Measured, not assumed: a plain `rm -rf` of the channel directory left the listener process alive and blocked.
+
+That is why `pp --close` writes a "channel closed" notice into every side that has a listener marker **before** deleting the directory. The listener receives it, prints it, and exits cleanly.
+
+Two cases `--close` cannot rescue, because there is no marker to find them by:
+
+- a listener started with a raw `cat` instead of `pp --listen`;
+- a listener whose channel directory was deleted by something other than `pp --close` (a `/tmp` cleaner, a manual `rm`).
+
+Both have to be killed by pid. Match on the process, never with `pkill -f <pattern>` — `-f` matches every command line including the shell running your own kill command, so a self-matching pattern kills your own session.
