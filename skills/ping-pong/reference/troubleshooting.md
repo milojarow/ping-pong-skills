@@ -15,8 +15,8 @@ Confirm with `pp --info <id>`, and if you know the peer is really there, `pp --s
 
 Check them in this order:
 
-1. **Are you on the right side?** `pp --info <id>` prints "yo soy lado a/b". Both sides listening on the *same* FIFO would each wait forever. This is impossible through `pp` (side is recorded at open/join) but possible if `PP_SIDE` was set by hand.
-2. **Did the peer's send actually succeed?** It prints `entregado a lado <x>`. Without that line, nothing was written.
+1. **Are you on the right side?** `pp --info <id>` prints `this machine is side a` (or `b`). Both sides listening on the *same* FIFO would each wait forever. This is impossible through `pp` (side is recorded at open/join) but possible if `PP_SIDE` was set by hand.
+2. **Did the peer's send actually succeed?** It prints `delivered to side <x> of channel <id>`. Without that line, nothing was written.
 3. **Is the ssh still up?** A listener is a long-lived ssh. It runs with keepalives, but a laptop suspend or a network change can still drop it. The task exits non-zero rather than hanging — check the exit status, not just the empty output.
 
 ## `--listen` returned instantly with no message
@@ -27,11 +27,21 @@ The channel does not exist on the bus. Almost always: the **bus host rebooted** 
 
 You ran a channel command on a machine that never opened or joined it. The side is local state, not something derivable from the id. Run `pp --join <id>` there first. If you *did* join, check you are on the machine you think you are.
 
-## `--info` says "sin listener" while a listener is clearly running
+## `--info` says "no listener" while a listener is clearly running
 
-Fixed in the current version, but worth knowing why, because the intuitive check is wrong: **a process blocked in `open(2)` on a FIFO holds no file descriptor yet.** The open has not returned, so nothing appears in `/proc/<pid>/fd` — `fuser` and `lsof` both report the FIFO as unused. Listener presence therefore cannot be probed from the kernel's fd tables; it has to be recorded explicitly. `pp --listen` writes a `listening-<side>` marker before it blocks and removes it via an EXIT trap.
+The intuitive check is the wrong one: **a process blocked in `open(2)` on a FIFO holds no file descriptor yet.** The open has not returned, so nothing appears in `/proc/<pid>/fd` — `fuser` and `lsof` both report the FIFO as unused, no matter how many readers are waiting on it.
 
 Generalize it: **the absence of an fd is not the absence of a waiter.**
+
+So listener presence cannot be probed from the kernel at all; it has to be recorded. Since v0.1.0, `pp --listen` writes a `listening-<side>` marker before it blocks and removes it with an EXIT trap, and `--info` reports that marker — never `fuser`. If your `pp --version` is older, the reported state is meaningless.
+
+Given that, "I can see a `cat` running" distinguishes nothing on its own — `pp --listen`'s reader *is* a `cat`. To tell a `pp` listener from a bare one, look at the marker, not the process:
+
+```bash
+pp --info <id>       # the authority: marker present or not
+```
+
+A reader with no marker is a raw `cat` (or a listener from an older build). Reach for `--send --force` there, and prefer switching that side to `pp --listen` so the state stays visible.
 
 ## Messages appear in the wrong conversation
 

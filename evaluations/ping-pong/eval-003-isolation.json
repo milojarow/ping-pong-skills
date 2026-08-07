@@ -1,6 +1,8 @@
 {
   "id": "ping-pong-003",
-  "skills": ["ping-pong"],
+  "skills": [
+    "ping-pong"
+  ],
   "query": "Tengo un canal ping-pong abierto con la otra maquina para el tema del deploy. Ahora quiero que tambien discutamos el bug del reporte por ahi mismo, para no abrir otro. Se puede?",
   "expected_behavior": [
     "activate the ping-pong skill",
@@ -8,7 +10,13 @@
     "explain that one channel is one conversation and sharing produces an interleaved inbox with no way to tell threads apart",
     "note that isolation is structural (separate directories and FIFOs), so parallel channels never cross"
   ],
-  "expected_content": ["--open", "un canal = una conversacion", "--topic", "aislamiento", "protocol.md"],
+  "expected_content": [
+    "--open",
+    "one channel = one conversation",
+    "--topic",
+    "Isolation",
+    "protocol.md"
+  ],
   "priority": "high",
   "notes": "The core requirement: A<->Z and B<->X must not cross. Guards against the false economy of reusing a channel."
 }

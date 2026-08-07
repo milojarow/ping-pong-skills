@@ -29,14 +29,16 @@ The mechanism that makes this work in an agent harness: **a blocking read is the
 
 ## First: resolve the CLI
 
-The `pp` CLI ships next to this file. Resolve it once per session and reuse the variable:
+The `pp` CLI ships inside this skill's own directory, at `bin/pp`. When this skill loaded, the harness printed its base directory — that path plus `/bin/pp` is the CLI. Resolve it once per session into a variable and reuse it:
 
 ```bash
-PP="<this skill's base directory>/bin/pp"    # .../skills/ping-pong/bin/pp
-"$PP" --help
+PP="/absolute/path/announced/for/this/skill/bin/pp"
+"$PP" --version        # confirms you resolved it
 ```
 
-One-time per machine, if `pp --list` complains about configuration — see [reference/pp-cli.md](reference/pp-cli.md#setup):
+Never hardcode a plugin-cache path: it contains the version number and breaks on the next update. The announced base directory is always current.
+
+One-time per machine, if any command says "not configured yet" — see [reference/pp-cli.md](reference/pp-cli.md#setup):
 
 ```bash
 "$PP" --setup --bus-local          # on the machine that HOSTS the bus
@@ -59,6 +61,12 @@ One-time per machine, if `pp --list` complains about configuration — see [refe
 3. Send a greeting so the peer knows you're on: `"$PP" --send <id> -m "<greeting + what you're working on>"`
 4. Stop and wait.
 
+## Reading what arrived
+
+`--listen` prints the message on stdout and exits. Run as a background command, that means: **the background task's output IS the message.** When the harness notifies you the listen task finished, read that task's output — first line is the header (`=== ping-pong <id> | from: <label> (side x) | <UTC> ===`), the rest is the body. The header is how you tell which channel woke you when you hold more than one.
+
+An empty output with a non-zero exit is not a message: the channel was closed or the connection dropped. See [reference/troubleshooting.md](reference/troubleshooting.md).
+
 ## The turn contract
 
 Every time you are woken by a message, produce these three things **in this order**:
@@ -68,6 +76,21 @@ Every time you are woken by a message, produce these three things **in this orde
 3. **Then reply** — `"$PP" --send <id> -m "..."`, and tell the operator what was exchanged.
 
 Listener up, then work, then reply. That ordering is what keeps both sides race-free: at any moment exactly one side is thinking and the other is listening. Details and the failure shapes in [reference/protocol.md](reference/protocol.md).
+
+**If you already broke the order** — you did the work with your listener down — relaunch the listener now, then send. Anything the peer tried to send during that window was *refused at their end*, not queued for you, so ask them to resend rather than waiting for it.
+
+## Several channels at once
+
+Channels are isolated by construction — separate directories, separate pipes — so nothing special is needed for two *pairs* of sessions to work in parallel: each pair opens its own channel and neither can see the other's traffic.
+
+A single session can also hold more than one channel. What that costs you:
+
+- **One background listener per channel.** They are independent; one firing does not disturb the others.
+- **Route by the header.** The `=== ping-pong <id> ... ===` line names the channel the message came from.
+- **The turn contract applies per channel.** Relaunch the listener for *that* channel before replying on it; leave the others alone.
+- **To bring a peer into a second channel**, open it and send the new id over the channel you already share — or hand it to the operator to paste. The peer runs `--join` on it and starts a second listener.
+
+Keep one topic per channel. Two topics in one channel produce an interleaved inbox that neither side can untangle.
 
 ## Quick reference
 
@@ -94,5 +117,9 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Sending to a side with no listener | Refused in ~2 s with instructions (it does not hang) | Ask the peer to start their listener, then resend |
 | Reusing one channel for two topics | Both conversations interleave in one inbox | One channel per topic — open a second one |
 | Assuming a channel survives a bus reboot | Channels live in a temp dir and are wiped | Open a fresh channel; ids are cheap |
+| Reaching for `--force` when the peer simply isn't up yet | It skips the check and blocks for the full send timeout, then fails — the turn stalls for a minute | `--force` is only for a peer you *know* is reading without `pp`. Otherwise wait for their listener |
+| Inventing a `--as` label per message | The peer sees a different author each time and cannot tell who it is talking to | Pick one short, stable label for the whole channel — the machine or the role, not the task |
+
+**"No listener" has two different causes — do not treat them as one.** If `--send` refuses, the ordinary cause is that the peer has not started their listener: ask them to, then resend. But if you can *see* their reader running and `--info` still says no listener, that is a different problem with a non-obvious cause — start at [reference/troubleshooting.md](reference/troubleshooting.md), not with `--force`.
 
 More failure shapes, with the underlying cause of each: [reference/troubleshooting.md](reference/troubleshooting.md).

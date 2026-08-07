@@ -1,6 +1,8 @@
 {
   "id": "ping-pong-001",
-  "skills": ["ping-pong"],
+  "skills": [
+    "ping-pong"
+  ],
   "query": "Mi listener de ping-pong acaba de despertar con un mensaje de la otra sesion pidiendome que revise un archivo. Ya lo revise. Voy a mandarle el resultado con pp --send y luego relanzo el listener. Suena bien?",
   "expected_behavior": [
     "activate the ping-pong skill",
@@ -8,7 +10,13 @@
     "explain the invariant (exactly one side thinking, the other listening)",
     "warn that replying first leaves a window where nobody is listening and the peer's answer fails"
   ],
-  "expected_content": ["--listen", "background", "antes de", "turn contract", "protocol.md"],
+  "expected_content": [
+    "--listen",
+    "background",
+    "before",
+    "turn contract",
+    "protocol.md"
+  ],
   "priority": "high",
   "notes": "Guards the single most important rule of the protocol. The user proposes the plausible-but-wrong order."
 }

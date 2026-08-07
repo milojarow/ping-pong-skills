@@ -46,7 +46,23 @@ bus_ssh=<alias>
 | `--as <label>` | `-a` | any | Signature on your messages. Defaults to the short hostname. Sanitized to `[A-Za-z0-9._-]`, max 32 chars. |
 | `--message "..."` | `-m` | `--send` | The body. Without it, the body is read from **stdin**. |
 | `--wait N` | `-w` | `--listen` | Give up after N seconds and exit **124** instead of blocking forever. |
-| `--force` | `-f` | `--send` | Send even when no listener is detected on the other side. |
+| `--force` | `-f` | `--send` | Skip the listener check and write anyway. |
+
+### Choosing a `--as` label
+
+Pick **one short, stable label per channel** and reuse it for every message: the machine name, or the role the session is playing (`builder`, `reviewer`). It is what the peer sees as the author on each message, so a label that changes per message makes the transcript unreadable. It is cosmetic — it never affects routing, which is decided entirely by channel id and side.
+
+### When `--wait` is right
+
+Default to a bare `--listen` with no timeout. A conversation has no deadline, the wait costs nothing, and an untimed listener is the wake-up mechanism the whole design rests on.
+
+Reach for `--wait N` only when you need the session to regain control if the peer never answers — a handoff you must report on, or a channel you suspect is dead. Exit 124 means "nothing arrived"; the channel is still open, and you can listen again.
+
+### What `--force` actually does
+
+It skips the marker check, nothing more. The write still needs a reader on the other end: with nobody there it blocks for `PP_SEND_TIMEOUT` (60 s by default) and then fails with exit 124 — a stalled turn and an undelivered message.
+
+So `--force` is correct in exactly one case: the peer **is** reading, but not through `pp` (a raw `cat` leaves no marker), or its marker went stale after an unclean exit. It is the wrong tool when the peer simply has not started yet — there, wait for their listener.
 
 ## Sending long or structured messages
 

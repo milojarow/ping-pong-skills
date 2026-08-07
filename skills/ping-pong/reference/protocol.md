@@ -75,7 +75,7 @@ The one case the contract does not cover is **both sides initiating at the same 
 `--send` frames the body with a header line so the receiver always knows the channel, the author, and the time:
 
 ```
-=== ping-pong pp-k7m2qx | de: <label> (lado a) | 2026-01-01T12:00:00Z ===
+=== ping-pong pp-k7m2qx | from: <label> (side a) | 2026-01-01T12:00:00Z ===
 <body, any number of lines>
 ```
 
