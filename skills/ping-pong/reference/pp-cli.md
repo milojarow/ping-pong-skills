@@ -33,6 +33,8 @@ bus_ssh=<alias>
 | `--list` | `-l` | — | Open channels on the bus, with topic and which side you are. |
 | `--info` | `-i` | channel id | Channel metadata plus who currently has a listener up. |
 | `--close` | `-c` | channel id | Removes the channel from the bus and forgets it locally. |
+| `--gc` | `-g` | — | Reaps orphaned readers, clears dead listener markers, drops stale local records. |
+| `--adopt` | — | channel id | Transfers ownership of the channel to this session. |
 | `--setup` | — | — | Writes the bus configuration (above). |
 | `--install` | — | — | Copies the script to `~/.local/bin/pp`. |
 | `--help` | `-h` | — | Usage. |
@@ -47,6 +49,31 @@ bus_ssh=<alias>
 | `--message "..."` | `-m` | `--send` | The body. Without it, the body is read from **stdin**. |
 | `--wait N` | `-w` | `--listen` | Give up after N seconds and exit **124** instead of blocking forever. |
 | `--force` | `-f` | `--send` | Skip the listener check and write anyway. |
+| `--adopt` | — | open/join/listen/send/close | Override an ownership refusal and claim the channel for this session. |
+
+### Ownership, and how a session is identified
+
+`--open` and `--join` record the calling **session** as the channel's owner; `--listen`, `--send` and `--close` refuse when a different, still-live session on this machine owns it. The session is resolved by walking up the process tree to the agent process — its pid is stable for that session's lifetime and unique on the machine. Override it with `PP_SESSION` when scripting.
+
+Three outcomes:
+
+| Situation | What happens |
+|---|---|
+| No owner recorded yet (channel from an older version) | Claimed silently on first use |
+| Owner is this session | Proceeds |
+| Owner is another session, still alive | **Refused**, naming both sessions. `--adopt` overrides |
+| Owner session is gone | Adopted automatically, with a note on stderr |
+| Called from a plain shell, no agent ancestor | Checks are permissive — sessions cannot be told apart |
+
+### What `--gc` sweeps
+
+Three distinct kinds of litter, all scoped to this machine:
+
+1. **Orphaned readers** — a reader still blocked on the bus whose local session is gone. Reaped by process group; the marker carries a token written by this machine, so a recycled pgid is never killed by mistake.
+2. **Dead listener markers** — the marker file outlived its process. No kill needed; left in place it makes `--send` report success into nothing and blocks a legitimate re-listen.
+3. **Stale local records** — `.side` / `.owner` / `.listener` for channels that no longer exist on the bus.
+
+It runs automatically before `--open`, `--join` and `--list`. **Limitation:** a reader started by a version older than 0.2.0 has no token, so `--gc` will not reap it — it can only clear its marker once the process is dead. Legacy orphans have to be killed by pid.
 
 ### Choosing a `--as` label
 

@@ -41,11 +41,18 @@ Activates when this session must talk to another agent session — the operator 
 - Nothing about the bus is auto-detected — it is declared once per machine in `~/.config/ping-pong/config`.
 - Keep the docs free of real hostnames, aliases, and usernames. The bus is always `<alias>` / "the bus host".
 
-## Known gap: reaping orphaned remote listeners
+## Shipped in 0.2.0: ownership + the reaper
 
-A listener on the bus survives the death of the session that launched it — diagnosis and the manual remedy are in `reference/troubleshooting.md`. The shipped CLI has **no automatic reaper**; do not document one until it exists.
+Both of the gaps recorded here were closed in 0.2.0 and are now documented in the skill:
 
-The shape a fix should take:
+- **Session ownership.** A channel belongs to the session that opened or joined it, resolved by walking the process tree to the agent process. `--listen` / `--send` / `--close` refuse when another live session on the machine owns it; `--join` refuses to take an occupied seat; `--listen` refuses a second reader on a side that already has one. `--adopt` overrides deliberately. This closed a production incident where two live channel pairs got crossed after a dropped connection.
+- **`--gc`.** Reaps orphaned readers (by process group, gated on a token the marker carries so a recycled pgid is never killed), clears markers whose process is dead, drops stale local records. Runs automatically before `--open` / `--join` / `--list`.
+
+Known limitation, worth keeping: a reader started by a pre-0.2.0 build carries no token, so `--gc` cannot prove it is ours and will not reap it — it only clears the marker once that process dies. Legacy orphans are killed by pid.
+
+The design notes below are kept because they explain *why* the implementation looks the way it does.
+
+The shape the fix took:
 
 1. **`--listen` must leave a LOCAL record before it blocks.** Today the machine stores only `<id>.side`. A sibling `<id>.listener` holding the local wrapper pid and the remote pgid, removed on clean exit, is the discriminant of orphanhood. It has to be written *before* blocking — afterwards there is nobody left to write it.
 2. **A `--gc` pass** over each local `<id>.listener`: local alive + remote alive → healthy, leave it; local dead + remote alive → orphan, reap; both dead → drop the stale local record. Reap = `kill -TERM -<pgid>`, escalating to `-KILL` after a grace period, and only after confirming the group's command line still names the channel.

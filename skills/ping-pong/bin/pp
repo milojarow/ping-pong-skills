@@ -5,11 +5,20 @@
 # exchange messages through a private pair of FIFOs. Every channel is isolated:
 # two channels never see each other's traffic.
 #
+# Isolation has TWO layers, and the second one is not optional:
+#   1. Per channel  - separate directory, separate FIFOs. Structural.
+#   2. Per SESSION  - a channel is owned by the session that opened or joined it.
+#      Several agent sessions share one machine, one user and one state directory,
+#      so "which machine" is NOT enough to tell them apart. Without this layer a
+#      second session on the same machine can attach to a channel that is not its
+#      own: both readers then block on the same FIFO, one silently swallows the
+#      message and the other wakes with zero bytes.
+#
 # Operations are flags. The bare argument is ALWAYS the channel id.
 
 set -uo pipefail
 
-PP_VERSION="0.1.0"
+PP_VERSION="0.2.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -23,6 +32,7 @@ bus_ssh=""
 
 die() { printf 'pp: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
+note() { printf 'pp: %s\n' "$*" >&2; }
 
 # ---------------------------------------------------------------- bus plumbing
 
@@ -36,7 +46,6 @@ need_config() {
   esac
 }
 
-# bus <snippet> - short remote/local command; stdin and stdout are forwarded
 bus() {
   case "$bus_mode" in
     local) bash -c "$1" ;;
@@ -44,7 +53,6 @@ bus() {
   esac
 }
 
-# bus_stream <snippet> - same, but for calls that block for a long time
 bus_stream() {
   case "$bus_mode" in
     local) bash -c "$1" ;;
@@ -62,20 +70,50 @@ bus_label() {
 
 # ------------------------------------------------------------------- utilities
 
+rand() {
+  head -c 256 /dev/urandom | LC_ALL=C tr -dc 'abcdefghijkmnpqrstuvwxyz23456789' | cut -c1-"${1:-6}"
+}
+
 gen_id() {
-  local raw
-  raw=$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'abcdefghijkmnpqrstuvwxyz23456789' | cut -c1-6)
+  local raw; raw=$(rand 6)
   [ ${#raw} -eq 6 ] || die "could not generate a random id"
   printf 'pp-%s' "$raw"
 }
 
 valid_id() { [[ "${1:-}" =~ ^pp-[a-z0-9]{4,16}$ ]]; }
+valid_tok() { [[ "${1:-}" =~ ^[a-z0-9]{6,16}$ ]]; }
 
 sanitize() { printf '%s' "${1:-}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | cut -c1-32; }
 
 default_label() { sanitize "${PP_LABEL:-$(hostname -s 2>/dev/null || echo agent)}"; }
 
-side_file() { printf '%s/%s.side' "$STATE_DIR" "$1"; }
+# Which SESSION is running this command - not which machine. Several agent
+# sessions share one user and one state dir, so the machine cannot distinguish
+# them. Walk up to the agent process; its pid is stable for that session's life.
+session_id() {
+  if [ -n "${PP_SESSION:-}" ]; then printf '%s' "$PP_SESSION"; return 0; fi
+  local p="$PPID" d=0 c
+  while [ "${p:-0}" -gt 1 ] && [ "$d" -lt 15 ]; do
+    c=$(cat "/proc/$p/comm" 2>/dev/null || true)
+    if [ "$c" = "claude" ]; then printf 'claude:%s' "$p"; return 0; fi
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    d=$((d+1))
+  done
+  # Not launched from an agent session (a human at a shell). Ownership checks
+  # stay permissive rather than locking the operator out of his own channels.
+  printf 'nosession'
+}
+
+session_alive() {
+  case "$1" in
+    claude:*) kill -0 "${1#claude:}" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+side_file()     { printf '%s/%s.side' "$STATE_DIR" "$1"; }
+owner_file()    { printf '%s/%s.owner' "$STATE_DIR" "$1"; }
+listener_file() { printf '%s/%s.listener' "$STATE_DIR" "$1"; }
 
 my_side() {
   local id="$1"
@@ -95,6 +133,79 @@ require_channel() {
     || die "channel $id does not exist on the bus ($(bus_label)).
     Check the id, or the bus rebooted - channels live in $BUS_ROOT and do not survive one.
     Open channels:  pp --list"
+}
+
+# ------------------------------------------------------------- ownership layer
+
+claim_channel() {
+  local id="$1" label="$2"
+  mkdir -p "$STATE_DIR"
+  printf 'session=%s\nlabel=%s\nclaimed=%s\n' \
+    "$(session_id)" "$label" "$(date -u +%FT%TZ)" > "$(owner_file "$id")"
+}
+
+# Refuse to operate on a channel that belongs to a DIFFERENT live session on this
+# machine. That is the guard against crossed wires: without it, any session here
+# can attach to any channel this machine ever joined, because the side file is
+# machine-global.
+assert_owner() {
+  local id="$1" label="$2" adopt="$3"
+  local me; me=$(session_id)
+  local f; f=$(owner_file "$id")
+
+  if [ ! -f "$f" ]; then claim_channel "$id" "$label"; return 0; fi
+
+  local owner owner_label
+  owner=$(sed -n 's/^session=//p' "$f" | tr -d '[:space:]')
+  owner_label=$(sed -n 's/^label=//p' "$f" | tr -d '[:space:]')
+
+  [ "$owner" = "$me" ] && return 0
+  [ "$me" = "nosession" ] && return 0   # a human shell cannot be told apart; allow
+
+  if [ "$adopt" = "1" ]; then
+    claim_channel "$id" "$label"
+    note "adopted channel $id from session $owner (label: ${owner_label:-?})"
+    return 0
+  fi
+
+  if session_alive "$owner"; then
+    die "channel $id belongs to ANOTHER LIVE session on this machine.
+    owner: $owner  (label: ${owner_label:-?})
+    You are: $me
+    Two sessions on one channel side read the same FIFO: one swallows the message
+    and the other wakes with zero bytes. That is how conversations get crossed.
+    If this channel really is yours, take it over deliberately:  pp --adopt $id"
+  fi
+
+  claim_channel "$id" "$label"
+  note "previous owner session ($owner) is gone - channel $id adopted by $me"
+}
+
+# --------------------------------------------------------- listener bookkeeping
+
+# The marker on the bus carries a token this side generated, so --gc can prove a
+# remote reader is OURS before killing it (a pgid can be recycled).
+bus_marker_pid() {
+  bus "sed -n 's/.*pid=\([0-9]*\).*/\1/p' '$BUS_ROOT/$1/listening-$2' 2>/dev/null" | tr -d '[:space:]'
+}
+bus_marker_token() {
+  bus "sed -n 's/.*token=\([a-z0-9]*\).*/\1/p' '$BUS_ROOT/$1/listening-$2' 2>/dev/null" | tr -d '[:space:]'
+}
+
+# Kill a remote reader by process GROUP - the shell's `cat` child is reparented
+# to init if only the shell is killed, and stays blocked forever.
+reap_remote() {
+  local id="$1" side="$2" pgid="$3"
+  [[ "$pgid" =~ ^[0-9]+$ ]] || return 1
+  bus "if ps -o args= -g '$pgid' 2>/dev/null | grep -q '$BUS_ROOT/$id/to-$side'; then
+         kill -TERM -'$pgid' 2>/dev/null
+         for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 -'$pgid' 2>/dev/null || break; sleep 0.3; done
+         kill -0 -'$pgid' 2>/dev/null && kill -KILL -'$pgid' 2>/dev/null
+         rm -f '$BUS_ROOT/$id/listening-$side'
+         echo reaped
+       else
+         echo mismatch
+       fi" 2>/dev/null
 }
 
 # ------------------------------------------------------------------- commands
@@ -122,6 +233,7 @@ cmd_setup() {
 cmd_open() {
   local topic="$1" label="$2"
   need_config
+  gc_quiet
   local id; id=$(gen_id)
   local created; created=$(date -u +%FT%TZ)
 
@@ -138,10 +250,11 @@ cmd_open() {
 
   mkdir -p "$STATE_DIR"
   printf 'a\n' > "$(side_file "$id")"
+  claim_channel "$id" "$label"
 
   say "Channel open: $id"
   say "  bus:   $(bus_label):$BUS_ROOT/$id"
-  say "  me:    side a  (label: $label)"
+  say "  me:    side a  (label: $label, session $(session_id))"
   [ -n "$topic" ] && say "  topic: $topic"
   say ""
   say "Hand THIS line to the other session:"
@@ -152,10 +265,24 @@ cmd_open() {
 }
 
 cmd_join() {
-  local id="$1" label="$2"
+  local id="$1" label="$2" adopt="$3"
   need_config
   valid_id "$id" || die "invalid id: '$id' (expected form: pp-xxxxxx)"
+  gc_quiet
   require_channel "$id"
+
+  # Joining a channel that already has a different partner registered means you
+  # are taking someone else's seat - the exact shape of a crossed wire.
+  local existing
+  existing=$(bus "sed -n 's/^side_b=//p' '$BUS_ROOT/$id/meta' 2>/dev/null" | tr -d '[:space:]')
+  if [ -n "$existing" ] && [ "$existing" != "$label" ] && [ "$adopt" != "1" ]; then
+    die "channel $id already has a side b registered: '$existing' (you are '$label').
+    Joining would put two sessions on the same side of one channel.
+    Double-check the id you were handed. If you really are replacing '$existing':
+      pp --join $id --adopt"
+  fi
+
+  assert_owner "$id" "$label" "$adopt"
 
   bus "set -e
     sed -i 's/^side_b=.*/side_b=$label/' '$BUS_ROOT/$id/meta' 2>/dev/null || true" >/dev/null
@@ -165,7 +292,7 @@ cmd_join() {
 
   say "Joined channel: $id"
   say "  bus:   $(bus_label):$BUS_ROOT/$id"
-  say "  me:    side b  (label: $label)"
+  say "  me:    side b  (label: $label, session $(session_id))"
   local topic
   topic=$(bus "sed -n 's/^topic=//p' '$BUS_ROOT/$id/meta' 2>/dev/null")
   [ -n "$topic" ] && say "  topic: $topic"
@@ -175,23 +302,45 @@ cmd_join() {
 }
 
 # A reader blocked in open(2) on a FIFO does not hold a file descriptor yet, so
-# fuser/lsof cannot see it. The listener therefore records an explicit marker and
-# removes it on exit; that marker is the only reliable "someone is listening".
+# fuser/lsof cannot see it. The listener records an explicit marker before it
+# blocks and removes it on exit; that marker is the only reliable presence signal.
 cmd_listen() {
-  local id="$1" wait_for="$2" label="$3"
+  local id="$1" wait_for="$2" label="$3" adopt="$4"
   need_config
   valid_id "$id" || die "invalid id: '$id'"
   local side; side=$(my_side "$id")
+  assert_owner "$id" "$label" "$adopt"
   require_channel "$id"
+
+  # Self-heal: if MY previous listener on this side was orphaned (my local
+  # process is gone but the remote reader still blocks), reap it before attaching.
+  gc_channel "$id" >/dev/null
+
+  # Never a second reader on one side. Two readers on one FIFO means one message
+  # goes to exactly one of them and the other wakes with zero bytes.
+  local live_pid; live_pid=$(bus_marker_pid "$id" "$side")
+  if [ -n "$live_pid" ] && bus "kill -0 '$live_pid' 2>/dev/null"; then
+    die "side $side of channel $id ALREADY has a live listener (pid $live_pid on the bus).
+    Attaching a second reader to one FIFO does not duplicate the message: one
+    session swallows it and the other wakes with zero bytes.
+    If that listener is stale, clear it:  pp --gc"
+  fi
+
+  local tok; tok=$(rand 8)
+  mkdir -p "$STATE_DIR"
+  printf 'local_pid=%s\nside=%s\ntoken=%s\nsession=%s\n' \
+    "$$" "$side" "$tok" "$(session_id)" > "$(listener_file "$id")"
 
   local reader="cat '$BUS_ROOT/$id/to-$side'"
   [ "$wait_for" -gt 0 ] 2>/dev/null && reader="timeout $wait_for $reader"
 
   bus_stream "m='$BUS_ROOT/$id/listening-$side'
-    printf '%s pid=%s since=%s\n' '$label' \"\$\$\" \"\$(date -u +%FT%TZ)\" > \"\$m\"
+    printf '%s pid=%s token=%s since=%s\n' '$label' \"\$\$\" '$tok' \"\$(date -u +%FT%TZ)\" > \"\$m\"
     trap 'rm -f \"\$m\"' EXIT INT TERM HUP
     $reader"
   local rc=$?
+
+  rm -f "$(listener_file "$id")"
 
   if [ $rc -eq 124 ]; then
     say "pp: nothing arrived within ${wait_for}s (channel $id is still open)"
@@ -201,11 +350,12 @@ cmd_listen() {
 }
 
 cmd_send() {
-  local id="$1" body="$2" label="$3" force="$4"
+  local id="$1" body="$2" label="$3" force="$4" adopt="$5"
   need_config
   valid_id "$id" || die "invalid id: '$id'"
   local side; side=$(my_side "$id")
   local out; out=$(other_side "$side")
+  assert_owner "$id" "$label" "$adopt"
   require_channel "$id"
 
   if [ "$force" != "1" ]; then
@@ -234,6 +384,7 @@ cmd_send() {
 
 cmd_list() {
   need_config
+  gc_quiet
   local out
   out=$(bus "for d in '$BUS_ROOT'/pp-*; do
       [ -d \"\$d\" ] || continue
@@ -249,10 +400,17 @@ cmd_list() {
     say "pp: no open channels on the bus ($(bus_label):$BUS_ROOT)"
     return 0
   fi
+  local me; me=$(session_id)
   say "Open channels on $(bus_label):$BUS_ROOT"
   printf '%s\n' "$out" | while IFS=$'\t' read -r id sides created topic; do
-    local mine=""
-    [ -r "$(side_file "$id")" ] && mine=" (me: side $(tr -d '[:space:]' < "$(side_file "$id")"))"
+    local mine="" owner
+    if [ -r "$(side_file "$id")" ]; then
+      mine=" (this machine: side $(tr -d '[:space:]' < "$(side_file "$id")")"
+      owner=$(sed -n 's/^session=//p' "$(owner_file "$id")" 2>/dev/null | tr -d '[:space:]')
+      if [ -z "$owner" ]; then mine="$mine, unclaimed)"
+      elif [ "$owner" = "$me" ]; then mine="$mine, YOURS)"
+      else mine="$mine, owned by $owner)"; fi
+    fi
     printf '  %-12s %-24s %s%s\n' "$id" "$sides" "$created" "$mine"
     [ -n "$topic" ] && printf '  %-12s topic: %s\n' "" "$topic"
   done
@@ -271,6 +429,13 @@ cmd_info() {
   else
     say "  this machine is NOT registered on the channel (run: pp --join $id)"
   fi
+  local o; o=$(owner_file "$id")
+  if [ -r "$o" ]; then
+    local ow; ow=$(sed -n 's/^session=//p' "$o" | tr -d '[:space:]')
+    if [ "$ow" = "$(session_id)" ]; then say "  owned by THIS session ($ow)"
+    elif session_alive "$ow"; then say "  owned by another LIVE session on this machine ($ow)"
+    else say "  owner session $ow is gone (adoptable)"; fi
+  fi
   local waiting
   waiting=$(bus "for s in a b; do
       m='$BUS_ROOT/$id/listening-'\$s
@@ -280,12 +445,13 @@ cmd_info() {
 }
 
 # Deleting a FIFO does NOT release a reader already blocked in open(2): the
-# pending open keeps the inode alive. So before deleting, write a closing notice
-# to every side that has a listener marker, so it exits cleanly.
+# pending open keeps the inode alive. So notify every side that has a listener
+# marker before deleting.
 cmd_close() {
-  local id="$1"
+  local id="$1" label="$2" adopt="$3"
   need_config
   valid_id "$id" || die "invalid id: '$id'"
+  assert_owner "$id" "$label" "$adopt"
   bus "for s in a b; do
       if [ -f '$BUS_ROOT/$id/listening-'\$s ]; then
         printf '=== ping-pong %s | the other side CLOSED this channel ===\n' '$id' |
@@ -293,8 +459,94 @@ cmd_close() {
       fi
     done
     rm -rf '$BUS_ROOT/$id'" || die "could not delete the channel on the bus"
-  rm -f "$(side_file "$id")"
+  rm -f "$(side_file "$id")" "$(owner_file "$id")" "$(listener_file "$id")"
   say "pp: channel $id closed and deleted from the bus (active listeners were notified)"
+}
+
+# Reap this machine's orphans: a remote reader whose local process is gone.
+# The token proves the remote reader is ours, so a recycled pgid is never killed.
+gc_channel() {
+  local id="$1" reaped=0
+  local lf; lf=$(listener_file "$id")
+  [ -r "$lf" ] || return 0
+  local lpid side tok
+  lpid=$(sed -n 's/^local_pid=//p' "$lf" | tr -d '[:space:]')
+  side=$(sed -n 's/^side=//p' "$lf" | tr -d '[:space:]')
+  tok=$(sed -n 's/^token=//p' "$lf" | tr -d '[:space:]')
+
+  if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null; then return 0; fi   # still alive
+
+  if valid_tok "$tok" && [ -n "$side" ]; then
+    local mtok mpid
+    mtok=$(bus_marker_token "$id" "$side")
+    mpid=$(bus_marker_pid "$id" "$side")
+    if [ "$mtok" = "$tok" ] && [ -n "$mpid" ]; then
+      if [ "$(reap_remote "$id" "$side" "$mpid")" = "reaped" ]; then
+        say "  reaped orphan reader: channel $id side $side (bus pid $mpid)"
+        reaped=1
+      fi
+    fi
+  fi
+  rm -f "$lf"
+  return $reaped
+}
+
+cmd_gc() {
+  need_config
+  local n=0 s=0
+  mkdir -p "$STATE_DIR"
+  say "pp: sweeping this machine's ping-pong state"
+
+  for lf in "$STATE_DIR"/*.listener; do
+    [ -e "$lf" ] || continue
+    local id; id=$(basename "$lf" .listener)
+    gc_channel "$id" && true
+    n=$((n+1))
+  done
+
+  # Markers whose remote reader is already dead. No kill needed and no ownership
+  # question: the process is gone, only the file lies. Left alone it makes --send
+  # report success into nothing, and blocks a legitimate re-listen.
+  local dead
+  dead=$(bus "for d in '$BUS_ROOT'/pp-*; do
+      [ -d \"\$d\" ] || continue
+      for s in a b; do
+        m=\"\$d/listening-\$s\"; [ -f \"\$m\" ] || continue
+        p=\$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' \"\$m\")
+        if [ -n \"\$p\" ] && ! kill -0 \"\$p\" 2>/dev/null; then
+          rm -f \"\$m\"; echo \"\$(basename \$d) \$s\"
+        fi
+      done
+    done" 2>/dev/null)
+  if [ -n "$dead" ]; then
+    printf '%s\n' "$dead" | while read -r cid cs; do
+      [ -n "$cid" ] && say "  cleared dead listener marker: channel $cid side $cs"
+    done
+  fi
+
+  # Local records for channels that no longer exist on the bus.
+  local alive; alive=$(bus "ls -1 '$BUS_ROOT' 2>/dev/null | grep '^pp-' || true")
+  for f in "$STATE_DIR"/*.side "$STATE_DIR"/*.owner; do
+    [ -e "$f" ] || continue
+    local id; id=$(basename "$f"); id="${id%.*}"
+    if ! printf '%s\n' "$alive" | grep -qx "$id"; then
+      rm -f "$STATE_DIR/$id.side" "$STATE_DIR/$id.owner" "$STATE_DIR/$id.listener"
+      say "  dropped stale local state for $id (channel no longer on the bus)"
+      s=$((s+1))
+    fi
+  done
+
+  say "pp: checked $n listener record(s), dropped $s stale channel record(s)"
+}
+
+gc_quiet() { cmd_gc >/dev/null 2>&1 || true; }
+
+cmd_adopt() {
+  local id="$1" label="$2"
+  need_config
+  valid_id "$id" || die "invalid id: '$id'"
+  claim_channel "$id" "$label"
+  say "pp: channel $id is now owned by this session ($(session_id), label $label)"
 }
 
 cmd_install() {
@@ -319,27 +571,31 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   pp --listen <id>                BLOCK until ONE message arrives, print it, exit
   pp --send <id> -m "text"        send a message (or pipe it in, without -m)
   pp --list                       open channels on the bus
-  pp --info <id>                  channel metadata and who is listening now
+  pp --info <id>                  channel metadata, owner, and who is listening
   pp --close <id>                 close and delete the channel
+  pp --gc                         reap orphaned readers + drop stale local state
+  pp --adopt <id>                 take ownership of a channel for THIS session
 
   --as <label>    signature on your messages (default: short hostname)
   --force         send even if no listener is detected (blocks up to the timeout)
   --wait N        with --listen: give up after N seconds, exit 124
+  --adopt         with open/join/listen/send/close: override an ownership refusal
 
   --install       copy this script to ~/.local/bin/pp
   -h, --help      this help
   -V, --version   version
 
   Env: PP_BUS_ROOT (default /tmp/ping-pong), PP_SEND_TIMEOUT (60),
-       PP_LABEL, PP_SIDE (force side a|b, for driving both ends from one machine).
+       PP_LABEL, PP_SIDE (force side a|b), PP_SESSION (override session identity).
 
   GOLDEN RULE: after receiving a message, relaunch --listen BEFORE you reply.
+  A channel belongs to the SESSION that opened or joined it, not to the machine.
 EOF
 }
 
 # ---------------------------------------------------------------------- parser
 
-op="" id="" topic="" body="" label="" wait_for=0 force=0
+op="" id="" topic="" body="" label="" wait_for=0 force=0 adopt=0
 setup_args=()
 
 while [ $# -gt 0 ]; do
@@ -351,6 +607,7 @@ while [ $# -gt 0 ]; do
     -l|--list) op="list" ;;
     -i|--info) op="info" ;;
     -c|--close) op="close" ;;
+    -g|--gc) op="gc" ;;
     --setup) op="setup" ;;
     --install) op="install" ;;
     --bus-local|--bus-ssh) setup_args+=("$1") ;;
@@ -359,6 +616,7 @@ while [ $# -gt 0 ]; do
     -a|--as) shift; label="$(sanitize "${1:-}")" ;;
     -w|--wait) shift; wait_for="${1:-0}" ;;
     -f|--force) force=1 ;;
+    --adopt) adopt=1; [ -z "$op" ] && op="adopt" ;;
     -h|--help) usage; exit 0 ;;
     -V|--version) say "pp $PP_VERSION"; exit 0 ;;
     -*) die "unknown flag: $1  (pp --help)" ;;
@@ -372,20 +630,22 @@ done
 case "$op" in
   setup) cmd_setup "${setup_args[@]:-}" "${id:-}" ;;
   install) cmd_install ;;
+  gc) cmd_gc ;;
+  adopt) [ -n "$id" ] || die "--adopt needs the channel id"; cmd_adopt "$id" "$label" ;;
   open) cmd_open "$topic" "$label" ;;
-  join) [ -n "$id" ] || die "--join needs the channel id"; cmd_join "$id" "$label" ;;
-  listen) [ -n "$id" ] || die "--listen needs the channel id"; cmd_listen "$id" "$wait_for" "$label" ;;
+  join) [ -n "$id" ] || die "--join needs the channel id"; cmd_join "$id" "$label" "$adopt" ;;
+  listen) [ -n "$id" ] || die "--listen needs the channel id"; cmd_listen "$id" "$wait_for" "$label" "$adopt" ;;
   send)
     [ -n "$id" ] || die "--send needs the channel id"
     if [ -z "$body" ]; then
       [ -t 0 ] && die "--send without -m needs the message on stdin"
       body=$(cat)
     fi
-    cmd_send "$id" "$body" "$label" "$force"
+    cmd_send "$id" "$body" "$label" "$force" "$adopt"
     ;;
   list) cmd_list ;;
   info) [ -n "$id" ] || die "--info needs the channel id"; cmd_info "$id" ;;
-  close) [ -n "$id" ] || die "--close needs the channel id"; cmd_close "$id" ;;
+  close) [ -n "$id" ] || die "--close needs the channel id"; cmd_close "$id" "$label" "$adopt" ;;
   "") usage; exit 1 ;;
   *) die "operation not implemented: $op" ;;
 esac

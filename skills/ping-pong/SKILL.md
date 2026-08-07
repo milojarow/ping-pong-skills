@@ -13,6 +13,11 @@ A private, isolated message channel between two agent sessions — on the same m
 
 Two sessions meet on a shared **bus host** and exchange messages through a private pair of named pipes (FIFOs). One channel = one conversation. Two channels never see each other's traffic, so `A <-> Z` can discuss one thing while `B <-> X` discusses another.
 
+Isolation has **two layers, and both are load-bearing**:
+
+1. **Per channel** — separate directory, separate pipes. Structural; nothing can cross.
+2. **Per session** — a channel belongs to the session that opened or joined it. Several agent sessions share one machine, one user and one state directory, so *which machine* is not enough to tell them apart. Without this layer a second session on the same box can attach to a channel that is not its own — and then two readers block on one pipe, one silently swallows the message and the other wakes with **zero bytes**. See [Ownership](#ownership-a-channel-belongs-to-a-session-not-a-machine).
+
 The mechanism that makes this work in an agent harness: **a blocking read is the wake-up signal.** `pp --listen` blocks with zero CPU until a message arrives; run it as a *background* command and the harness notifies you the moment it returns. That notification is your cue to read the message and act.
 
 **The human's only job** is to start both sessions and carry the channel id from one to the other. Everything else is yours.
@@ -61,11 +66,32 @@ One-time per machine, if any command says "not configured yet" — see [referenc
 3. Send a greeting so the peer knows you're on: `"$PP" --send <id> -m "<greeting + what you're working on>"`
 4. Stop and wait.
 
+## Ownership: a channel belongs to a session, not a machine
+
+`--open` and `--join` stamp the channel with the identity of **this session**. Every later `--listen`, `--send` and `--close` checks it, and refuses when the channel belongs to a different session that is still alive on this machine.
+
+What that buys you: after a dropped tunnel or a restart, attaching to the wrong channel id **fails loudly** instead of quietly wiring you into someone else's conversation. That failure used to be silent and it crossed two live conversations.
+
+- If the owning session has ended, the channel is adopted automatically and you are told.
+- If it is still alive and the channel really is yours, take it over deliberately: `pp --adopt <id>`, or pass `--adopt` to the command you were running.
+- Invoked from a plain shell rather than an agent session, ownership cannot be determined and the checks stay permissive — that is for the operator, not for you.
+
+**One side, one listener.** `--listen` also refuses to attach when that side of the channel already has a live listener, for the same reason: a second reader on one pipe does not duplicate the message, it steals it.
+
 ## Reading what arrived
 
 `--listen` prints the message on stdout and exits. Run as a background command, that means: **the background task's output IS the message.** When the harness notifies you the listen task finished, read that task's output — first line is the header (`=== ping-pong <id> | from: <label> (side x) | <UTC> ===`), the rest is the body. The header is how you tell which channel woke you when you hold more than one.
 
-An empty output with a non-zero exit is not a message: the channel was closed or the connection dropped. See [reference/troubleshooting.md](reference/troubleshooting.md).
+Two non-message outcomes to recognize:
+
+- **Empty output, non-zero exit** — the channel was closed or the connection dropped.
+- **Empty output, exit 0** — something else consumed the message on your side. That is the signature of a second reader on your pipe; run `pp --info <id>` and `pp --gc`.
+
+Both are covered in [reference/troubleshooting.md](reference/troubleshooting.md).
+
+## Housekeeping
+
+`pp --gc` sweeps this machine: it reaps listeners on the bus whose session is gone, clears listener markers whose process is already dead, and drops local records for channels that no longer exist. It runs automatically before `--open`, `--join` and `--list`, so in normal use you never call it — reach for it when `--listen` refuses because of a listener you believe is stale.
 
 ## The turn contract
 
@@ -104,8 +130,10 @@ Keep one topic per channel. Two topics in one channel produce an interleaved inb
 | Send a message | `pp --send pp-xxxxxx -m "texto"` |
 | Send a long/multiline message | `pp --send pp-xxxxxx < file` |
 | See open channels | `pp --list` |
-| Who is listening right now | `pp --info pp-xxxxxx` |
+| Who is listening, and who owns it | `pp --info pp-xxxxxx` |
 | Close and delete a channel | `pp --close pp-xxxxxx` |
+| Reap orphans, clear stale state | `pp --gc` |
+| Take over a channel for this session | `pp --adopt pp-xxxxxx` |
 
 Operations are flags; the bare argument is always the channel id. Full CLI, config, and environment variables: [reference/pp-cli.md](reference/pp-cli.md).
 
@@ -120,6 +148,8 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Reusing one channel for two topics | Both conversations interleave in one inbox | One channel per topic — open a second one |
 | Assuming a channel survives a bus reboot | Channels live in a temp dir and are wiped | Open a fresh channel; ids are cheap |
 | Reaching for `--force` when the peer simply isn't up yet | It skips the check and blocks for the full send timeout, then fails — the turn stalls for a minute | `--force` is only for a peer you *know* is reading without `pp`. Otherwise wait for their listener |
+| Re-attaching to a channel id from memory after a dropped connection | You can land on a *different* channel this machine also belongs to, and cross two conversations | Take the id from `pp --list`, which marks which channels are YOURS |
+| Passing `--adopt` to get past an ownership refusal | You take a live channel away from another working session | `--adopt` is for a channel whose owner session is gone, or one you are certain is yours |
 | Inventing a `--as` label per message | The peer sees a different author each time and cannot tell who it is talking to | Pick one short, stable label for the whole channel — the machine or the role, not the task |
 
 **A marker is evidence, not proof.** A listener whose session already ended can stay blocked on the bus for hours, marker and all. The send then *succeeds* and the message is lost into a reader nobody is watching. If a peer goes quiet right after a delivery that looked clean, suspect an orphaned listener — [reference/troubleshooting.md](reference/troubleshooting.md).

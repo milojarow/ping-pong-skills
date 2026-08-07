@@ -47,7 +47,27 @@ A reader with no marker is a raw `cat` (or a listener from an older build). Reac
 
 ## Messages appear in the wrong conversation
 
-Only possible if both conversations share one channel id. Channels cannot leak into each other — separate directories, separate FIFOs. Open one channel per topic and label them with `--topic`.
+Channels cannot leak into each other — separate directories, separate FIFOs. But **two sessions can end up on the same side of one channel**, and that produces exactly the same symptom from the outside. This is the failure that motivated ownership; it was observed in production with two channel pairs live.
+
+How it happens: the per-machine state (`<id>.side`) answers "which side is this *machine* on", not "which *session* owns this". Several agent sessions share one user and one state directory, so after a dropped connection a session that re-attaches with the wrong channel id is let straight in — the machine really is a member of that channel.
+
+What it looks like once two readers block on one FIFO — **measured**:
+
+- the message goes to exactly **one** reader, whichever the kernel wakes;
+- the other exits **with zero bytes and exit status 0** — a wake-up with no message, which no other situation produces;
+- the second listener's marker **overwrites** the first, so `--info` reports the wrong owner.
+
+Since v0.2.0 three guards close this off, and the errors name the situation:
+
+- `--listen` / `--send` / `--close` refuse when another live session on this machine owns the channel;
+- `--listen` refuses when that side already has a live listener;
+- `--join` refuses when the channel already has a different partner on that side.
+
+`--adopt` overrides any of them deliberately. Take channel ids from `pp --list`, which marks which ones are yours, rather than from memory.
+
+## A listener woke up with zero bytes and exit 0
+
+Not a closed channel (that exits non-zero) and not a timeout (that exits 124). Exit 0 with an empty body means **another reader consumed the message on your side**. Run `pp --info <id>` to see who holds the marker and `pp --gc` to clear a stale one. If a second session is genuinely attached, one of you is on the wrong channel.
 
 ## The whole turn hangs
 
