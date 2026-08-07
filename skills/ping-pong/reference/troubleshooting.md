@@ -66,9 +66,42 @@ The process was alive the whole time. A listener runs **on the bus host**, launc
 - it does not exist locally → you conclude "dead" and double up the readers;
 - it *does* exist locally, as a completely unrelated process → you conclude "alive", or you kill a stranger.
 
-The check has to happen where the pid was issued. `pp --info <id>` already does that — its `kill -0` runs inside the ssh call, which is why its answer is the authority. Probing by hand, the `kill -0` goes *inside* the ssh session, never outside it.
+**Why it reads as local.** Nothing in the record says otherwise. The marker is written by the remote shell as `$$`, and the label beside it is the **side label** (`--as`) — which by convention is often a machine name, just not the machine the pid belongs to:
+
+```
+listening-a:  "<side-label> pid=1001 since=<UTC>"
+                            ^^^^^^^^ a pid on the bus host, not here
+```
+
+So the line invites exactly the wrong reading: a familiar name next to a plausible pid, with no marker of which namespace issued it.
+
+The check has to happen where the pid was issued. `pp --info <id>` already does that — its `kill -0` runs inside the ssh call, which is why its answer is the authority. Probing by hand, the `kill -0` goes *inside* the ssh session, never outside it:
+
+```bash
+ssh <bus> "ps -p <pid> -o pid=,etime="
+```
+
+And when you do not have the pid, ask the bus by channel id instead of guessing:
+
+```bash
+ssh <bus> "ps -eo pid=,pgid=,args= | grep -F '<channel-id>' | grep -v grep"
+```
 
 Generalize it: **a pid only means something inside the pid namespace that issued it.** A pid that travels between machines is a number, not a reference — and probing it from the wrong side does not answer "unknown", it answers wrong.
+
+## `--info` says `LISTENING`, a new `--listen` is refused, and the peer's messages land nowhere
+
+Three symptoms that only occur together, and they identify one cause:
+
+- `pp --info <id>` reports `LISTENING`;
+- `pp --listen` on that side is refused with *already has a live listener*;
+- everything the peer sends is accepted as delivered and is never seen.
+
+An **orphaned reader is swallowing them**. Not the tunnel, not the FIFO, and not a lying marker — there is a real reader holding a real pid, it simply has no session behind it. That is why the refusal is correct and the delivery reports success: every component is telling the truth about a reader nobody owns.
+
+`pp --gc` is the remedy — it reaps disconnected readers on the bus and clears the marker, so the side is free to listen again. If it reports nothing and the symptoms persist, reap by hand: [An orphaned listener outlives the session that started it](#an-orphaned-listener-outlives-the-session-that-started-it).
+
+Read `--gc`'s output carefully. Reaped orphans print on their own `reaped disconnected reader:` lines; the closing `checked N listener record(s), dropped M stale channel record(s)` counts only this machine's local records. **A summary of `dropped 0 stale` does not mean nothing was reaped** — the reap lines are above it.
 
 ## A session runs the build it started with — updating the plugin does not move it
 
@@ -181,4 +214,6 @@ Two guards before firing:
 - **Confirm identity first.** A pgid can be recycled once the original group is gone. Check that the group's command line still names the channel path.
 - **Kill by numeric pgid, never by pattern.** `pkill -f` matches the shell running your own kill command — the same self-matching trap as above.
 
-There is no automatic reaper in the CLI. Until there is, treat an unexplained silent peer as a possible orphan and check `--info` against whether that session still exists.
+**Reach for `pp --gc` before doing any of that by hand.** Since 0.4.x it is the automatic reaper, and it runs on the bus, so it sees what your machine cannot: besides the token-proved orphans it owns, it kills any reader on the bus whose parent or grandparent is pid 1 — a reader that survived its ssh gets **reparented**, which is a fact no local state and no version can hide. That backstop needs no token, so it reaches listeners from builds too old to have written one. `--gc` also runs on its own before `--open`, `--join` and `--list`.
+
+Hand-killing is for what remains after that: a reader that is still correctly parented but abandoned, or a bus you can reach only by ssh. Treat an unexplained silent peer as a possible orphan and check `--info` against whether that session still exists.

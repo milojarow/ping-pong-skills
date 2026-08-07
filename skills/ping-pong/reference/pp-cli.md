@@ -69,11 +69,15 @@ Three outcomes:
 
 Three distinct kinds of litter, all scoped to this machine:
 
-1. **Orphaned readers** — a reader still blocked on the bus whose local session is gone. Reaped by process group; the marker carries a token written by this machine, so a recycled pgid is never killed by mistake.
+1. **Orphaned readers** — a reader still blocked on the bus whose local session is gone. Reaped two ways: by process group where the marker carries a token written by this machine, so a recycled pgid is never killed by mistake; and, as a backstop, any reader on the bus whose parent or grandparent is pid 1. A reader that outlived its ssh gets **reparented**, so that second check needs no token, no local record and no matching version.
 2. **Dead listener markers** — the marker file outlived its process. No kill needed; left in place it makes `--send` report success into nothing and blocks a legitimate re-listen.
 3. **Stale local records** — `.side` / `.owner` / `.listener` for channels that no longer exist on the bus.
 
-It runs automatically before `--open`, `--join` and `--list`. **Limitation:** a reader started by a version older than 0.2.0 has no token, so `--gc` will not reap it — it can only clear its marker once the process is dead. Legacy orphans have to be killed by pid.
+It runs automatically before `--open`, `--join` and `--list`.
+
+**Reading its output:** reaped orphans print on their own lines as they are killed. The closing `checked N listener record(s), dropped M stale channel record(s)` counts only this machine's local records, so `dropped 0` is not a statement that nothing was reaped.
+
+A reader started by a version older than 0.2.0 has no token and so escapes the token-proved path, but the reparenting backstop still reaches it once its connection is gone. What neither path can touch is a reader that is still correctly parented to a live ssh — an abandoned-but-connected reader has to be killed by pid on the bus.
 
 ### Choosing a `--as` label
 
