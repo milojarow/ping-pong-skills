@@ -45,6 +45,18 @@ pp --info <id>       # the authority: marker present or not
 
 A reader with no marker is a raw `cat` (or a listener from an older build). Reach for `--send --force` there, and prefer switching that side to `pp --listen` so the state stays visible.
 
+## A marker is a claim, not proof — and `--info` now says which
+
+The `listening-<side>` file is removed by an EXIT trap. That works when the listener ends cleanly; it does **not** run on `SIGKILL`, so a session killed hard (restart, closed terminal, `kill -9`) leaves the file behind announcing a listener that no longer exists.
+
+Since 0.4.0 nothing trusts the file's mere existence:
+
+- `--info` verifies the pid **on the bus** and reports `LISTENING` or `STALE MARKER — claims … but that process is dead`.
+- `--send` refuses on a stale marker instead of delivering into nothing. That was the worst failure shape in the protocol: the write looked successful and the message was gone.
+- `--gc` clears the file.
+
+If you are reading a marker by hand, remember it is a claim about a process on another machine, and see the next entry before checking it.
+
 ## The pid in a marker is a bus pid — checking it locally gives a confident wrong answer
 
 Observed: a session read the `listening-<side>` marker, took the pid, ran `kill -0` **on its own machine**, found nothing, and concluded the marker was lying. It then started its own listener to replace the "dead" one — and ended with two readers blocked on the same FIFO, which is precisely the failure the marker exists to prevent. The verification produced the damage it was meant to avoid.
@@ -67,6 +79,10 @@ This matters more than a wrong version number: **the guards live in the executab
 - `pp --version` is the ground truth for which build you are actually on. Check it before trusting the presence and ownership behavior described in this file.
 - Reloading skills does **not** repin it. Only restarting the session does.
 - Close your channels before restarting (`pp --close <id>`), or you leave a reader blocked on the bus — see [An orphaned listener outlives the session that started it](#an-orphaned-listener-outlives-the-session-that-started-it).
+
+Since 0.4.0 you do not have to notice this yourself: `--open`, `--join` and `--listen` compare the build they are running against the newest one installed and print the newer build's **exact path** when they differ. That closes a real trap — a session correctly refused to construct a newer path by hand, because this skill tells it never to hardcode a versioned path, and so it kept running a build that was three releases old. The advice was right; what was missing was the tool handing over the path instead of leaving it to be guessed.
+
+Running that path directly is a stopgap for a session already mid-conversation. Restarting is still the only thing that repins the session.
 
 ## Messages appear in the wrong conversation
 

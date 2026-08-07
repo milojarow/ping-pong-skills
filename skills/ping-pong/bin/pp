@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="0.3.0"
+PP_VERSION="0.4.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -151,6 +151,28 @@ session_alive() {
   esac
 }
 
+# A session keeps the build it resolved at startup, and the guards live in this
+# binary rather than in the skill text - so a session started before a fix exists
+# keeps suffering the bug it closes, silently. Say so, and hand over the exact
+# path of the newer build instead of leaving the operator to construct one.
+version_notice() {
+  local self; self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) || return 0
+  case "$self" in *"/plugins/"*) : ;; *) return 0 ;; esac
+  local vdir="${self%/skills/*}"
+  local base mine newest
+  base=$(dirname "$vdir"); mine=$(basename "$vdir")
+  [[ "$mine" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+  newest=$(ls -1 "$base" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+  [ -n "$newest" ] && [ "$newest" != "$mine" ] || return 0
+  note "you are running build $mine, but $newest is installed on this machine.
+    A session keeps the build it started with, and the guards live in this
+    executable - not in the skill text - so this session is missing whatever
+    $newest fixed. Restart the session to pick it up. Until then, the newer
+    build is at:
+      $base/$newest/skills/ping-pong/bin/pp"
+  return 0
+}
+
 side_file()     { printf '%s/%s.side' "$STATE_DIR" "$1"; }
 owner_file()    { printf '%s/%s.owner' "$STATE_DIR" "$1"; }
 listener_file() { printf '%s/%s.listener' "$STATE_DIR" "$1"; }
@@ -228,6 +250,19 @@ assert_owner() {
 bus_marker_pid() {
   bus "sed -n 's/.*pid=\([0-9]*\).*/\1/p' '$BUS_ROOT/$1/listening-$2' 2>/dev/null" | tr -d '[:space:]'
 }
+
+# A marker file is a CLAIM, not proof. The EXIT trap that removes it never runs on
+# SIGKILL - a session killed hard leaves the file behind announcing a listener that
+# no longer exists. Everything that trusts a marker must therefore ask whether its
+# process is still alive, ON THE BUS, where the pid was issued.
+# Prints: live | stale | none
+bus_listener_state() {
+  local id="$1" side="$2"
+  bus "m='$BUS_ROOT/$id/listening-$side'
+    if [ ! -f \"\$m\" ]; then echo none; exit 0; fi
+    p=\$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' \"\$m\")
+    if [ -n \"\$p\" ] && kill -0 \"\$p\" 2>/dev/null; then echo live; else echo stale; fi" 2>/dev/null | tr -d '[:space:]'
+}
 bus_marker_token() {
   bus "sed -n 's/.*token=\([a-z0-9]*\).*/\1/p' '$BUS_ROOT/$1/listening-$2' 2>/dev/null" | tr -d '[:space:]'
 }
@@ -273,6 +308,7 @@ cmd_setup() {
 cmd_open() {
   local topic="$1" label="$2"
   need_config
+  version_notice
   gc_quiet
   local id; id=$(gen_id)
   local created; created=$(date -u +%FT%TZ)
@@ -307,6 +343,7 @@ cmd_open() {
 cmd_join() {
   local id="$1" label="$2" adopt="$3"
   need_config
+  version_notice
   valid_id "$id" || die "invalid id: '$id' (expected form: pp-xxxxxx)"
   gc_quiet
   require_channel "$id"
@@ -347,6 +384,7 @@ cmd_join() {
 cmd_listen() {
   local id="$1" wait_for="$2" label="$3" adopt="$4"
   need_config
+  version_notice
   valid_id "$id" || die "invalid id: '$id'"
   local side; side=$(my_side "$id")
   assert_owner "$id" "$label" "$adopt"
@@ -410,7 +448,12 @@ cmd_send() {
   require_channel "$id"
 
   if [ "$force" != "1" ]; then
-    bus "test -f '$BUS_ROOT/$id/listening-$out'" || die "side $out of channel $id has no listener.
+    local peer; peer=$(bus_listener_state "$id" "$out")
+    [ "$peer" = "stale" ] && die "side $out of channel $id has a STALE marker: it claims a listener, but that process is dead.
+    Its session was killed hard, so the cleanup trap never ran. Delivering into it
+    would look like success and lose the message.
+    Clear it and try again:  pp --gc"
+    [ "$peer" = "live" ] || die "side $out of channel $id has no listener.
     A send with no reader blocks until the timeout, so it was not attempted.
     Ask the other session to run:  pp --listen $id
     If you know it IS listening without pp (a raw cat leaves no marker), retry with:
@@ -487,10 +530,18 @@ cmd_info() {
     elif session_alive "$ow"; then say "  owned by another LIVE session on this machine ($ow)"
     else say "  owner session $ow is gone (adoptable)"; fi
   fi
+  # Report the marker's TRUTH, not its existence. A marker whose process is dead
+  # is worse than no marker: it makes --send deliver into nothing.
   local waiting
   waiting=$(bus "for s in a b; do
       m='$BUS_ROOT/$id/listening-'\$s
-      if [ -f \"\$m\" ]; then echo \"side \$s: LISTENING (\$(cat \"\$m\"))\"; else echo \"side \$s: no listener\"; fi
+      if [ ! -f \"\$m\" ]; then echo \"side \$s: no listener\"; continue; fi
+      c=\$(cat \"\$m\"); p=\$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' \"\$m\")
+      if [ -n \"\$p\" ] && kill -0 \"\$p\" 2>/dev/null; then
+        echo \"side \$s: LISTENING (\$c)\"
+      else
+        echo \"side \$s: STALE MARKER - claims \$c but that process is dead (pp --gc clears it)\"
+      fi
     done" 2>/dev/null)
   [ -n "$waiting" ] && printf '%s\n' "$waiting" | sed 's/^/  /'
 }
@@ -554,6 +605,35 @@ cmd_gc() {
     gc_channel "$id" && true
     n=$((n+1))
   done
+
+  # Orphans that no local record can prove, reaped by a version-independent fact:
+  # a reader whose connection died gets REPARENTED. A healthy remote reader hangs
+  # off a live ssh session (cat -> shell -> sshd); an orphan's parent or
+  # grandparent is pid 1. That check needs no token, no local state and no
+  # matching version, so it also reaches listeners started by older builds - the
+  # gap that left a real orphan alive for 26 minutes while --gc reported nothing.
+  local reaped_any
+  reaped_any=$(bus "for d in '$BUS_ROOT'/pp-*; do
+      [ -d \"\$d\" ] || continue
+      for s in a b; do
+        ps -eo pid=,ppid=,args= | while read -r rp rpp rest; do
+          case \"\$rest\" in *\"cat \$d/to-\$s\"*) ;; *) continue ;; esac
+          gpp=\$(ps -o ppid= -p \"\$rpp\" 2>/dev/null | tr -d ' ')
+          if [ \"\$rpp\" = \"1\" ] || [ \"\$gpp\" = \"1\" ] || [ -z \"\$gpp\" ]; then
+            kill -KILL \"\$rp\" 2>/dev/null
+            kill -KILL \"\$rpp\" 2>/dev/null
+            mp=\$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' \"\$d/listening-\$s\" 2>/dev/null)
+            [ \"\$mp\" = \"\$rpp\" ] && rm -f \"\$d/listening-\$s\"
+            echo \"\$(basename \$d) \$s \$rp\"
+          fi
+        done
+      done
+    done" 2>/dev/null)
+  if [ -n "$reaped_any" ]; then
+    printf '%s\n' "$reaped_any" | while read -r cid cs cp; do
+      [ -n "$cid" ] && say "  reaped disconnected reader: channel $cid side $cs (bus pid $cp)"
+    done
+  fi
 
   # Markers whose remote reader is already dead. No kill needed and no ownership
   # question: the process is gone, only the file lies. Left alone it makes --send
