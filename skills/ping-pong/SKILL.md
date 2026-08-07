@@ -41,7 +41,7 @@ PP="/absolute/path/announced/for/this/skill/bin/pp"
 "$PP" --version        # confirms you resolved it
 ```
 
-Never hardcode a plugin-cache path: it contains the version number and breaks on the next update. The announced base directory is always current.
+Never hardcode a plugin-cache path: it contains the version number and breaks on the next update. Use the announced base directory — but know that it is resolved **once, when the session starts**. A plugin update mid-session does not move it, and neither does reloading skills; `--version` tells you which build you are actually running, and only restarting the session picks up a newer one. That matters because the guards live in the executable, not in this text — see [reference/troubleshooting.md](reference/troubleshooting.md).
 
 One-time per machine, if any command says "not configured yet" — see [reference/pp-cli.md](reference/pp-cli.md#setup):
 
@@ -91,7 +91,9 @@ Both are covered in [reference/troubleshooting.md](reference/troubleshooting.md)
 
 ## Housekeeping
 
-`pp --gc` sweeps this machine: it reaps listeners on the bus whose session is gone, clears listener markers whose process is already dead, and drops local records for channels that no longer exist. It runs automatically before `--open`, `--join` and `--list`, so in normal use you never call it — reach for it when `--listen` refuses because of a listener you believe is stale.
+Since 0.3.0 a listener **dies with its session** — about two seconds after the session goes, the reader on the bus is gone and its marker with it. Orphans are prevented, not swept.
+
+`pp --gc` stays as the backstop for what prevention cannot reach: a hard kill of the whole tree, and listeners started by pre-0.3.0 builds. It reaps readers on the bus whose session is gone, clears markers whose process is already dead, and drops local records for channels that no longer exist. It runs automatically before `--open`, `--join` and `--list`, so in normal use you never call it — reach for it when `--listen` refuses because of a listener you believe is stale.
 
 ## The turn contract
 
@@ -151,6 +153,7 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Re-attaching to a channel id from memory after a dropped connection | You can land on a *different* channel this machine also belongs to, and cross two conversations | Take the id from `pp --list`, which marks which channels are YOURS |
 | Passing `--adopt` to get past an ownership refusal | You take a live channel away from another working session | `--adopt` is for a channel whose owner session is gone, or one you are certain is yours |
 | Inventing a `--as` label per message | The peer sees a different author each time and cannot tell who it is talking to | Pick one short, stable label for the whole channel — the machine or the role, not the task |
+| Deciding a listener is dead because its pid is absent on **your** machine | That pid lives in the bus host's pid namespace; you start a second reader and two block on one FIFO | `pp --info <id>` — it runs the liveness check on the bus, where the pid means something |
 
 **A marker is evidence, not proof.** A listener whose session already ended can stay blocked on the bus for hours, marker and all. The send then *succeeds* and the message is lost into a reader nobody is watching. If a peer goes quiet right after a delivery that looked clean, suspect an orphaned listener — [reference/troubleshooting.md](reference/troubleshooting.md).
 

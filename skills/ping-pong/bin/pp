@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="0.2.0"
+PP_VERSION="0.3.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -59,6 +59,46 @@ bus_stream() {
     ssh) ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=1000 \
              "$bus_ssh" "$1" ;;
   esac
+}
+
+# The listener needs one thing no other call does: to DIE when its client dies.
+# A reader blocked in open(2) on a FIFO has no signal path home - it never writes
+# (no EPIPE), never reads stdin (no channel EOF), and sshd sends no SIGHUP to a
+# non-interactive command. It outlives its session and becomes an orphan that
+# silently swallows messages.
+#
+# Two mechanisms were measured, not assumed:
+#
+#   - Forcing a pty (-tt) so the kernel would SIGHUP the group on hangup: FAILS
+#     here. The remote processes end up with NO controlling terminal (`tty=?`)
+#     and reparented to init, so there is no terminal to hang up. (`stty raw`
+#     does keep the bytes intact, so the classic objection to -tt is wrong -
+#     but the reaping it was wanted for does not happen.)
+#   - A WATCHDOG READING STDIN: works. When the connection drops, sshd closes the
+#     remote command's stdin, so a process *reading stdin* gets EOF and can kill
+#     the blocked reader. That is the mechanism below.
+#
+# The catch: stdin must not be at EOF to begin with. Run as a background command,
+# this process inherits /dev/null, which would fire the watchdog instantly. So a
+# holder process keeps the pipe open, and its life is tied to ours: kill this
+# process tree and the holder dies, the pipe closes, the remote watchdog fires.
+bus_listen_stream() {
+  local snippet="$1"
+  if [ "$bus_mode" = "local" ]; then bash -c "$snippet"; return $?; fi
+
+  local hold; hold=$(mktemp -u "${TMPDIR:-/tmp}/pp-hold-XXXXXX")
+  mkfifo -m 600 "$hold" 2>/dev/null || { ssh -o BatchMode=yes "$bus_ssh" "$snippet"; return $?; }
+  sleep 2147483647 > "$hold" &
+  local holdpid=$!
+
+  ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=1000 \
+      "$bus_ssh" "$snippet" < "$hold"
+  local rc=$?
+
+  kill "$holdpid" 2>/dev/null
+  wait "$holdpid" 2>/dev/null
+  rm -f "$hold"
+  return $rc
 }
 
 bus_label() {
@@ -334,10 +374,21 @@ cmd_listen() {
   local reader="cat '$BUS_ROOT/$id/to-$side'"
   [ "$wait_for" -gt 0 ] 2>/dev/null && reader="timeout $wait_for $reader"
 
-  bus_stream "m='$BUS_ROOT/$id/listening-$side'
+  # The reader runs in the background; a watchdog blocks on stdin and kills it the
+  # moment the client's connection drops. Whichever finishes first ends the other,
+  # so a delivered message and a dead client both exit cleanly - and the EXIT trap
+  # clears the marker either way.
+  bus_listen_stream "m='$BUS_ROOT/$id/listening-$side'
     printf '%s pid=%s token=%s since=%s\n' '$label' \"\$\$\" '$tok' \"\$(date -u +%FT%TZ)\" > \"\$m\"
     trap 'rm -f \"\$m\"' EXIT INT TERM HUP
-    $reader"
+    $reader &
+    r=\$!
+    { cat > /dev/null; kill \$r 2>/dev/null; } &
+    w=\$!
+    wait \$r
+    rc=\$?
+    kill \$w 2>/dev/null
+    exit \$rc"
   local rc=$?
 
   rm -f "$(listener_file "$id")"

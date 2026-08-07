@@ -45,6 +45,29 @@ pp --info <id>       # the authority: marker present or not
 
 A reader with no marker is a raw `cat` (or a listener from an older build). Reach for `--send --force` there, and prefer switching that side to `pp --listen` so the state stays visible.
 
+## The pid in a marker is a bus pid — checking it locally gives a confident wrong answer
+
+Observed: a session read the `listening-<side>` marker, took the pid, ran `kill -0` **on its own machine**, found nothing, and concluded the marker was lying. It then started its own listener to replace the "dead" one — and ended with two readers blocked on the same FIFO, which is precisely the failure the marker exists to prevent. The verification produced the damage it was meant to avoid.
+
+The process was alive the whole time. A listener runs **on the bus host**, launched over ssh, so its pid belongs to the bus's pid namespace. From anywhere else that number fails in two ways, and both are convincing:
+
+- it does not exist locally → you conclude "dead" and double up the readers;
+- it *does* exist locally, as a completely unrelated process → you conclude "alive", or you kill a stranger.
+
+The check has to happen where the pid was issued. `pp --info <id>` already does that — its `kill -0` runs inside the ssh call, which is why its answer is the authority. Probing by hand, the `kill -0` goes *inside* the ssh session, never outside it.
+
+Generalize it: **a pid only means something inside the pid namespace that issued it.** A pid that travels between machines is a number, not a reference — and probing it from the wrong side does not answer "unknown", it answers wrong.
+
+## A session runs the build it started with — updating the plugin does not move it
+
+Measured: after a new version was published and the plugin updated, a session that reloaded its skills **kept executing the binary from the previous version's directory**. The plugin cache keeps one directory per version, each held by the sessions using it; a session resolves its directory once at startup and stays there, so superseded versions are not swept while anyone still holds them.
+
+This matters more than a wrong version number: **the guards live in the executable, not in the skill text.** A session pinned to a build from before a guard existed still suffers the failure that guard closes — and those are the sessions already mid-conversation, with the most to lose.
+
+- `pp --version` is the ground truth for which build you are actually on. Check it before trusting the presence and ownership behavior described in this file.
+- Reloading skills does **not** repin it. Only restarting the session does.
+- Close your channels before restarting (`pp --close <id>`), or you leave a reader blocked on the bus — see [An orphaned listener outlives the session that started it](#an-orphaned-listener-outlives-the-session-that-started-it).
+
 ## Messages appear in the wrong conversation
 
 Channels cannot leak into each other — separate directories, separate FIFOs. But **two sessions can end up on the same side of one channel**, and that produces exactly the same symptom from the outside. This is the failure that motivated ownership; it was observed in production with two channel pairs live.
@@ -100,6 +123,14 @@ Two cases `--close` cannot rescue, because there is no marker to find them by:
 Both have to be killed by pid. Match on the process, never with `pkill -f <pattern>` — `-f` matches every command line including the shell running your own kill command, so a self-matching pattern kills your own session.
 
 ### An orphaned listener outlives the session that started it
+
+**Fixed at the source in 0.3.0** — a listener now dies with its session, measured at roughly two seconds. What follows is why it used to happen, because the same trap catches anything else that blocks on a remote host, and because a listener started by an older build still behaves the old way.
+
+The mechanism that fixes it: the reader runs in the background on the bus while a **watchdog blocks reading stdin**. When the connection drops, sshd closes the remote command's stdin, the watchdog gets EOF and kills the reader; the EXIT trap clears the marker on the way out. Whichever finishes first — a delivered message or a dead client — ends the other.
+
+Two mechanisms were tried before that one, and both failed for instructive reasons. Forcing a pty (`ssh -tt`) so the kernel would `SIGHUP` the group **does not work**: the remote processes end up with no controlling terminal and reparented to init, so there is nothing to hang up. Deleting the FIFO does not work either, for the reason below. `--gc` remains as the backstop for hard kills and for listeners started by pre-0.3.0 builds.
+
+The original failure, for reference:
 
 A remote listener does **not** die when its client does. Measured, not assumed: after the agent session ended and the local `pp --listen` process was gone, the reader on the bus host was still alive and blocked more than an hour later.
 

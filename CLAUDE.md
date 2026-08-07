@@ -40,6 +40,7 @@ Activates when this session must talk to another agent session — the operator 
 - The CLI's operations are **flags**; the bare argument is always the channel id. Every command prints feedback, including when the result is empty.
 - Nothing about the bus is auto-detected — it is declared once per machine in `~/.config/ping-pong/config`.
 - Keep the docs free of real hostnames, aliases, and usernames. The bus is always `<alias>` / "the bus host".
+- **The version chain has three links, and they move together:** `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `PP_VERSION` in `skills/ping-pong/bin/pp`. Two past releases bumped the manifests and left the constant behind, so `--version` reported a stale version in two different builds — and "check which version you are running" stopped being a usable diagnostic exactly when it was needed to tell a build with guards from one without. If the executable prints its own version, that string is part of the release, not a comment.
 
 ## Shipped in 0.2.0: ownership + the reaper
 
@@ -62,11 +63,23 @@ The shape the fix took:
 
 Alternatives already considered and rejected:
 
-- **`ssh -tt` to force a PTY.** It does fix the root cause — with a PTY, disconnection sends `SIGHUP` to the foreground group. But terminal processing rewrites `\n` as `\r\n` on the way out, **corrupting the message bytes**. Unacceptable on a data channel.
+- **`ssh -tt` to force a PTY.** Rejected originally on an untested assumption (that the pty would rewrite `\n` as `\r\n` and corrupt the payload). Half of that was wrong: `stty raw -echo` before the reader keeps the bytes **identical**, multi-line UTF-8 included — measured. But the reaping it was wanted for **does not happen**: the remote processes end up with no controlling terminal (`tty=?`) and reparented to init, so there is no terminal to hang up and no `SIGHUP` is delivered. Measured, and it is why -tt is not in the shipped code.
+- **A watchdog reading stdin.** Rejected originally as "complexity in the wake-up path". **This is what 0.3.0 actually ships**, because it is the only mechanism measured to work: when the connection drops, sshd closes the remote command's stdin, so a process *reading stdin* gets EOF and can kill the blocked reader. Measured: the remote reader now dies on its own ~2s after its session is killed, and the EXIT trap clears the marker with it.
+
+**The methodology lesson, twice over.** Both alternatives were dismissed in writing without a test, and both dismissals were wrong in opposite directions — one was cheaper than believed, the other was the answer all along. The reaper is real work that a ten-minute experiment would have demoted from *the fix* to *the backstop*. And during the retest, a run that appeared to vindicate `-tt` was a **false positive** produced by a sloppy harness (the client process was never actually killed): when a result contradicts a later, more faithful test, suspect the cheerful one.
 - **A default `timeout N` on the listener.** Bounds the orphan's life without signal plumbing, but does not address session end at all: it trades "forever" for "N", and kills legitimately idle conversations. A secondary belt, not the fix.
 - **A remote watchdog on stdin EOF.** It works — remote stdin does get EOF when the client dies — but adds a background process and a `wait` inside the wake-up path, which is complexity exactly where a bug is most expensive.
 
 Generalizable beyond this skill: **a remote process started over ssh does not inherit the mortality of whatever started it.** If it is also blocked without reading or writing, no signal reaches it. Anything that spawns a long-lived remote block needs an explicit way to reap it, designed in from the start — and the record needed to do the reaping must be written *before* the block.
+
+## Known gap: a live session stays pinned to the build it started with
+
+Measured, and now documented in `reference/troubleshooting.md` as a diagnosis with a manual remedy (check `--version`; restart the session to repin, closing channels first). **The remedy is manual only — nothing in the CLI mitigates it yet.** What is *not* built:
+
+- **No self-check.** `pp` does not compare the build it is running against the newest one installed, so a session pinned to a pre-guard build gets no warning at the moment it matters. A cheap version could be a note on `--open` / `--join` when a newer version directory exists alongside its own.
+- **The "invoke through a non-versioned path" workaround is UNVERIFIED.** The idea is that calling the CLI through a stable, non-versioned marketplace path (rather than the session's versioned cache directory) would give an old session the new executable — guards included — even with stale skill text. That path was never confirmed to exist or to be stable across updates, and the harness's own guidance is to use the announced base directory. **Do not document it in the skill until someone verifies the path exists, survives an update, and that the resolved script actually runs.** Documenting an unverified path teaches every future session to run something that may silently fail.
+
+Until one of these is built and verified, the skill must keep presenting session restart as the only reliable repin.
 
 ## Updating this skill
 
