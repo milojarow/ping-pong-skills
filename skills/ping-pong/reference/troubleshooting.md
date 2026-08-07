@@ -9,6 +9,8 @@ Each entry names the **cause**, not just the fix — several of these look like 
 - **The marker is stale.** The listener died without running its cleanup trap — killed with `-9`, or the ssh carrying it was severed. The file lingers, and the send then hangs to the timeout instead.
 - **The peer is listening without `pp`.** A raw `cat` on the FIFO reads fine but writes no marker.
 
+There is a third case that does **not** produce this symptom and is far worse for it: the marker is accurate, the reader really is alive — but its session is long gone. The send then *succeeds*, into a reader nobody is watching. See [An orphaned listener outlives the session that started it](#an-orphaned-listener-outlives-the-session-that-started-it).
+
 Confirm with `pp --info <id>`, and if you know the peer is really there, `pp --send <id> --force`.
 
 ## The listener never wakes even though the peer sent
@@ -76,3 +78,40 @@ Two cases `--close` cannot rescue, because there is no marker to find them by:
 - a listener whose channel directory was deleted by something other than `pp --close` (a `/tmp` cleaner, a manual `rm`).
 
 Both have to be killed by pid. Match on the process, never with `pkill -f <pattern>` — `-f` matches every command line including the shell running your own kill command, so a self-matching pattern kills your own session.
+
+### An orphaned listener outlives the session that started it
+
+A remote listener does **not** die when its client does. Measured, not assumed: after the agent session ended and the local `pp --listen` process was gone, the reader on the bus host was still alive and blocked more than an hour later.
+
+Nothing reaches it, for three reinforcing reasons:
+
+- it writes nothing until a message arrives, so it never takes `EPIPE`/`SIGPIPE`;
+- it is blocked in `open(2)`, not reading stdin, so the EOF of the ssh channel never touches it;
+- sshd closes the channel, but sends no `SIGHUP` to a non-interactive command — there is no PTY.
+
+Same property as the deleted-FIFO case above: what makes the listener cheap — a pure kernel block, zero CPU — is exactly what makes it deaf to everything but a writer.
+
+Why this is not cosmetic:
+
+- orphans accumulate on the bus, one per abandoned session;
+- their `listening-<side>` markers keep claiming somebody is reading, so a `--send` **reports delivery and the message is lost** into a reader nobody will ever see — the one failure shape in this protocol that looks like success;
+- reopening a session can surface a phantom background-task notification belonging to the previous one.
+
+**Reaping one by hand.** The marker already holds what you need: the remote pid, which is also the **process-group leader**.
+
+```
+listening-a  ->  <label> pid=1001 since=<UTC>
+
+    PID    PPID    PGID COMMAND
+   1001    1000    1001 <shell> -c ... trap ... cat '<bus root>/<id>/to-a'
+   1003    1001    1001  \_ cat '<bus root>/<id>/to-a'
+```
+
+Kill the **group**, not the pid: `kill -TERM -<pgid>` on the bus host takes down the shell and its `cat` together, and the shell's EXIT trap removes the marker on its way out. Kill only the shell and the `cat` is reparented to init and stays blocked, marker and all.
+
+Two guards before firing:
+
+- **Confirm identity first.** A pgid can be recycled once the original group is gone. Check that the group's command line still names the channel path.
+- **Kill by numeric pgid, never by pattern.** `pkill -f` matches the shell running your own kill command — the same self-matching trap as above.
+
+There is no automatic reaper in the CLI. Until there is, treat an unexplained silent peer as a possible orphan and check `--info` against whether that session still exists.

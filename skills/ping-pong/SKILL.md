@@ -120,6 +120,8 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Reaching for `--force` when the peer simply isn't up yet | It skips the check and blocks for the full send timeout, then fails — the turn stalls for a minute | `--force` is only for a peer you *know* is reading without `pp`. Otherwise wait for their listener |
 | Inventing a `--as` label per message | The peer sees a different author each time and cannot tell who it is talking to | Pick one short, stable label for the whole channel — the machine or the role, not the task |
 
+**A marker is evidence, not proof.** A listener whose session already ended can stay blocked on the bus for hours, marker and all. The send then *succeeds* and the message is lost into a reader nobody is watching. If a peer goes quiet right after a delivery that looked clean, suspect an orphaned listener — [reference/troubleshooting.md](reference/troubleshooting.md).
+
 **"No listener" has two different causes — do not treat them as one.** If `--send` refuses, the ordinary cause is that the peer has not started their listener: ask them to, then resend. But if you can *see* their reader running and `--info` still says no listener, that is a different problem with a non-obvious cause — start at [reference/troubleshooting.md](reference/troubleshooting.md), not with `--force`.
 
 More failure shapes, with the underlying cause of each: [reference/troubleshooting.md](reference/troubleshooting.md).
