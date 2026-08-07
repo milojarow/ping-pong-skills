@@ -77,6 +77,8 @@ Every time you are woken by a message, produce these three things **in this orde
 
 Listener up, then work, then reply. That ordering is what keeps both sides race-free: at any moment exactly one side is thinking and the other is listening. Details and the failure shapes in [reference/protocol.md](reference/protocol.md).
 
+**It is also how a collision recovers.** If both sides happen to send at the same instant on an idle channel, both messages are delivered correctly — measured — but both listeners end up down at once. Relaunching before you reply absorbs that on the next turn with no extra logic. Two consequences for you: **read the header before assuming a message answers what you asked** (in a tie it is the peer's own initiative, not a reply), and if your send is refused with `has no listener` right after an exchange that looked simultaneous, just wait for the peer to relaunch and resend. See [reference/protocol.md](reference/protocol.md).
+
 **If you already broke the order** — you did the work with your listener down — relaunch the listener now, then send. Anything the peer tried to send during that window was *refused at their end*, not queued for you, so ask them to resend rather than waiting for it.
 
 ## Several channels at once

@@ -68,7 +68,36 @@ The invariant it maintains: **at any moment, exactly one side is thinking and th
 
 Break the ordering — reply first, relaunch after — and there is a window where neither side is listening, so the peer's answer has nowhere to land.
 
-The one case the contract does not cover is **both sides initiating at the same instant** on an idle channel. Both writes then find a listener and both are delivered; each side wakes holding a message it did not expect as an answer. Harmless, but read the header before assuming a message answers your last one.
+The one case the contract does not cover is **both sides initiating at the same instant** on an idle channel. That case is measured, not reasoned about, and it is safe — but its consequence is the reason the contract is more than hygiene.
+
+## A simultaneous send from both sides
+
+**Measured**, with two machines firing against a clock-compensated schedule and a real separation of **1 ms**: both messages are delivered, `rc=0` on both sides, each side receives the *other's* message with the correct `from:` in the header, no corruption and no rejection. Neither side gets its own message back and nothing is lost.
+
+**Why a tie cannot fail — the structural argument.** This is not timing luck, it is impossible by construction:
+
+- Your `--send` targets the **peer's** inbox (`to-<other side>`).
+- The reader of that inbox is the peer's listener, and **the only thing that consumes it is a message arriving at that inbox** — that is, yours.
+- Therefore **your own send never removes the reader you are aiming at**, and the marker check has nothing to race against. Symmetric on the other side.
+
+The TOCTOU window one imagines — check the marker, the marker disappears, write blind — does not exist here: what takes *your* listener down is the peer's message, and that message does not touch the listener *you* are writing to.
+
+### The consequence that actually matters
+
+After a tie **both listeners are down at the same time**. That is the one moment the invariant "exactly one side is thinking and the other is listening" breaks — and it isn't broken by a bug, it's broken by the symmetry.
+
+Measured immediately after: replying without relaunching the listener is **refused** (`side <x> has no listener`). Which means the turn contract — relaunch *before* you reply — is not merely good practice after an ordinary turn: **it is the mechanism that recovers from a collision.** If both sides honor it, the tie absorbs itself on the very next turn and no extra logic is needed anywhere.
+
+The only thing an agent must do differently: **read the header before assuming a message answers what you asked.** In a tie, what arrives is the peer's own initiative, not a reply.
+
+### Proving a tie between two machines
+
+A cross-machine tie is not produced by "firing both commands quickly" — connection latency dominates and you end up measuring a *crossing*, not a tie. You have to **compensate the clock offset**, which means being able to measure it:
+
+- NTP-style offset: `offset = t_remote - (t_before + t_after)/2`, taking the median of several probes. The uncertainty is **±RTT/2**, so the RTT is the ceiling on your precision.
+- **A fresh ssh connection per probe gives RTT ~1.4 s → ±700 ms of uncertainty: useless.** Multiplexing the connection (`ControlMaster` + `ControlPersist`) drops the RTT to ~266 ms → ±133 ms, which is enough.
+- Each side waits for an absolute instant in milliseconds (`date +%s%3N`), the remote one corrected by the offset. Busy-wait, not `sleep` — a `sleep 0.02` injects jitter the size of the effect you are hunting.
+- Record and report the **real** firing instant on each side and the resulting delta. Without it you cannot tell whether you tested a tie or a crossing: on the first, uncompensated run of this experiment the separation was **2 seconds**, and it read exactly like "it worked".
 
 ## Message format
 
