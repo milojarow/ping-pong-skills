@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="0.4.0"
+PP_VERSION="0.4.1"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -412,14 +412,17 @@ cmd_listen() {
   local reader="cat '$BUS_ROOT/$id/to-$side'"
   [ "$wait_for" -gt 0 ] 2>/dev/null && reader="timeout $wait_for $reader"
 
-  # The reader runs in the background; a watchdog blocks on stdin and kills it the
-  # moment the client's connection drops. Whichever finishes first ends the other,
-  # so a delivered message and a dead client both exit cleanly - and the EXIT trap
-  # clears the marker either way.
-  bus_listen_stream "m='$BUS_ROOT/$id/listening-$side'
-    printf '%s pid=%s token=%s since=%s\n' '$label' \"\$\$\" '$tok' \"\$(date -u +%FT%TZ)\" > \"\$m\"
-    trap 'rm -f \"\$m\"' EXIT INT TERM HUP
-    $reader &
+  # The watchdog exists to notice a dropped NETWORK connection: it blocks reading
+  # stdin, which sshd closes when the client goes away. On a local bus there is no
+  # connection to lose - the reader is this process's own child and dies with the
+  # session - and stdin is whatever the harness handed us, typically /dev/null.
+  # Wiring the watchdog there makes the listener kill itself the instant it
+  # starts (measured: exit 143 on every --listen). So: watchdog only over ssh.
+  local body
+  if [ "$bus_mode" = "local" ]; then
+    body="$reader"
+  else
+    body="$reader &
     r=\$!
     { cat > /dev/null; kill \$r 2>/dev/null; } &
     w=\$!
@@ -427,6 +430,12 @@ cmd_listen() {
     rc=\$?
     kill \$w 2>/dev/null
     exit \$rc"
+  fi
+
+  bus_listen_stream "m='$BUS_ROOT/$id/listening-$side'
+    printf '%s pid=%s token=%s since=%s\n' '$label' \"\$\$\" '$tok' \"\$(date -u +%FT%TZ)\" > \"\$m\"
+    trap 'rm -f \"\$m\"' EXIT INT TERM HUP
+    $body"
   local rc=$?
 
   rm -f "$(listener_file "$id")"
