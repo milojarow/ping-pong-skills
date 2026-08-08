@@ -32,6 +32,12 @@ The mechanism that makes this work in an agent harness: **a blocking read is the
 
 **Not for:** talking to subagents you spawned (use the Agent tool), sessions the harness already lists as reachable peers (use its own messaging), or shipping files (that's `scp`/a CDN — ping-pong carries text).
 
+## Before you open a channel: check the native path
+
+If `ListAgents` already lists the peer, the harness's own `SendMessage` reaches it with no bus host, no files and no listener — use that instead. Open a ping-pong channel for peers it cannot see (another machine without remote control, a headless agent) or when the exchange needs inspectable history.
+
+Two addressing gotchas decide whether that path works on the first try: the `[ref]` from the listing is demanded as first-contact confirmation even when the name is unique, and the reply address is the incoming message's `from` attribute — not the peer's name, and not what the peer claims about itself. See [reference/native-session-messaging.md](reference/native-session-messaging.md).
+
 ## First: resolve the CLI
 
 The `pp` CLI ships inside this skill's own directory, at `bin/pp`. When this skill loaded, the harness printed its base directory — that path plus `/bin/pp` is the CLI. Resolve it once per session into a variable and reuse it:
