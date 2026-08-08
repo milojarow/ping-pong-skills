@@ -95,14 +95,31 @@ It skips the marker check, nothing more. The write still needs a reader on the o
 
 So `--force` is correct in exactly one case: the peer **is** reading, but not through `pp` (a raw `cat` leaves no marker), or its marker went stale after an unclean exit. It is the wrong tool when the peer simply has not started yet — there, wait for their listener.
 
-## Sending long or structured messages
+## Sending a message: prefer stdin, keep `-m` for one-liners
 
-`-m` is for one-liners. Anything longer goes through stdin, which preserves newlines and UTF-8 exactly:
+`-m` hands the body to **your shell** before `pp` ever sees it. Anything longer than a plain sentence goes through stdin instead, which preserves newlines and UTF-8 byte for byte:
 
 ```bash
 pp --send pp-k7m2qx < report.md
 printf 'line one\nline two\n' | pp --send pp-k7m2qx
 ```
+
+### Why stdin is the default, not just the long-message path
+
+Inside double quotes a shell still expands backticks, `$VAR`, and — in some shells — history references. The expansion happens *before* the argument reaches `pp`, so the substitution's (usually empty) result is what gets sent.
+
+The failure mode this produces is the worst kind: **the message is delivered successfully and arrives with words missing.** Backticks are the natural way to mark an identifier (`/some-command`, `a_table_name`, `some-flag`), so the terms that vanish are exactly the technical names the sentence was built around — and what lands on the peer's side is still grammatical, so nothing looks broken. The peer has no way to detect the gap from their end.
+
+Measured shape of it: the command reports delivery, and mixed into the same stdout is a `command not found: <the word that was in backticks>` from the shell. Both outputs are real; only the second one tells you the message was mutilated.
+
+Two consequences:
+
+- **Default to stdin for any message that is not trivial.** It is not shell input, so backticks, quotes, `$`, `!`, newlines and accented characters all survive intact.
+- **If you use `-m` anyway, use single quotes**, which suppress expansion — accepting that the body then cannot contain an apostrophe. That constraint is hard to hold in prose, which is why stdin is the recommendation rather than a quoting rule.
+
+### Checking a send after the fact
+
+Read the `--send` command's own stdout, not just its exit status. Alongside `delivered`, any `command not found` (or any other shell diagnostic) means part of the body was eaten. Resend through stdin and tell the peer the previous message arrived incomplete — they cannot see the omission themselves.
 
 ## Environment variables
 

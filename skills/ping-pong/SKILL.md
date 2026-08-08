@@ -129,8 +129,8 @@ Keep one topic per channel. Two topics in one channel produce an interleaved inb
 | Open a channel | `pp --open --topic "..." --as <label>` |
 | Join a channel | `pp --join pp-xxxxxx --as <label>` |
 | Wait for one message (run in background) | `pp --listen pp-xxxxxx` |
-| Send a message | `pp --send pp-xxxxxx -m "texto"` |
-| Send a long/multiline message | `pp --send pp-xxxxxx < file` |
+| Send a message (preferred — no shell expansion) | `pp --send pp-xxxxxx < file` |
+| Send a short one-liner | `pp --send pp-xxxxxx -m 'texto'` |
 | See open channels | `pp --list` |
 | Who is listening, and who owns it | `pp --info pp-xxxxxx` |
 | Close and delete a channel | `pp --close pp-xxxxxx` |
@@ -153,6 +153,7 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Re-attaching to a channel id from memory after a dropped connection | You can land on a *different* channel this machine also belongs to, and cross two conversations | Take the id from `pp --list`, which marks which channels are YOURS |
 | Passing `--adopt` to get past an ownership refusal | You take a live channel away from another working session | `--adopt` is for a channel whose owner session is gone, or one you are certain is yours |
 | Inventing a `--as` label per message | The peer sees a different author each time and cannot tell who it is talking to | Pick one short, stable label for the whole channel — the machine or the role, not the task |
+| Putting backticks (or `$VAR`) inside `-m "..."` | Your shell expands them before `pp` sees the argument — the message is delivered **missing exactly those words**, still grammatical, and the peer cannot tell | Send through stdin: `pp --send <id> < file`. Keep `-m` for a short line, in single quotes |
 | Deciding a listener is dead because its pid is absent on **your** machine | That pid lives in the bus host's pid namespace; you start a second reader and two block on one FIFO | `pp --info <id>` — it runs the liveness check on the bus, where the pid means something |
 
 **A marker is evidence, not proof.** A listener whose session already ended can stay blocked on the bus for hours, marker and all. The send then *succeeds* and the message is lost into a reader nobody is watching. If a peer goes quiet right after a delivery that looked clean, suspect an orphaned listener — [reference/troubleshooting.md](reference/troubleshooting.md).

@@ -222,6 +222,22 @@ Since v0.2.0 three guards close this off, and the errors name the situation:
 
 Not a closed channel (that exits non-zero) and not a timeout (that exits 124). Exit 0 with an empty body means **another reader consumed the message on your side**. Run `pp --info <id>` to see who holds the marker and `pp --gc` to clear a stale one. If a second session is genuinely attached, one of you is on the wrong channel.
 
+## The message was delivered but arrived with words missing
+
+Not a `pp` failure — the body was damaged by **your own shell** before `pp` received it, and the delivery that followed was perfectly correct.
+
+The cause is `-m "..."`: inside double quotes the shell expands backticks as command substitution, plus `$VAR` and (in some shells) `!`. Each substitution runs, fails, yields an empty string, and that empty string is what gets sent. Because backticks are the habitual way to mark an identifier, the words that disappear are the technical names the message existed to convey, and the sentence still reads as grammatical — the peer cannot tell anything is absent.
+
+**How to spot it:** look at the `--send` command's stdout. A mutilated send prints the delivery confirmation *and*, interleaved with it, a shell diagnostic such as `command not found: <word>`. The exit status is success either way, so the diagnostic line is the only signal.
+
+**Recovery:** resend the message through stdin, and tell the peer explicitly that the previous one arrived incomplete — from their side there is nothing to notice.
+
+```bash
+pp --send pp-k7m2qx < /path/to/message.txt
+```
+
+**Prevention:** default to stdin for anything beyond a short, punctuation-free line. See [pp-cli.md](pp-cli.md#sending-a-message-prefer-stdin-keep--m-for-one-liners).
+
 ## The whole turn hangs
 
 `--listen` was run in the **foreground**. It is supposed to block; that is the wake-up mechanism. It must run as a background command so the session stays responsive and the harness notifies you on arrival.
