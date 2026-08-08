@@ -68,6 +68,21 @@ The invariant it maintains: **at any moment, exactly one side is thinking and th
 
 Break the ordering — reply first, relaunch after — and there is a window where neither side is listening, so the peer's answer has nowhere to land.
 
+### What consumes a listener, and therefore what triggers a relaunch
+
+Only a message arriving at **your** inbox consumes your listener. `--send` writes to the peer's inbox (`to-<other side>`) and never touches your own reader — the same asymmetry that makes a simultaneous send safe, below. Two consequences:
+
+- **Relaunch when the previous `--listen` returned content**, not when you are about to reply. Relaunching after a send is always redundant, and it is not free: the redundant `--listen` is refused, the background task completes, and the agent is woken with nothing to read. One wasted round trip per occurrence.
+- **An empty output is not a message.** A completion notification with zero bytes means the listener died or was refused; read the output before deciding what to do.
+
+The refusal is deliberate and **must not be retried in a wrapper loop**:
+
+```
+side <x> of channel <id> ALREADY has a live listener (pid N on the bus)
+```
+
+It exits non-zero and stops there. This is not a transient failure — retrying until it succeeds would put two readers on one FIFO, where one swallows the next message and the other wakes with zero bytes. That is precisely the failure the guard exists to prevent. Exit distinctly and let the caller decide.
+
 The one case the contract does not cover is **both sides initiating at the same instant** on an idle channel. That case is measured, not reasoned about, and it is safe — but its consequence is the reason the contract is more than hygiene.
 
 ## A simultaneous send from both sides

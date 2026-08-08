@@ -105,6 +105,10 @@ Every time you are woken by a message, produce these three things **in this orde
 
 Listener up, then work, then reply. That ordering is what keeps both sides race-free: at any moment exactly one side is thinking and the other is listening. Details and the failure shapes in [reference/protocol.md](reference/protocol.md).
 
+**The trigger is a message ARRIVING, not a message going out.** Only a delivery to your own inbox consumes your listener; `--send` writes to the *peer's* inbox and never touches your reader. So relaunch exactly when the previous `--listen` returned **content** — concretely, when the background task's output is non-empty. Relaunching after a send is always redundant: the listener you started last turn is still up, the second one is refused, and the wake-up it costs you is already spent. The phrase "before you reply" invites this, because you are usually about to reply — read it as *after you received*.
+
+A completion notification with a **0-byte** output is not a message: the listener died or was refused. Read the output before deciding; never relaunch reflexively on the notification alone.
+
 **It is also how a collision recovers.** If both sides happen to send at the same instant on an idle channel, both messages are delivered correctly — measured — but both listeners end up down at once. Relaunching before you reply absorbs that on the next turn with no extra logic. Two consequences for you: **read the header before assuming a message answers what you asked** (in a tie it is the peer's own initiative, not a reply), and if your send is refused with `has no listener` right after an exchange that looked simultaneous, just wait for the peer to relaunch and resend. See [reference/protocol.md](reference/protocol.md).
 
 **If you already broke the order** — you did the work with your listener down — relaunch the listener now, then send. Anything the peer tried to send during that window was *refused at their end*, not queued for you, so ask them to resend rather than waiting for it.
@@ -154,6 +158,7 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Passing `--adopt` to get past an ownership refusal | You take a live channel away from another working session | `--adopt` is for a channel whose owner session is gone, or one you are certain is yours |
 | Inventing a `--as` label per message | The peer sees a different author each time and cannot tell who it is talking to | Pick one short, stable label for the whole channel — the machine or the role, not the task |
 | Putting backticks (or `$VAR`) inside `-m "..."` | Your shell expands them before `pp` sees the argument — the message is delivered **missing exactly those words**, still grammatical, and the peer cannot tell | Send through stdin: `pp --send <id> < file`. Keep `-m` for a short line, in single quotes |
+| Relaunching `--listen` after a `--send` | Your send consumed nothing, so the previous listener is still up: the new one is refused and a whole wake-up is spent arriving at an empty output | Relaunch only when the previous `--listen` actually returned content |
 | Deciding a listener is dead because its pid is absent on **your** machine | That pid lives in the bus host's pid namespace; you start a second reader and two block on one FIFO | `pp --info <id>` — it runs the liveness check on the bus, where the pid means something |
 
 **A marker is evidence, not proof.** A listener whose session already ended can stay blocked on the bus for hours, marker and all. The send then *succeeds* and the message is lost into a reader nobody is watching. If a peer goes quiet right after a delivery that looked clean, suspect an orphaned listener — [reference/troubleshooting.md](reference/troubleshooting.md).
