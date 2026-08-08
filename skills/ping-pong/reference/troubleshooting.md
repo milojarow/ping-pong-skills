@@ -55,6 +55,44 @@ So: **on a machine that suspends or whose WiFi blinks, a listener will die every
 
 What matters operationally is the consequence: while your side is down, the peer's `--send` is **refused, not queued** — there is no mailbox. After recovering a listener, tell the peer to resend anything written during the gap, instead of waiting for a message that was never accepted.
 
+### Each death costs the agent a turn, not just a reconnect
+
+Measured over a few hours on a machine tethered to a phone hotspot, where `--listen` died four times with `Network is unreachable` / `client_loop: send disconnect: Broken pipe` / exit 255.
+
+Every death produces a **background-task completion notification with a 0-byte output file**, and that notification re-invokes the agent. The agent reads nothing, relaunches `--listen`, and the cycle repeats. On a link that flaps, the session burns turns babysitting a socket while the operator is away and nothing is being received — the turn budget goes to reconnects instead of to work.
+
+The mitigation available today is to make the **background command itself** survive a transient drop, so the agent is woken only when a message actually arrives. That is a loop you write around the call when you launch it — `pp` has no retry mode of its own:
+
+```bash
+# a bounded retry loop AROUND pp --listen; not a pp feature
+for i in $(seq 1 120); do
+  if out=$("$PP" --listen "$CHANNEL" 2>&1); then
+    printf '%s\n' "$out"; exit 0          # real message -> wake the agent
+  fi
+  case "$out" in
+    *"ALREADY has a live listener"*) printf '%s\n' "$out"; exit 2 ;;
+  esac
+  sleep 60
+done
+```
+
+Three details decide whether that loop helps or hurts:
+
+1. **Never retry on `ALREADY has a live listener`.** That is not a link failure — it means another session owns the reader, and attaching a second reader to one FIFO means one side swallows the message and the other wakes with zero bytes. Exit distinctly instead of looping.
+2. **Bound the retries**, so a channel that was closed for good cannot spin forever.
+3. **Capture stdout and re-emit it** on success, or the received message dies inside the wrapper.
+
+### Check the local link before the ssh config or the remote host
+
+The instinct on a dropped ssh is to add `ServerAliveInterval`. Check whether it is already set first — in the incident above it was (60 s / 3 / `TCPKeepAlive yes`), so keepalive was never the problem and "fixing" it would have been a change with no defect behind it. `Network is unreachable` is the **local route dying**, not an idle NAT mapping expiring; keepalives do not address it.
+
+```bash
+nmcli -t -g NAME,TYPE,STATE connection show --active   # which link is actually active?
+journalctl -b -u NetworkManager --since "-6h" | grep -ci disconnect
+```
+
+A phone hotspot flaps in a way a stable home link does not. Confirming *which* connection is active costs one command and can redirect the whole investigation.
+
 ### When it repeats, find the underlying cause
 
 ```bash

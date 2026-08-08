@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="0.4.3"
+PP_VERSION="0.4.4"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"

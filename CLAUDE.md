@@ -81,6 +81,18 @@ Measured, and now documented in `reference/troubleshooting.md` as a diagnosis wi
 
 Until one of these is built and verified, the skill must keep presenting session restart as the only reliable repin.
 
+## Known gap: `--listen` has no retry mode, so a flapping link burns agent turns
+
+Measured, and now documented in `reference/troubleshooting.md` as a diagnosis with a manual remedy (wrap the background command in your own bounded retry loop). **The remedy is manual only — `pp` ships no retry of its own.** On a link that flaps, each drop produces a background-task notification with a 0-byte output file, which re-invokes the agent to do nothing but relaunch; four drops in a few hours were measured on a tethered connection.
+
+What is *not* built:
+
+- **No `--listen` retry/persist mode.** The natural shape is an opt-in bounded retry inside the process the harness is watching, so the agent is woken only on a real message: retry on transport failure, re-emit captured stdout on success, and stop after a bounded number of attempts. Whether this belongs as a flag on `--listen` or as a separate wrapper the skill ships in `bin/` is undecided — a flag keeps the golden rule ("relaunch `--listen` before you reply") satisfiable in one call, which is the point.
+- **The refusal cases must not be retried.** `ALREADY has a live listener` means another session owns the reader, not that the link broke; retrying it would attach a second reader to one FIFO, which is exactly the failure ownership exists to prevent. Any built-in retry has to classify the failure before looping — transport failure retries, refusal exits distinctly, a closed channel exits.
+- **A retry loop hides the flap it is papering over.** If it ships, it should still surface *that* it retried and how many times, or the underlying network problem becomes invisible precisely when it is degrading everything else on the machine.
+
+**Do not document a retry flag in the skill until it exists in `bin/pp`.** The troubleshooting entry deliberately presents the loop as shell the caller writes, labelled as not a `pp` feature; documenting it as a flag would teach every future session to run something that fails.
+
 ## Updating this skill
 
 After any session that discovers a new failure shape. Keep entries generic — patterns and causes, never machine or client data. The git log of this repo is the diary.
