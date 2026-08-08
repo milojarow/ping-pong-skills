@@ -19,7 +19,50 @@ Check them in this order:
 
 1. **Are you on the right side?** `pp --info <id>` prints `this machine is side a` (or `b`). Both sides listening on the *same* FIFO would each wait forever. This is impossible through `pp` (side is recorded at open/join) but possible if `PP_SIDE` was set by hand.
 2. **Did the peer's send actually succeed?** It prints `delivered to side <x> of channel <id>`. Without that line, nothing was written.
-3. **Is the ssh still up?** A listener is a long-lived ssh. It runs with keepalives, but a laptop suspend or a network change can still drop it. The task exits non-zero rather than hanging — check the exit status, not just the empty output.
+3. **Is the ssh still up?** A listener is a long-lived ssh. It runs with keepalives, but a laptop suspend or a network change can still drop it. The task exits non-zero rather than hanging — check the exit status, not just the empty output. Then read the **first line of stderr**, which says *which* of three different things broke: [`--listen` exited 255](#listen-exited-255--the-first-line-of-stderr-says-which-of-three-things-broke).
+
+## `--listen` exited 255 — the first line of stderr says which of three things broke
+
+Exit 255 with an empty body is not one failure, it is three, and they need opposite responses. Do not collapse them into "the channel closed or the connection dropped" — the first line of stderr separates them:
+
+| What it says | What broke | What to do |
+|---|---|---|
+| `Network is unreachable` | **Your own local network.** The kernel has no route to the bus at all. | Wait for the link to come back, then relaunch. The peer never learned anything happened. |
+| `Connection timed out` | The link *to* the bus. Could be your network or the bus's. | Probe the bus before concluding — see the three-step proof below. |
+| Empty, with no ssh message | The channel really closed (`--close` from the other side). | `pp --list`: if the id is gone, the conversation is over. |
+
+**`Network is unreachable` is local, always.** It is the kernel reporting it has no route out — the packet never reached the bus. Blaming the remote host, a rebooted bus or an ISP port block is a deduction the data does not support, and it sends the investigation to the wrong machine.
+
+### The three-step proof, in order
+
+Before relaunching a second time, measure instead of assuming:
+
+```bash
+pp --info <id>            # does the channel live? is the peer still listening?
+ssh <bus> uptime          # is the bus healthy and reachable RIGHT NOW?
+stat -c 'born %w  died %y' <task-output-file>   # how long the listener survived
+```
+
+If `--info` answers and the peer shows `LISTENING`, **the channel is healthy and only your side died**. Relaunching is correct and sufficient. A peer that has been listening for hours without moving while your side dies three times is the evidence that the problem is yours, not the channel's.
+
+The listener's lifetime is the datum that reveals the pattern — a socket that dies after hours is a flapping link; one that dies in seconds is something else.
+
+### A listener is a connection, not infrastructure
+
+Measured across three consecutive listeners on a laptop over ordinary home WiFi: **3h52m, 3h02m, 1h05m**. In the same window `NetworkManager` logged four full disconnect/reconnect cycles of the wireless interface. The listener at the other end — on a host with a stable wired link — ran eight hours without a single interruption.
+
+So: **on a machine that suspends or whose WiFi blinks, a listener will die every few hours, and that is not a defect in the channel.** Plan around it rather than debugging it.
+
+What matters operationally is the consequence: while your side is down, the peer's `--send` is **refused, not queued** — there is no mailbox. After recovering a listener, tell the peer to resend anything written during the gap, instead of waiting for a message that was never accepted.
+
+### When it repeats, find the underlying cause
+
+```bash
+journalctl -b -o short-iso -u NetworkManager --since "-12h" \
+  | grep -E "wlan0.*state change: activated ->"
+```
+
+Each line is a link drop. If there are several, the work is not hardening the channel — it is the machine's network, and it degrades everything else that depends on a long-lived connection (ssh, tmux, syncs, downloads).
 
 ## `--listen` returned instantly with no message
 
