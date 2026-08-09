@@ -120,15 +120,32 @@ Listener up, then work, then reply. That ordering is what keeps both sides race-
 
 A completion notification with a **0-byte** output is not a message: the listener died or was refused. Read the output before deciding; never relaunch reflexively on the notification alone.
 
-**And if that notification is the first thing you see after the session was resumed, do nothing.**
-When the operator quits with a listener still blocked, the harness asks them what to do with the
-background process; killing it completes the task, and that completion is still queued. It is
-delivered on the next `claude -c` / `--resume` **before they have typed a single word**, so the
-session wakes and starts working on yesterday's channel by itself. In their words: *"yo todavía ni
-escribo nada y Claude se pone a hacer cosas."* That is not a message and not a request — it is the
-echo of a process that was killed at exit. Say one line naming the channel it came from, and stop.
-Do not relaunch the listener, do not resume the old collaboration, do not touch the repo you were
-working in. The operator opens the session to give it work; wait for that. The empty body alone does not say *what* killed it — the exit status does, and `255` with a broken pipe means the link went away, not the channel. See [reference/troubleshooting.md](reference/troubleshooting.md).
+**And if a background-task event is the first thing you see after a resume, do nothing.**
+
+When the operator quits with a listener still blocked, `/exit` makes them choose what to do with
+the background process. Whatever they pick, the next `claude -c` / `--resume` delivers an event for
+that task **before they have typed a single word**, and a session that obeys the relaunch rule wakes
+up and picks yesterday's collaboration back up on its own. Measured, twice, in the operator's words:
+
+> *"por qué acabo de hacer --resume de sesión y tú ya tenías como trabajos background, o sea,
+> todavía no te decía nada y tú ya estabas trabajando?"*
+
+**Do not key the guard on the task having *completed*.** It usually has not. The observed case
+arrived with no completion record at all, and the harness says so in as many words — this exact
+text is your recognition signal:
+
+> No completion record was found for this background shell command from the previous session. It
+> may have been stopped (via the UI, Monitor timeout, or agent teardown — these leave no transcript
+> marker), or it may have been running when the previous Claude Code process exited.
+
+So the discriminant is neither the exit status nor the word *completed*: it is **a background-task
+event arriving as the first thing after a resume, with no operator input in between.** Its output
+file is 0 bytes, because a listener that was killed never read anything.
+
+That is not a message and not a request — it is the echo of a process that outlived, or died with,
+the previous session. Say one line naming the channel it came from, and stop. Do not relaunch the
+listener, do not resume the old collaboration, do not touch the repo you were working in. The
+operator opens the session to give it work; wait for that. The empty body alone does not say *what* killed it — the exit status does, and `255` with a broken pipe means the link went away, not the channel. See [reference/troubleshooting.md](reference/troubleshooting.md).
 
 **It is also how a collision recovers.** If both sides happen to send at the same instant on an idle channel, both messages are delivered correctly — measured — but both listeners end up down at once. Relaunching before you reply absorbs that on the next turn with no extra logic. Two consequences for you: **read the header before assuming a message answers what you asked** (in a tie it is the peer's own initiative, not a reply), and if your send is refused with `has no listener` right after an exchange that looked simultaneous, just wait for the peer to relaunch and resend. See [reference/protocol.md](reference/protocol.md).
 
