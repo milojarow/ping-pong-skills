@@ -41,14 +41,31 @@ Two addressing gotchas decide whether that path works on the first try: the `[re
 
 ## First: resolve the CLI
 
-The `pp` CLI ships inside this skill's own directory, at `bin/pp`. When this skill loaded, the harness printed its base directory — that path plus `/bin/pp` is the CLI. Resolve it once per session into a variable and reuse it:
+The `pp` CLI ships inside this skill's own directory, at `bin/pp`. **Resolve it through the
+marketplace path, not through the base directory the harness announced when this skill loaded:**
 
 ```bash
-PP="/absolute/path/announced/for/this/skill/bin/pp"
-"$PP" --version        # confirms you resolved it
+PP="$HOME/.claude/plugins/marketplaces/ping-pong-skills/skills/ping-pong/bin/pp"
+[ -x "$PP" ] || PP="<announced-base-dir>/bin/pp"   # fallback if that layout is absent
+"$PP" --version                                    # ALWAYS confirm which build you resolved
 ```
 
-Never hardcode a plugin-cache path: it contains the version number and breaks on the next update. Use the announced base directory — but know that it is resolved **once, when the session starts**. A plugin update mid-session does not move it, and neither does reloading skills; `--version` tells you which build you are actually running, and only restarting the session picks up a newer one. That matters because the guards live in the executable, not in this text — see [reference/troubleshooting.md](reference/troubleshooting.md).
+The announced base directory is a **versioned cache path**, and it is resolved **once, when the
+session started**. A plugin update mid-session does not move it and neither does reloading skills,
+so a long-running session keeps executing whatever build it launched with — silently, with no error,
+because an old `pp` still works. It is the single most common source of confusing behaviour reports:
+the guards live in the executable, not in this text.
+
+The marketplace path is a git checkout that `plugin marketplace update` pulls in place, so it always
+resolves to the newest installed build. Measured on two machines: it exists, it runs, and it kept
+returning the current version across five consecutive marketplace updates in one day — while the
+versioned cache on the same disk still topped out five releases behind, and several of its snapshots
+had a `PP_VERSION` older than the directory they sat in.
+
+`--version` is the check that makes this visible, so run it once per session and believe it over any
+assumption about what is installed. For convenience on a machine you use often, symlink it onto PATH
+once — `ln -s "$PP" ~/.local/bin/pp` — and `pp` tracks the current build from then on. Do **not**
+`--install` a copy: a copy never updates.
 
 One-time per machine, if any command says "not configured yet" — see [reference/pp-cli.md](reference/pp-cli.md#setup):
 

@@ -72,9 +72,38 @@ Alternatives already considered and rejected:
 
 Generalizable beyond this skill: **a remote process started over ssh does not inherit the mortality of whatever started it.** If it is also blocked without reading or writing, no signal reaches it. Anything that spawns a long-lived remote block needs an explicit way to reap it, designed in from the start — and the record needed to do the reaping must be written *before* the block.
 
-## Known gap: a live session stays pinned to the build it started with
+## Closed in 0.6.0: a live session no longer has to stay pinned to a stale build
 
-Measured, and now documented in `reference/troubleshooting.md` as a diagnosis with a manual remedy (check `--version`; restart the session to repin, closing channels first). **The remedy is manual only — nothing in the CLI mitigates it yet.** What shipped, and the constraints it had to satisfy — all three were written
+A session resolves the skill's announced base directory **once, at launch**, and that directory is a
+**versioned cache path**. A plugin update mid-session does not move it, and neither does reloading
+skills — so a long-running session keeps executing the build it launched with, silently, because an
+old `pp` still works. This produced hours of confusing behaviour reports where the guards documented
+in the skill simply were not in the binary being run.
+
+The workaround this file previously listed as **UNVERIFIED** is now verified, so the skill documents
+it. All three demanded proofs, measured on two machines 2026-08-08:
+
+- **The path exists.** `~/.claude/plugins/marketplaces/<name>/skills/ping-pong/bin/pp` is the git
+  checkout that `plugin marketplace update` pulls in place; it sat at the newest commit each time.
+- **The resolved script runs.** `--version`, `--gc`, `--close` and `--list` all executed through it,
+  on both machines.
+- **It survives an update.** Five consecutive marketplace updates in one day, each followed by that
+  path returning the new version.
+
+Meanwhile the versioned cache on the same disk held **eleven** snapshots topping out five releases
+behind what was installed — and several of those snapshots carry a `PP_VERSION` older than the
+directory containing them, which is the version-chain drift fossilised release by release.
+
+Session restart is still the only way to repin the *announced* directory. It is no longer the only
+remedy, because the skill now tells the agent not to depend on that directory at all, and to run
+`--version` once per session and believe it.
+
+What is still **not** built: a self-check that warns when a newer build exists alongside the running
+one. `--version` makes the fact visible on demand; nothing volunteers it.
+
+## Shipped in 0.5.0: `--listen --retry`, and the local holder no longer leaks
+
+What shipped, and the constraints it had to satisfy — all three were written
 here before the code existed, and all three are honoured:
 
 - **`--listen --retry [N]`**, an opt-in bounded retry *inside* the process the
