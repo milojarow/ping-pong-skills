@@ -18,13 +18,18 @@
 
 set -uo pipefail
 
-PP_VERSION="0.4.9"
+PP_VERSION="0.5.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ping-pong"
 BUS_ROOT="${PP_BUS_ROOT:-/tmp/ping-pong}"
 SEND_TIMEOUT="${PP_SEND_TIMEOUT:-60}"
+# --retry: how many attach attempts, and how long between them. The default
+# tolerates a link that is gone for about five minutes, which covers the
+# disconnect/reconnect cycles measured on WiFi and on a phone tether.
+PP_RETRY_DEFAULT="${PP_RETRY_DEFAULT:-60}"
+PP_RETRY_DELAY="${PP_RETRY_DELAY:-5}"
 
 bus_mode=""
 bus_ssh=""
@@ -91,6 +96,14 @@ bus_listen_stream() {
   sleep 2147483647 > "$hold" &
   local holdpid=$!
 
+  # The inline cleanup below only runs when ssh RETURNS. Killed before that -
+  # the harness reaping the background task, the session ending, a signal - it
+  # never runs, and the holder plus its FIFO outlive us. Measured on this
+  # machine: sleeps orphaned for over a day and seven stale FIFOs, none of which
+  # --gc can see (it sweeps the bus, not local /tmp). One attach leaked one of
+  # each; a retry loop attaches many times, so the trap is not optional here.
+  trap 'kill "$holdpid" 2>/dev/null; rm -f "$hold"' EXIT INT TERM HUP
+
   ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=1000 \
       "$bus_ssh" "$snippet" < "$hold"
   local rc=$?
@@ -98,6 +111,7 @@ bus_listen_stream() {
   kill "$holdpid" 2>/dev/null
   wait "$holdpid" 2>/dev/null
   rm -f "$hold"
+  trap - EXIT INT TERM HUP
   return $rc
 }
 
@@ -438,13 +452,118 @@ cmd_listen() {
     $body"
   local rc=$?
 
-  rm -f "$(listener_file "$id")"
+  # Keep the local record when the TRANSPORT died (255): the reader on the bus
+  # can outlive the ssh client that started it - measured at 1h12m - and this
+  # file holds the only proof that the survivor is ours (its token). Dropping it
+  # here is what made those orphans unreapable: --gc needs the token to know it
+  # is killing its own reader and not another session's live one.
+  [ $rc -eq 255 ] || rm -f "$(listener_file "$id")"
 
   if [ $rc -eq 124 ]; then
     say "pp: nothing arrived within ${wait_for}s (channel $id is still open)"
     exit 124
   fi
   return $rc
+}
+
+# A lost link does not necessarily kill the reader at the far end: sshd only
+# closes the remote stdin when it notices, and a remote reader was measured
+# surviving its own client by 1h12m. That survivor still holds the FIFO, so the
+# next attach hits "side X ALREADY has a live listener" - a refusal, correctly
+# never retried - and the retry would surrender in exactly the case it exists
+# for. So clear our own corpse first.
+#
+# gc_channel cannot do this job: it treats a live local pid as proof of health
+# and returns early, and during a retry the live local pid is US.
+#
+# The token is the safety gate, and it is not optional. It proves the reader on
+# the bus is the one THIS process started. A reader with any other token belongs
+# to somebody else and is left strictly alone - reaping blind here would
+# recreate the crossed-channels incident that ownership was built to prevent.
+reap_my_orphan() {
+  local id="$1"
+  local lf; lf=$(listener_file "$id")
+  [ -r "$lf" ] || return 0
+  local side tok mtok mpid
+  side=$(sed -n 's/^side=//p' "$lf" | tr -d '[:space:]')
+  tok=$(sed -n 's/^token=//p' "$lf" | tr -d '[:space:]')
+  if valid_tok "$tok" && [ -n "$side" ]; then
+    mtok=$(bus_marker_token "$id" "$side")
+    mpid=$(bus_marker_pid "$id" "$side")
+    if [ "$mtok" = "$tok" ] && [ -n "$mpid" ]; then
+      if [ "$(reap_remote "$id" "$side" "$mpid")" = "reaped" ]; then
+        note "cleared my own reader left on the bus (pid $mpid) before reattaching"
+      fi
+    fi
+  fi
+  rm -f "$lf"
+}
+
+# Re-attach across TRANSPORT failures only, inside the process the harness is
+# watching, so the agent is woken by a message and not by a dropped link.
+#
+# The classification is the whole point. Every one of these produces an empty
+# body, so "no output" proves nothing; the exit status is what separates them:
+#
+#   255            the ssh client itself died - a lost link. RETRY.
+#   1              a refusal (ownership, a live listener on this side). EXIT.
+#                  Retrying a refusal would attach a second reader to one FIFO,
+#                  which is the exact failure ownership exists to prevent.
+#   124            --wait elapsed. The caller asked for a bound; honour it.
+#   0 + body       a real message. Emit and stop.
+#   0 + no body    the peer closed the channel. Nothing left to listen to.
+#   anything else  NOT transport - on the ssh path this is the shape a
+#                  watchdog kill would take. Refuse to loop over it: hiding a
+#                  deterministic bug inside a retry turns it into silent flapping.
+#
+# Drops are always reported, even on success. A retry that stays quiet makes the
+# flapping link invisible exactly while it degrades everything else.
+cmd_listen_retry() {
+  local id="$1" wait_for="$2" label="$3" adopt="$4" attempts="$5"
+  local n=0 drops=0 out rc
+
+  while :; do
+    n=$((n + 1))
+    out=$(cmd_listen "$id" "$wait_for" "$label" "$adopt"); rc=$?
+
+    case "$rc" in
+      124)
+        [ -n "$out" ] && say "$out"
+        [ "$drops" -gt 0 ] && note "reattached $drops time(s) before the wait elapsed"
+        return 124
+        ;;
+      0)
+        if [ -n "$out" ]; then
+          say "$out"
+          [ "$drops" -gt 0 ] && note "message received after $drops transport drop(s)"
+          return 0
+        fi
+        note "channel $id closed by the peer - nothing left to listen to"
+        return 0
+        ;;
+      1)
+        # cmd_listen already explained itself on stderr. Not a link problem.
+        return 1
+        ;;
+      255)
+        drops=$((drops + 1))
+        if [ "$n" -ge "$attempts" ]; then
+          note "link lost $drops time(s); gave up after $attempts attempt(s) on channel $id"
+          note "the channel is fine - this side could not reach the bus. Relaunch when the link is back."
+          return 255
+        fi
+        note "link lost (attempt $n/$attempts) - reattaching to $id in ${PP_RETRY_DELAY}s"
+        sleep "$PP_RETRY_DELAY"
+        reap_my_orphan "$id"
+        ;;
+      *)
+        note "listener on $id exited $rc with no message. That is NOT a transport failure:"
+        note "  transport dies as 255 with a broken pipe. Not looping over it - a retry here"
+        note "  would hide a deterministic kill (watchdog, OOM, signal) as silent flapping."
+        return "$rc"
+        ;;
+    esac
+  done
 }
 
 cmd_send() {
@@ -719,6 +838,10 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   --as <label>    signature on your messages (default: short hostname)
   --force         send even if no listener is detected (blocks up to the timeout)
   --wait N        with --listen: give up after N seconds, exit 124
+  --retry [N]     with --listen: survive a dropped LINK without waking the
+                  agent. Re-attaches on transport failure only (N attempts,
+                  default 60, 5s apart); a refusal or a closed channel still
+                  exits at once. Drops are always reported on stderr.
   --adopt         with open/join/listen/send/close: override an ownership refusal
 
   --install       copy this script to ~/.local/bin/pp
@@ -735,7 +858,7 @@ EOF
 
 # ---------------------------------------------------------------------- parser
 
-op="" id="" topic="" body="" label="" wait_for=0 force=0 adopt=0
+op="" id="" topic="" body="" label="" wait_for=0 force=0 adopt=0 retries=0
 setup_args=()
 
 while [ $# -gt 0 ]; do
@@ -755,6 +878,14 @@ while [ $# -gt 0 ]; do
     -m|--message) shift; body="${1:-}" ;;
     -a|--as) shift; label="$(sanitize "${1:-}")" ;;
     -w|--wait) shift; wait_for="${1:-0}" ;;
+    -r|--retry)
+      # The count is OPTIONAL. Only a bare number is consumed, so the channel id
+      # can follow the flag without being eaten as an attempt count.
+      case "${2:-}" in
+        ''|*[!0-9]*) retries="$PP_RETRY_DEFAULT" ;;
+        *) retries="$2"; shift ;;
+      esac
+      ;;
     -f|--force) force=1 ;;
     --adopt) adopt=1; [ -z "$op" ] && op="adopt" ;;
     -h|--help) usage; exit 0 ;;
@@ -774,7 +905,14 @@ case "$op" in
   adopt) [ -n "$id" ] || die "--adopt needs the channel id"; cmd_adopt "$id" "$label" ;;
   open) cmd_open "$topic" "$label" ;;
   join) [ -n "$id" ] || die "--join needs the channel id"; cmd_join "$id" "$label" "$adopt" ;;
-  listen) [ -n "$id" ] || die "--listen needs the channel id"; cmd_listen "$id" "$wait_for" "$label" "$adopt" ;;
+  listen)
+    [ -n "$id" ] || die "--listen needs the channel id"
+    if [ "$retries" -gt 0 ] 2>/dev/null; then
+      cmd_listen_retry "$id" "$wait_for" "$label" "$adopt" "$retries"
+    else
+      cmd_listen "$id" "$wait_for" "$label" "$adopt"
+    fi
+    ;;
   send)
     [ -n "$id" ] || die "--send needs the channel id"
     if [ -z "$body" ]; then

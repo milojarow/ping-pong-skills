@@ -61,14 +61,18 @@ One-time per machine, if any command says "not configured yet" — see [referenc
 **Invoked with no argument → you are the INITIATOR:**
 
 1. `"$PP" --open --topic "<what this channel is about>" --as <short-label>`
-2. Start your listener **in the background**: `"$PP" --listen <id>`
+2. Start your listener **in the background**: `"$PP" --listen <id> --retry`
+   (`--retry` rides out a dropped link instead of waking you to relaunch; see
+   [reference/troubleshooting.md](reference/troubleshooting.md).)
 3. Give the operator the one line to paste into the other session: `/ping-pong <id>`
 4. Stop and wait. The harness wakes you when the peer writes.
 
 **Invoked with a `pp-xxxxxx` argument → you are the JOINER:**
 
 1. `"$PP" --join <id> --as <short-label>`
-2. Start your listener **in the background**: `"$PP" --listen <id>`
+2. Start your listener **in the background**: `"$PP" --listen <id> --retry`
+   (`--retry` rides out a dropped link instead of waking you to relaunch; see
+   [reference/troubleshooting.md](reference/troubleshooting.md).)
 3. Send a greeting so the peer knows you're on: `"$PP" --send <id> -m "<greeting + what you're working on>"`
 4. Stop and wait.
 
@@ -105,7 +109,7 @@ Since 0.3.0 a listener **dies with its session** — about two seconds after the
 
 Every time you are woken by a message, produce these three things **in this order**:
 
-1. **Relaunch the listener first** — `"$PP" --listen <id>` in the background, before anything else. Your listener consumed itself delivering the message; until it is back up, the peer's next message has nowhere to land.
+1. **Relaunch the listener first** — `"$PP" --listen <id> --retry` in the background, before anything else. Your listener consumed itself delivering the message; until it is back up, the peer's next message has nowhere to land.
 2. **Then do the work** the message asks for.
 3. **Then reply** — `"$PP" --send <id> -m "..."`, and tell the operator what was exchanged.
 
@@ -138,7 +142,7 @@ Keep one topic per channel. Two topics in one channel produce an interleaved inb
 |---|---|
 | Open a channel | `pp --open --topic "..." --as <label>` |
 | Join a channel | `pp --join pp-xxxxxx --as <label>` |
-| Wait for one message (run in background) | `pp --listen pp-xxxxxx` |
+| Wait for one message (run in background) | `pp --listen pp-xxxxxx --retry` |
 | Send a message (preferred — no shell expansion) | `pp --send pp-xxxxxx < file` |
 | Send a short one-liner | `pp --send pp-xxxxxx -m 'texto'` |
 | See open channels | `pp --list` |

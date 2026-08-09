@@ -91,52 +91,38 @@ Measured over a few hours on a machine tethered to a phone hotspot, where `--lis
 
 Every death produces a **background-task completion notification with a 0-byte output file**, and that notification re-invokes the agent. The agent reads nothing, relaunches `--listen`, and the cycle repeats. On a link that flaps, the session burns turns babysitting a socket while the operator is away and nothing is being received — the turn budget goes to reconnects instead of to work.
 
-The mitigation available today is to make the **background command itself** survive a transient drop, so the agent is woken only when a message actually arrives. That is a loop you write around the call when you launch it — `pp` has no retry mode of its own:
+The remedy is a flag, and it lives inside the process the harness is watching:
 
 ```bash
-# a bounded retry loop AROUND pp --listen; not a pp feature
-for i in $(seq 1 120); do
-  if out=$("$PP" --listen "$CHANNEL" 2>&1); then
-    printf '%s\n' "$out"; exit 0          # real message -> wake the agent
-  fi
-  case "$out" in
-    *"ALREADY has a live listener"*) printf '%s\n' "$out"; exit 2 ;;
-  esac
-  sleep 60
-done
+pp --listen <id> --retry          # 60 attempts, 5s apart (~5 min of dead link)
+pp --listen <id> --retry 240      # tolerate longer outages
 ```
 
-Three details decide whether that loop helps or hurts:
+`--retry` re-attaches on **transport failure only**, so the agent is woken by a
+message and not by a dropped link. What it deliberately does not swallow:
 
-1. **Never retry on `ALREADY has a live listener`.** That is not a link failure — it means another session owns the reader, and attaching a second reader to one FIFO means one side swallows the message and the other wakes with zero bytes. Exit distinctly instead of looping.
-2. **Bound the retries**, so a channel that was closed for good cannot spin forever.
-3. **Capture stdout and re-emit it** on success, or the received message dies inside the wrapper.
+| Exit | What it is | What `--retry` does |
+|---|---|---|
+| `255` | the ssh client died — a lost link | re-attaches, after clearing its own reader left on the bus |
+| `1` | a refusal (ownership, a live listener on this side) | exits at once; retrying would put a second reader on one FIFO |
+| `124` | `--wait` elapsed | honours the bound you asked for |
+| `0` + body | a real message | prints it and stops |
+| `0` + nothing | the peer closed the channel | stops; there is nothing left to listen to |
+| anything else | **not transport** | stops loudly — see below |
 
-### The cheapest mitigation is not needing a listener at all
+That last row is the safety property, not a detail. **Every one of these failures
+produces an empty body, so "no output" proves nothing; the exit status is what
+separates them.** A death with 0 bytes and a status other than 255 is the shape a
+watchdog kill takes, and looping over it would convert a deterministic bug into
+silent flapping — the failure mode a retry is most likely to create. `--retry`
+refuses to loop there and says so.
 
-The pair that flaps most is often the pair that no longer needs a channel. If both sessions can see each other in `ListAgents`, the harness's own `SendMessage` reaches them with **no background process and no socket of their own** — it queues, so there is no listener to die. Measured: two sessions on one machine, and one session against a remote host reachable by Remote Control, held round-trip exchanges without opening a single channel.
+Drops are always reported on stderr, including on success (`message received
+after 2 transport drop(s)`). A retry that stays quiet hides the degrading link
+exactly while it degrades everything else on the machine.
 
-So for a peer the listing can reach, listener death stops existing rather than being mitigated. Reserve the channel for what the listing cannot reach — and there, today, the only mitigation is the bounded loop written by whoever launches the command. See [native-session-messaging.md](native-session-messaging.md).
-
-### Check the local link before the ssh config or the remote host
-
-The instinct on a dropped ssh is to add `ServerAliveInterval`. Check whether it is already set first — in the incident above it was (60 s / 3 / `TCPKeepAlive yes`), so keepalive was never the problem and "fixing" it would have been a change with no defect behind it. `Network is unreachable` is the **local route dying**, not an idle NAT mapping expiring; keepalives do not address it.
-
-```bash
-nmcli -t -g NAME,TYPE,STATE connection show --active   # which link is actually active?
-journalctl -b -u NetworkManager --since "-6h" | grep -ci disconnect
-```
-
-A phone hotspot flaps in a way a stable home link does not. Confirming *which* connection is active costs one command and can redirect the whole investigation.
-
-### When it repeats, find the underlying cause
-
-```bash
-journalctl -b -o short-iso -u NetworkManager --since "-12h" \
-  | grep -E "wlan0.*state change: activated ->"
-```
-
-Each line is a link drop. If there are several, the work is not hardening the channel — it is the machine's network, and it degrades everything else that depends on a long-lived connection (ssh, tmux, syncs, downloads).
+Without the flag, each drop still costs a turn — that is the pre-0.5.0 behaviour
+and the reason the flag exists.
 
 ## `--listen` returned instantly with no message
 

@@ -74,28 +74,44 @@ Generalizable beyond this skill: **a remote process started over ssh does not in
 
 ## Known gap: a live session stays pinned to the build it started with
 
-Measured, and now documented in `reference/troubleshooting.md` as a diagnosis with a manual remedy (check `--version`; restart the session to repin, closing channels first). **The remedy is manual only — nothing in the CLI mitigates it yet.** What is *not* built:
+Measured, and now documented in `reference/troubleshooting.md` as a diagnosis with a manual remedy (check `--version`; restart the session to repin, closing channels first). **The remedy is manual only — nothing in the CLI mitigates it yet.** What shipped, and the constraints it had to satisfy — all three were written
+here before the code existed, and all three are honoured:
 
-- **No self-check.** `pp` does not compare the build it is running against the newest one installed, so a session pinned to a pre-guard build gets no warning at the moment it matters. A cheap version could be a note on `--open` / `--join` when a newer version directory exists alongside its own.
-- **The "invoke through a non-versioned path" workaround is UNVERIFIED.** The idea is that calling the CLI through a stable, non-versioned marketplace path (rather than the session's versioned cache directory) would give an old session the new executable — guards included — even with stale skill text. That path was never confirmed to exist or to be stable across updates, and the harness's own guidance is to use the announced base directory. **Do not document it in the skill until someone verifies the path exists, survives an update, and that the resolved script actually runs.** Documenting an unverified path teaches every future session to run something that may silently fail.
+- **`--listen --retry [N]`**, an opt-in bounded retry *inside* the process the
+  harness watches (default 60 attempts, 5s apart; `PP_RETRY_DEFAULT` /
+  `PP_RETRY_DELAY` override). It stays a flag rather than a separate wrapper so
+  the golden rule ("relaunch before you reply") is satisfiable in one call.
+- **Refusals are never retried.** The classifier keys on the exit status:
+  255 retries, 1 exits, 124 honours the bound, 0-with-body delivers,
+  0-without-body means the peer closed. Anything else stops **loudly** — that is
+  the watchdog shape, and looping over it is precisely how a retry turns a
+  deterministic bug into silent flapping. The discriminant survives in the code
+  and in the docs: *every one of these produces an empty body, so the empty body
+  proves nothing; the status is what separates them.*
+- **The flap stays visible.** Drop counts go to stderr even on success.
 
-Until one of these is built and verified, the skill must keep presenting session restart as the only reliable repin.
+Two defects were found while building it, both by review rather than by running:
 
-## Known gap: `--listen` has no retry mode, so a flapping link burns agent turns
+- **A lost link does not always kill the far reader** (measured: a remote reader
+  outlived its client by 1h12m). The survivor holds the FIFO, so the next attach
+  hits `ALREADY has a live listener` — a refusal, correctly not retried — and the
+  retry would have surrendered in exactly the case it exists for. `gc_channel`
+  cannot help: it treats a live local pid as proof of health and returns early,
+  and during a retry the live local pid is us. Hence `reap_my_orphan`, gated on
+  the **token** so it can only ever kill the reader this process started; any
+  other token is left strictly alone rather than recreating the crossed-channels
+  incident.
+- **The local holder leaked.** `bus_listen_stream` cleaned up its `sleep` and
+  FIFO only when ssh *returned*; killed before that, both outlived the process,
+  and `--gc` never saw them because it sweeps the bus, not local `/tmp`.
+  Measured on a live machine: sleeps orphaned for over a day, seven stale FIFOs.
+  Now trapped on EXIT/INT/TERM/HUP. Verified against the pre-fix code as a
+  control: control leaks one FIFO per kill, the fixed version leaks none.
 
-Measured, and now documented in `reference/troubleshooting.md` as a diagnosis with a manual remedy (wrap the background command in your own bounded retry loop). **The remedy is manual only — `pp` ships no retry of its own.** On a link that flaps, each drop produces a background-task notification with a 0-byte output file, which re-invokes the agent to do nothing but relaunch; four drops in a few hours were measured on a tethered connection.
-
-**The cause is now established, and it settles whether the retry is a fix or a cover-up.** The deaths are **transport** — the ssh client dying with `exit 255` plus a broken pipe / `Network is unreachable` — and *not* the 0.3.0 stdin-EOF watchdog. A watchdog kill cannot produce that signature: on that path the connection is healthy, the remote reader is what dies, and ssh returns the **remote command's** status, never 255 with a broken pipe. Two independent instruments agree (explicit 255s on a tethered link; four `NetworkManager` disconnect cycles across a WiFi run while the wired end held eight hours). The side-by-side asymmetry that first implicated the watchdog — zero survivors on the ssh side across four channels versus 4h20m and 1h12m on the local-bus side — is explained by the same transport cause, since only the ssh side has a link to lose.
-
-Why that decides the design: against transport failure a bounded retry is **exactly** the right remedy; against a watchdog kill the same retry would have converted a deterministic bug into silent flapping. So the retry is worth building — and whatever ships should preserve the discriminant (**0 bytes with an exit status other than 255 = watchdog, not transport**) so a future regression cannot hide inside the loop. No such death has been recorded yet.
-
-What is *not* built:
-
-- **No `--listen` retry/persist mode.** The natural shape is an opt-in bounded retry inside the process the harness is watching, so the agent is woken only on a real message: retry on transport failure, re-emit captured stdout on success, and stop after a bounded number of attempts. Whether this belongs as a flag on `--listen` or as a separate wrapper the skill ships in `bin/` is undecided — a flag keeps the golden rule ("relaunch `--listen` before you reply") satisfiable in one call, which is the point.
-- **The refusal cases must not be retried.** `ALREADY has a live listener` means another session owns the reader, not that the link broke; retrying it would attach a second reader to one FIFO, which is exactly the failure ownership exists to prevent. Any built-in retry has to classify the failure before looping — transport failure retries, refusal exits distinctly, a closed channel exits.
-- **A retry loop hides the flap it is papering over.** If it ships, it should still surface *that* it retried and how many times, or the underlying network problem becomes invisible precisely when it is degrading everything else on the machine.
-
-**Do not document a retry flag in the skill until it exists in `bin/pp`.** The troubleshooting entry deliberately presents the loop as shell the caller writes, labelled as not a `pp` feature; documenting it as a flag would teach every future session to run something that fails.
+Still true, and worth keeping: **the retry is the backup, not the answer.** When
+`ListAgents` already lists the peer, the native path has no listener to keep
+alive, so the failure mode does not get mitigated — it stops existing. The retry
+earns its place only where a channel is mandatory.
 
 ## Updating this skill
 
