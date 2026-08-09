@@ -34,7 +34,8 @@ The mechanism that makes this work in an agent harness: **a blocking read is the
 
 ## Before you open a channel: check the native path
 
-If `ListAgents` already lists the peer, the harness's own `SendMessage` reaches it with no bus host, no files and no listener — use that instead. Open a ping-pong channel for peers it cannot see (another machine without remote control, a headless agent) or when the exchange needs inspectable history.
+If `ListAgents` already lists the peer, the harness's own `SendMessage` reaches it with no bus host, no files and no listener — use that instead. Open a ping-pong channel for one reason only: **the peer is not on that list** — a session on a
+machine with no remote control, or a headless agent.
 
 Two addressing gotchas decide whether that path works on the first try: the `[ref]` from the listing is demanded as first-contact confirmation even when the name is unique, and the reply address is the incoming message's `from` attribute — not the peer's name, and not what the peer claims about itself. See [reference/native-session-messaging.md](reference/native-session-messaging.md).
 

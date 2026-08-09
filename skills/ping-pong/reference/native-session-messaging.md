@@ -61,7 +61,8 @@ That last part is a real trap: a peer can assert in its own message text "reply 
 - A listed peer is alive, and the message is queued for it. There is no "busy" state — it drains on the peer's next round of tool calls.
 - **Nothing here can die between turns.** There is no background process and no socket of your own, so the listener-death failure mode simply does not exist on this path — measured across round-trip exchanges both between two sessions on one machine and between a session and a remote host reached by Remote Control, none of which opened a channel. On a flapping link that is worth more than any retry around `--listen`.
 - **Permissions are per session.** Asking a peer to run something *you* were denied is permission laundering. That goes back to the operator; it does not get routed to the peer.
-- Nothing is written to disk, so there is no history to re-read afterwards.
+- Nothing is written to disk. Neither does a ping-pong channel — see below — so this is not a
+  reason to prefer one over the other.
 
 ## `ListAgents` is a live census, not a registry
 
@@ -74,5 +75,13 @@ Two consequences:
 
 ## When you still need a ping-pong channel
 
-- The peer is **not** a session visible in `ListAgents` — a session on another machine with no remote control, or a headless agent.
-- You need persistent, inspectable history of the exchange.
+One reason, and it is the only one: **the peer is not visible in `ListAgents`** — a session on
+another machine with no remote control, or a headless agent.
+
+**It is not for history.** A ping-pong channel keeps none. A channel on the bus is a `meta` file,
+two FIFOs and a listener marker; the FIFOs are 0 bytes forever because the payload passes through
+memory and is consumed by the read. Nothing in the CLI logs a message anywhere.
+
+And a third copy would be redundant even if it existed: each side's own transcript already records
+what it sent and what it received, so the exchange is recoverable in duplicate from either end. If
+you want to re-read a conversation between two sessions, read either session.
