@@ -118,11 +118,49 @@ Listener up, then work, then reply. That ordering is what keeps both sides race-
 
 **The trigger is a message ARRIVING, not a message going out.** Only a delivery to your own inbox consumes your listener; `--send` writes to the *peer's* inbox and never touches your reader. So relaunch exactly when the previous `--listen` returned **content** — concretely, when the background task's output is non-empty. Relaunching after a send is always redundant: the listener you started last turn is still up, the second one is refused, and the wake-up it costs you is already spent. The phrase "before you reply" invites this, because you are usually about to reply — read it as *after you received*.
 
-A completion notification with a **0-byte** output is not a message: the listener died or was refused. Read the output before deciding; never relaunch reflexively on the notification alone. The empty body alone does not say *what* killed it — the exit status does, and `255` with a broken pipe means the link went away, not the channel. See [reference/troubleshooting.md](reference/troubleshooting.md).
+A completion notification with a **0-byte** output is not a message: the listener died or was refused. Read the output before deciding; never relaunch reflexively on the notification alone.
+
+**And if that notification is the first thing you see after the session was resumed, do nothing.**
+When the operator quits with a listener still blocked, the harness asks them what to do with the
+background process; killing it completes the task, and that completion is still queued. It is
+delivered on the next `claude -c` / `--resume` **before they have typed a single word**, so the
+session wakes and starts working on yesterday's channel by itself. In their words: *"yo todavía ni
+escribo nada y Claude se pone a hacer cosas."* That is not a message and not a request — it is the
+echo of a process that was killed at exit. Say one line naming the channel it came from, and stop.
+Do not relaunch the listener, do not resume the old collaboration, do not touch the repo you were
+working in. The operator opens the session to give it work; wait for that. The empty body alone does not say *what* killed it — the exit status does, and `255` with a broken pipe means the link went away, not the channel. See [reference/troubleshooting.md](reference/troubleshooting.md).
 
 **It is also how a collision recovers.** If both sides happen to send at the same instant on an idle channel, both messages are delivered correctly — measured — but both listeners end up down at once. Relaunching before you reply absorbs that on the next turn with no extra logic. Two consequences for you: **read the header before assuming a message answers what you asked** (in a tie it is the peer's own initiative, not a reply), and if your send is refused with `has no listener` right after an exchange that looked simultaneous, just wait for the peer to relaunch and resend. See [reference/protocol.md](reference/protocol.md).
 
 **If you already broke the order** — you did the work with your listener down — relaunch the listener now, then send. Anything the peer tried to send during that window was *refused at their end*, not queued for you, so ask them to resend rather than waiting for it.
+
+## When the exchange is over, close the channel
+
+Ending the session is the operator's call, not yours. But leaving a listener blocked once the
+collaboration is finished is not neutral — they pay for it three times:
+
+- **At exit.** `/exit` warns about a background process and makes them choose. There is no good
+  option: "exit anyway" kills the listener, "keep the process" leaves an orphan behind.
+- **On the next launch.** The kill completes the background task, and its notification is delivered
+  before they type anything — see the rule above.
+- **On the next channel.** A reader on the bus can outlive the client that started it (measured at
+  1h12m), so its marker stays and the next `--listen` on that side is refused with
+  `ALREADY has a live listener`, which reads as the channel being broken.
+
+So when the work the channel was opened for is done, wind it down instead of leaving it blocked:
+
+```bash
+"$PP" --send <id> -m "done here — closing the channel"
+"$PP" --close <id>
+```
+
+`--close` signals the peer's blocked listener before deleting the FIFOs, so their side wakes with an
+empty read and learns the conversation is over rather than hanging. After that neither side has a
+background process, `/exit` is silent, and the next launch starts on the operator's prompt.
+
+If you are unsure whether the collaboration is really finished, ask the operator in one line rather
+than leaving a listener up by default. A channel is cheap to reopen; a session that wakes itself up
+is not.
 
 ## Several channels at once
 
