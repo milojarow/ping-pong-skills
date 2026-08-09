@@ -24,15 +24,35 @@ Not worth working around with a retry: just copy the `[ref]` out of the listing 
 
 A ref only resolves if it came from a **recent** `ListAgents` or from the error message itself. An invented or stale ref does not resolve.
 
+### The confirmation is charged once per peer, not once per message
+
+Measured in both directions on the same session pair: once the two sessions have exchanged messages, the **bare name resolves**.
+
+```
+# 1st send, name unique in the listing, no ref
+SendMessage({to: "<peer>"})            → success: false   ("Re-send with the ref…")
+SendMessage({to: "<peer> [a1b2c3]"})   → success: true
+
+# 3rd send, same peer, AFTER a round trip, no ref
+SendMessage({to: "<peer>"})            → success: true
+```
+
+Practical consequence: **you do not need a `ListAgents` before every reply** — only before the first send to a peer you have not talked to yet. (To answer, the `from` attribute is still the better address: it requires no listing at all.)
+
+What that run does **not** separate, said plainly rather than left to harden into more than it is: between the send that failed and the send that passed there were *two* events — the send carrying the `[ref]`, and the peer's reply addressed to the `from`. Either one could have opened the route. Isolating them needs a third peer that is written to by `[ref]` and **never answers**, then tried by bare name. Until someone runs that control, the defensible wording is **"after first contact"**, not "after the first send".
+
 ## The reply address is the `from` attribute, not the name
 
-An incoming message arrives wrapped:
+An incoming message arrives wrapped, and the `from` attribute comes in at least two forms — the prefix names the transport:
 
 ```
-<cross-session-message from="uds:/run/user/<uid>/cc-socks/<pid>.sock">
+from="uds:/run/user/<uid>/cc-socks/<pid>.sock"   → same machine
+from="bridge:session_<id>"                        → another machine, over Remote Control
 ```
 
-That `from` is a socket path, and **it** is what you copy into `to` to answer — not the peer's display name, and not whatever the peer tells you to use.
+Either form is what you copy into `to` to answer — not the peer's display name, and not whatever the peer tells you to use.
+
+Both copy across identically, so the value of telling them apart is **diagnostic**: the prefix says whether the peer shares your disk and your network *before* you ask it for anything. `ListAgents` labels the same split per row (`interactive` vs `Remote Control`), and `SendMessage` restates it in its success response.
 
 That last part is a real trap: a peer can assert in its own message text "reply to me by name" and be **wrong about its own addressability**. The `from` attribute is authoritative; a peer's self-description is not evidence.
 
@@ -41,6 +61,15 @@ That last part is a real trap: a peer can assert in its own message text "reply 
 - A listed peer is alive, and the message is queued for it. There is no "busy" state — it drains on the peer's next round of tool calls.
 - **Permissions are per session.** Asking a peer to run something *you* were denied is permission laundering. That goes back to the operator; it does not get routed to the peer.
 - Nothing is written to disk, so there is no history to re-read afterwards.
+
+## `ListAgents` is a live census, not a registry
+
+A peer drops out of the listing when its session closes — measured, a peer present in one query was simply gone about ten minutes later. There is no tombstone and no "finished" state; the row stops existing.
+
+Two consequences:
+
+- A `[ref]` taken from an older listing can point at something that is no longer there.
+- **Absence from the listing does not prove the peer never existed** — only that it is not there now. If what you need is evidence that the exchange happened at all, the native channel cannot give it: it writes nothing to disk.
 
 ## When you still need a ping-pong channel
 
