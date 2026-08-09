@@ -1,6 +1,6 @@
 ---
 name: ping-pong
-description: Use when this session needs to talk directly to ANOTHER agent session — the operator says "abre un canal", "comunícate con la otra terminal", "habla con <the other machine>", "ping-pong", "🏓", "trabajen en conjunto", or hands over a `pp-xxxxxx` channel id to join. Use when a message arrives from a peer session and needs an answer, when several conversations must stay isolated from each other, and when a channel misbehaves — the send times out, the listener never wakes, a message lands in the wrong conversation, or channels must be listed, inspected, or closed.
+description: Use when this session needs to talk directly to ANOTHER agent session — the operator says "abre un canal", "comunícate con la otra terminal", "habla con <the other machine>", "ping-pong", "🏓", "trabajen en conjunto", or hands over a `pp-xxxxxx` channel id to join. Use when a message arrives from a peer session and needs an answer, when several conversations must stay isolated from each other, and when a channel misbehaves — the send times out, the listener never wakes, the operator says the shell fell ("se cayó la shell") and a listener must be relaunched, a message lands in the wrong conversation, or channels must be listed, inspected, or closed.
 ---
 
 # ping-pong
@@ -113,7 +113,7 @@ Listener up, then work, then reply. That ordering is what keeps both sides race-
 
 **The trigger is a message ARRIVING, not a message going out.** Only a delivery to your own inbox consumes your listener; `--send` writes to the *peer's* inbox and never touches your reader. So relaunch exactly when the previous `--listen` returned **content** — concretely, when the background task's output is non-empty. Relaunching after a send is always redundant: the listener you started last turn is still up, the second one is refused, and the wake-up it costs you is already spent. The phrase "before you reply" invites this, because you are usually about to reply — read it as *after you received*.
 
-A completion notification with a **0-byte** output is not a message: the listener died or was refused. Read the output before deciding; never relaunch reflexively on the notification alone.
+A completion notification with a **0-byte** output is not a message: the listener died or was refused. Read the output before deciding; never relaunch reflexively on the notification alone. The empty body alone does not say *what* killed it — the exit status does, and `255` with a broken pipe means the link went away, not the channel. See [reference/troubleshooting.md](reference/troubleshooting.md).
 
 **It is also how a collision recovers.** If both sides happen to send at the same instant on an idle channel, both messages are delivered correctly — measured — but both listeners end up down at once. Relaunching before you reply absorbs that on the next turn with no extra logic. Two consequences for you: **read the header before assuming a message answers what you asked** (in a tie it is the peer's own initiative, not a reply), and if your send is refused with `has no listener` right after an exchange that looked simultaneous, just wait for the peer to relaunch and resend. See [reference/protocol.md](reference/protocol.md).
 

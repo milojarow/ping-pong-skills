@@ -33,6 +33,26 @@ Exit 255 with an empty body is not one failure, it is three, and they need oppos
 
 **`Network is unreachable` is local, always.** It is the kernel reporting it has no route out — the packet never reached the bus. Blaming the remote host, a rebooted bus or an ISP port block is a deduction the data does not support, and it sends the investigation to the wrong machine.
 
+### A 0-byte output does not say what killed it — the exit status does
+
+Since 0.3.0 the listener has **two** possible killers, and both leave the same empty output file, so the 0 bytes discriminate nothing:
+
+- the **ssh client** dying because the link went away (transport);
+- the **stdin-EOF watchdog** killing the reader because it believes the session went away.
+
+They call for opposite responses — a retry fixes the first and *hides* the second — so read the exit status and the first line of stderr rather than the empty body:
+
+| Evidence | Killer |
+|---|---|
+| `exit 255` **plus** `client_loop: send disconnect: Broken pipe` or `Network is unreachable` | **Transport.** 255 is the status ssh reserves for its *own* errors. |
+| 0 bytes with an exit status that is **not** 255 | **The watchdog**, or the remote command itself. |
+
+The second row is the one to keep in mind, because a watchdog kill **cannot** counterfeit the first: on that path the connection is healthy, it is the *remote reader* that dies, and ssh reports the **remote command's** status — never 255 with a broken pipe.
+
+Every death recorded so far falls in the first row, and by two independent instruments: deaths over a phone hotspot carried explicit `exit 255` + broken pipe, while a separate run over home WiFi coincided with four full `NetworkManager` disconnect cycles as the wired end ran eight hours uninterrupted. **The cause is transport, not the watchdog.**
+
+**The asymmetry that looks damning, and why it is not.** Counting listener survival by side: the side reaching the bus **over ssh** lost every listener across four channels, while the side whose bus is **local** kept two alive for 4h20m and 1h12m. Zero against hours is not noise, and the only structural difference between the two paths is the stdin-EOF watchdog, which exists solely on the ssh side — so it is the obvious suspect. It is still not the culprit, and the exit codes that clear it were **already recorded in past failures**. Before spending an operator's hours staging a fresh listener just to note its time of death, check whether the failures you already have answer the question.
+
 ### The three-step proof, in order
 
 Before relaunching a second time, measure instead of assuming:
@@ -54,6 +74,16 @@ Measured across three consecutive listeners on a laptop over ordinary home WiFi:
 So: **on a machine that suspends or whose WiFi blinks, a listener will die every few hours, and that is not a defect in the channel.** Plan around it rather than debugging it.
 
 What matters operationally is the consequence: while your side is down, the peer's `--send` is **refused, not queued** — there is no mailbox. After recovering a listener, tell the peer to resend anything written during the gap, instead of waiting for a message that was never accepted.
+
+### How this reaches you: the operator says the shell fell
+
+Worth knowing in the operator's own words, because that is the wording the next report arrives in:
+
+- They say **"se cayó la shell"** — *the shell fell* — not "the listener died". What they see is the background command disappearing.
+- They experience it as **their own chore**, not as a channel fault: they have to notice which of the two sessions went deaf and tell it to relaunch. It is an attention tax rather than a visible error, so it gets under-reported.
+- It shows up **once the conversation has been running a while**, never in a short one — which is exactly why it does not surface in testing.
+
+One inference inside that report decides diagnoses: being able to *tell that session to relaunch* means **the session is still alive when its listener dies**. A finished session cannot be asked for anything. That rules out the tempting rival explanation — "the marker is empty because that session had already ended". It had not.
 
 ### Each death costs the agent a turn, not just a reconnect
 
@@ -81,6 +111,12 @@ Three details decide whether that loop helps or hurts:
 1. **Never retry on `ALREADY has a live listener`.** That is not a link failure — it means another session owns the reader, and attaching a second reader to one FIFO means one side swallows the message and the other wakes with zero bytes. Exit distinctly instead of looping.
 2. **Bound the retries**, so a channel that was closed for good cannot spin forever.
 3. **Capture stdout and re-emit it** on success, or the received message dies inside the wrapper.
+
+### The cheapest mitigation is not needing a listener at all
+
+The pair that flaps most is often the pair that no longer needs a channel. If both sessions can see each other in `ListAgents`, the harness's own `SendMessage` reaches them with **no background process and no socket of their own** — it queues, so there is no listener to die. Measured: two sessions on one machine, and one session against a remote host reachable by Remote Control, held round-trip exchanges without opening a single channel.
+
+So for a peer the listing can reach, listener death stops existing rather than being mitigated. Reserve the channel for what the listing cannot reach — and there, today, the only mitigation is the bounded loop written by whoever launches the command. See [native-session-messaging.md](native-session-messaging.md).
 
 ### Check the local link before the ssh config or the remote host
 

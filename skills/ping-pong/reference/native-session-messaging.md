@@ -59,6 +59,7 @@ That last part is a real trap: a peer can assert in its own message text "reply 
 ## What the native path gives you, and what it doesn't
 
 - A listed peer is alive, and the message is queued for it. There is no "busy" state — it drains on the peer's next round of tool calls.
+- **Nothing here can die between turns.** There is no background process and no socket of your own, so the listener-death failure mode simply does not exist on this path — measured across round-trip exchanges both between two sessions on one machine and between a session and a remote host reached by Remote Control, none of which opened a channel. On a flapping link that is worth more than any retry around `--listen`.
 - **Permissions are per session.** Asking a peer to run something *you* were denied is permission laundering. That goes back to the operator; it does not get routed to the peer.
 - Nothing is written to disk, so there is no history to re-read afterwards.
 
