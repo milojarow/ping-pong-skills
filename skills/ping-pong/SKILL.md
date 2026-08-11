@@ -123,6 +123,13 @@ Since 0.3.0 a listener **dies with its session** — about two seconds after the
 
 `pp --gc` stays as the backstop for what prevention cannot reach: a hard kill of the whole tree, and listeners started by pre-0.3.0 builds. It reaps readers on the bus whose session is gone, clears markers whose process is already dead, and drops local records for channels that no longer exist. It runs automatically before `--open`, `--join` and `--list`, so in normal use you never call it — reach for it when `--listen` refuses because of a listener you believe is stale.
 
+**Channels outlive the sessions that opened them, and that is the dangerous kind of leftover.** A channel costs almost nothing on disk and disappears when the bus reboots — but while it sits there it is a **decoy**: it looks exactly like a working channel, and the ownership guard *helps in the wrong direction*, because a dead owner means the next session adopts it without friction. Since 0.7.0 both surfaces make it visible instead:
+
+- `--list` shows how long each channel has been quiet and how many listeners are actually alive, and marks `LOOKS ABANDONED` when nobody is on either side and it has been silent past `PP_STALE_HOURS` (24 by default).
+- `--gc` reports those channels by id and topic.
+
+**Neither one closes them, and that is deliberate.** A channel is a conversation, and "no listener right now" is a *normal* state between turns — the turn contract has that window by design. A rule that deleted on this heuristic would be right most times and wrong once, and the once costs a live conversation. Confirm with the operator, then `pp --close <id>`.
+
 ## The turn contract
 
 Every time you are woken by a message, produce these three things **in this order**:

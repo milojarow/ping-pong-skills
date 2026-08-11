@@ -81,7 +81,18 @@ A reader started by a version older than 0.2.0 has no token and so escapes the t
 
 ### Choosing a `--as` label
 
-Pick **one short, stable label per channel** and reuse it for every message: the machine name, or the role the session is playing (`builder`, `reviewer`). It is what the peer sees as the author on each message, so a label that changes per message makes the transcript unreadable. It is cosmetic — it never affects routing, which is decided entirely by channel id and side.
+Since 0.7.0 the default is **`host:project`** — the short hostname plus the basename of the working directory (just the hostname when that would be the home directory, which carries no information). Override it with `--as` or `PP_LABEL`.
+
+The default changed because a label of only the hostname makes **every channel between the same two machines look identical** in `--list`: `host-a <-> host-b`, repeated, distinguishable solely by a free-text topic somebody has to read carefully. That is not a weak convention, it is the absence of one — and it is how a message reached the wrong channel in production. With the project in the label the pairs separate themselves:
+
+```
+workstation:storefront  <-> server:storefront-api
+workstation:billing      <-> server:billing-worker
+```
+
+If you set it by hand, pick **one short, stable label per channel** and reuse it — the peer sees it as the author on every message, so a label that changes per message makes the transcript unreadable. It never affects routing, which is decided entirely by channel id and side; its whole job is to let a human tell two channels apart at a glance.
+
+Labels are sanitized to `[A-Za-z0-9._:-]`, max 40 characters. `/` is deliberately excluded: it would break the substitution that writes the label into the channel's `meta`.
 
 ### When `--wait` is right
 

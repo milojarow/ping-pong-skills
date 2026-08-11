@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="0.6.0"
+PP_VERSION="0.7.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -137,9 +137,33 @@ gen_id() {
 valid_id() { [[ "${1:-}" =~ ^pp-[a-z0-9]{4,16}$ ]]; }
 valid_tok() { [[ "${1:-}" =~ ^[a-z0-9]{6,16}$ ]]; }
 
-sanitize() { printf '%s' "${1:-}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | cut -c1-32; }
+# `:` is deliberately allowed: it separates host from project in the default label.
+# `/` is NOT — it would break the sed substitution that writes the label into meta.
+sanitize() { printf '%s' "${1:-}" | LC_ALL=C tr -c 'A-Za-z0-9._:-' '_' | cut -c1-40; }
 
-default_label() { sanitize "${PP_LABEL:-$(hostname -s 2>/dev/null || echo agent)}"; }
+# A label of just the hostname makes every channel between the same two machines
+# look identical: `host-a <-> host-b`, over and over, distinguishable only by a
+# free-text topic somebody has to read carefully. That is not a weak convention,
+# it is the absence of one - and it is how a message reached the wrong channel.
+# Defaulting to host:project makes the pairs self-distinguishing in `--list`.
+default_label() {
+  if [ -n "${PP_LABEL:-}" ]; then sanitize "$PP_LABEL"; return 0; fi
+  local host proj
+  host=$(hostname -s 2>/dev/null || echo agent)
+  proj=$(basename -- "$PWD" 2>/dev/null || echo "")
+  # In the home directory the basename is just the user name - no information.
+  [ "$proj" = "$(basename -- "$HOME")" ] && proj=""
+  [ "$proj" = "/" ] && proj=""
+  if [ -n "$proj" ]; then sanitize "$host:$proj"; else sanitize "$host"; fi
+}
+
+# Last time this channel carried a message. Written on the BUS so the elapsed
+# time is computed against the bus clock - comparing a bus timestamp to a local
+# one silently shifts by the machines' offset.
+touch_activity() {
+  valid_id "${1:-}" || return 0
+  bus "date +%s > '$BUS_ROOT/$1/activity' 2>/dev/null" >/dev/null 2>&1 || true
+}
 
 # Which SESSION is running this command - not which machine. Several agent
 # sessions share one user and one state dir, so the machine cannot distinguish
@@ -341,6 +365,7 @@ cmd_open() {
   mkdir -p "$STATE_DIR"
   printf 'a\n' > "$(side_file "$id")"
   claim_channel "$id" "$label"
+  touch_activity "$id"
 
   say "Channel open: $id"
   say "  bus:   $(bus_label):$BUS_ROOT/$id"
@@ -380,6 +405,7 @@ cmd_join() {
 
   mkdir -p "$STATE_DIR"
   printf 'b\n' > "$(side_file "$id")"
+  touch_activity "$id"
 
   say "Joined channel: $id"
   say "  bus:   $(bus_label):$BUS_ROOT/$id"
@@ -463,6 +489,7 @@ cmd_listen() {
     say "pp: nothing arrived within ${wait_for}s (channel $id is still open)"
     exit 124
   fi
+  [ $rc -eq 0 ] && touch_activity "$id"
   return $rc
 }
 
@@ -601,6 +628,7 @@ cmd_send() {
     Ask the other session to run:  pp --listen $id   then send it again."
   fi
   [ $rc -eq 0 ] || die "send failed (rc=$rc) against the bus ($(bus_label))"
+  touch_activity "$id"
   say "pp: delivered to side $out of channel $id"
 }
 
@@ -608,14 +636,30 @@ cmd_list() {
   need_config
   gc_quiet
   local out
-  out=$(bus "for d in '$BUS_ROOT'/pp-*; do
+  # Silence and liveness are computed ON THE BUS: the timestamps live there, and
+  # a channel with no live listener that has been quiet for days is a decoy - it
+  # looks exactly like a working one until somebody joins it by mistake.
+  out=$(bus "now=\$(date +%s)
+    for d in '$BUS_ROOT'/pp-*; do
       [ -d \"\$d\" ] || continue
       id=\$(basename \"\$d\")
       topic=\$(sed -n 's/^topic=//p' \"\$d/meta\" 2>/dev/null)
       a=\$(sed -n 's/^side_a=//p' \"\$d/meta\" 2>/dev/null)
       b=\$(sed -n 's/^side_b=//p' \"\$d/meta\" 2>/dev/null)
-      created=\$(sed -n 's/^created=//p' \"\$d/meta\" 2>/dev/null)
-      printf '%s\t%s <-> %s\t%s\t%s\n' \"\$id\" \"\${a:-?}\" \"\${b:--}\" \"\$created\" \"\$topic\"
+      live=0
+      for s in a b; do
+        m=\"\$d/listening-\$s\"; [ -f \"\$m\" ] || continue
+        p=\$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' \"\$m\")
+        [ -n \"\$p\" ] && kill -0 \"\$p\" 2>/dev/null && live=\$((live+1))
+      done
+      act=\$(cat \"\$d/activity\" 2>/dev/null)
+      [ -n \"\$act\" ] || act=\$(stat -c %Y \"\$d/meta\" 2>/dev/null)
+      if [ -n \"\$act\" ]; then age=\$((now-act)); else age=-1; fi
+      if [ \$age -lt 0 ]; then sil='age unknown'
+      elif [ \$age -lt 3600 ]; then sil=\"quiet \$((age/60))m\"
+      elif [ \$age -lt 86400 ]; then sil=\"quiet \$((age/3600))h\"
+      else sil=\"quiet \$((age/86400))d\"; fi
+      printf '%s\t%s <-> %s\t%s\t%s\t%s\t%s\n' \"\$id\" \"\${a:-?}\" \"\${b:--}\" \"\$live\" \"\$sil\" \"\$age\" \"\$topic\"
     done" 2>/dev/null)
 
   if [ -z "$out" ]; then
@@ -623,9 +667,10 @@ cmd_list() {
     return 0
   fi
   local me; me=$(session_id)
+  local stale_s=$(( ${PP_STALE_HOURS:-24} * 3600 ))
   say "Open channels on $(bus_label):$BUS_ROOT"
-  printf '%s\n' "$out" | while IFS=$'\t' read -r id sides created topic; do
-    local mine="" owner
+  printf '%s\n' "$out" | while IFS=$'\t' read -r id sides live sil age topic; do
+    local mine="" owner flag=""
     if [ -r "$(side_file "$id")" ]; then
       mine=" (this machine: side $(tr -d '[:space:]' < "$(side_file "$id")")"
       owner=$(sed -n 's/^session=//p' "$(owner_file "$id")" 2>/dev/null | tr -d '[:space:]')
@@ -633,7 +678,12 @@ cmd_list() {
       elif [ "$owner" = "$me" ]; then mine="$mine, YOURS)"
       else mine="$mine, owned by $owner)"; fi
     fi
-    printf '  %-12s %-24s %s%s\n' "$id" "$sides" "$created" "$mine"
+    # No listener on either side AND quiet past the threshold. Not proof of
+    # abandonment - both sides are legitimately down between turns - but it is
+    # the state a forgotten channel sits in, and it is worth seeing.
+    [ "${live:-0}" = "0" ] && [ "${age:--1}" -ge "$stale_s" ] 2>/dev/null \
+      && flag="  <-- LOOKS ABANDONED"
+    printf '  %-12s %-30s listeners:%s  %s%s%s\n' "$id" "$sides" "${live:-?}" "$sil" "$mine" "$flag"
     [ -n "$topic" ] && printf '  %-12s topic: %s\n' "" "$topic"
   done
 }
@@ -794,6 +844,42 @@ cmd_gc() {
       s=$((s+1))
     fi
   done
+
+  # Channels nobody is on, quiet past the threshold. These are REPORTED, never
+  # closed. A channel is a conversation, and "no listener right now" is a normal
+  # state between turns - the turn contract has that window by design. A heuristic
+  # that deletes would be right most times and wrong once, and the once costs a
+  # live conversation. Closing stays a decision for whoever has the context.
+  local stale_s=$(( ${PP_STALE_HOURS:-24} * 3600 ))
+  local abandoned
+  abandoned=$(bus "now=\$(date +%s)
+    for d in '$BUS_ROOT'/pp-*; do
+      [ -d \"\$d\" ] || continue
+      live=0
+      for si in a b; do
+        m=\"\$d/listening-\$si\"; [ -f \"\$m\" ] || continue
+        p=\$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' \"\$m\")
+        [ -n \"\$p\" ] && kill -0 \"\$p\" 2>/dev/null && live=\$((live+1))
+      done
+      [ \$live -gt 0 ] && continue
+      act=\$(cat \"\$d/activity\" 2>/dev/null)
+      [ -n \"\$act\" ] || act=\$(stat -c %Y \"\$d/meta\" 2>/dev/null)
+      [ -n \"\$act\" ] || continue
+      age=\$((now-act))
+      [ \$age -ge $stale_s ] || continue
+      t=\$(sed -n 's/^topic=//p' \"\$d/meta\" 2>/dev/null | cut -c1-46)
+      printf '%s\t%s\n' \"\$(basename \$d)\" \"\$t\"
+    done" 2>/dev/null)
+
+  if [ -n "$abandoned" ]; then
+    say ""
+    say "pp: channels with no listener on either side, quiet for over ${PP_STALE_HOURS:-24}h:"
+    printf '%s\n' "$abandoned" | while IFS=$'\t' read -r aid atopic; do
+      [ -n "$aid" ] && say "  $aid  ${atopic:-<no topic>}"
+    done
+    say "  NOT closed - a channel is a conversation, and both sides are legitimately"
+    say "  down between turns. Confirm with the operator, then: pp --close <id>"
+  fi
 
   say "pp: checked $n listener record(s), dropped $s stale channel record(s)"
 }
