@@ -90,7 +90,7 @@ So: **`tailscale up` succeeding is not evidence of reachability.** The evidence 
 
 Exactly one tailnet must own both devices. Two ways to get there, both fine:
 
-- **Pre-auth key** (fewer moving parts): the host mints one at `login.tailscale.com/admin/settings/keys` and sends it; the partner runs `sudo tailscale up --auth-key=<key>`. One command, no URL relay. It is a secret — single-use, short expiry.
+- **Pre-auth key** (fewer moving parts): the host mints one at `login.tailscale.com/admin/settings/keys` and sends it; the partner runs `sudo tailscale up --auth-key=<key>`. One command, no URL relay. It is a secret — single-use, short expiry. There is **no CLI subcommand and no MCP** that mints a key, so do not go looking for one: it is the console or the REST API, and for a one-off hand-over the console is strictly cheaper — the API's own access token can only be created there anyway. Contract and body nesting in [reference/pp-cli.md](reference/pp-cli.md).
 - **URL relay**: the partner runs `sudo tailscale up` and sends the printed URL to the **host**, who opens it and authenticates with the host's account. The partner must not open it.
 
 Recovery when the partner already joined the wrong tailnet: `sudo tailscale logout && sudo tailscale up`, then relay the new URL.

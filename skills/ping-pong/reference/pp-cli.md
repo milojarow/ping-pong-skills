@@ -80,6 +80,38 @@ Getting both devices into one tailnet, two supported ways:
 
 Already in the wrong tailnet: `sudo tailscale logout && sudo tailscale up`, then relay the new URL.
 
+#### Minting the pre-auth key: admin console or REST API — there is no CLI
+
+Do not go hunting for a `tailscale` subcommand to mint a key; the CLI has none (its full subcommand list covers `up`/`down`/`status`/`serve`/`funnel`/`cert`/`lock` and friends — nothing for keys), and no Tailscale MCP server exists either. The only two paths are the admin console and the REST API.
+
+    POST https://api.tailscale.com/api/v2/tailnet/-/keys
+    Authorization: Bearer <access-token>
+
+`-` in the tailnet path means "the default tailnet of the access token", which is the right choice for most callers. The part worth copying is the **nesting** — the flags live three levels down, not at the top:
+
+```json
+{
+  "description": "<max 50 alphanumeric chars, hyphens allowed>",
+  "expirySeconds": 3600,
+  "capabilities": {
+    "devices": {
+      "create": {
+        "reusable": false,
+        "ephemeral": false,
+        "preauthorized": true,
+        "tags": []
+      }
+    }
+  }
+}
+```
+
+`expirySeconds` defaults to 90 days when omitted — set it short for a hand-over key. `preauthorized: true` matters when device approval is enabled on the tailnet: without it the device registers but stays unapproved, which looks exactly like a key that did not work. A key minted by an **OAuth client** must carry tags; one minted with a personal access token has no such requirement.
+
+To read the contract yourself, the official OpenAPI 3.1.0 spec is at `https://api.tailscale.com/api/v2?outputOpenapiSchema=true` — it is **YAML** despite the JSON-looking query, so `jq` fails on it with `Invalid numeric literal`. Parse it with a YAML loader.
+
+**The economics invert the usual advice, so state them before reaching for the API:** the access token itself can only be created in the admin console. For a ONE-OFF key the console is therefore strictly cheaper — you have to go there either way, and the API adds a token to store and rotate. The API only pays off once minting is routine.
+
 #### Addresses, not names
 
 `--peer` takes the `100.x` address. MagicDNS depends on each machine's DNS wiring — measured non-functional on a machine whose mesh was otherwise perfectly healthy (`systemd-resolved` and NetworkManager wired together incorrectly, which Tailscale reports only in its health check and which nothing else surfaces). An address always resolves; a name is a second thing that can be broken, and it fails at connect time, long after the handover.
