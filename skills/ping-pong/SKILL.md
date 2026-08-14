@@ -47,20 +47,57 @@ Two transports, and the choice is about **trust**, not about networking.
 
 **Direct mode** (`--direct`) has no bus at all. Each side's inbox is a TCP port on **its own** machine, bound to a private mesh interface (Tailscale/WireGuard) that both devices joined. The peer connects to it. Nothing is exposed to the public internet, nobody gets a shell, and there is no token to mint or rotate — the mesh's device authorization is the access control.
 
-```bash
-# on the opener
-pp --open --direct --peer <peer-mesh-name> --topic "what this is about"
-# it prints the line to hand over:  /ping-pong <id> --direct --peer <your-mesh-name>
+### Direct mode: run `--mesh` first, then hand over one block
 
-# on the joiner
-pp --join <id> --direct --peer <opener-mesh-name>
+The operator's whole job is to paste **one block** into whatever they already use to talk to their partner. Everything before and after that is yours. Do not walk them through Tailscale by hand, and do not ask them to relay names or addresses you can read yourself.
+
+```bash
+pp --mesh          # ALWAYS first. Exits 0 when ready, 1 when something is missing.
+```
+
+It reports one of four states and, in each unfinished one, prints the exact text to hand over:
+
+| State | What you do |
+|---|---|
+| Not installed | Give the operator the install + `up` commands it printed. Nothing to hand over yet. |
+| Installed, not logged in | Same — but if the *partner* is the one who already has a tailnet, the operator must **send** their login URL rather than open it. |
+| Logged in but **alone** | Hand the operator the block `--mesh` printed. That block is written for the partner and needs no editing. |
+| Ready | Open the channel. `--peer` is optional when exactly one peer is on the mesh. |
+
+```bash
+# opener, once --mesh says READY
+pp --open --direct --topic "what this is about"
+# prints a second block to hand over, already containing:
+#     /ping-pong <id> --direct --peer <your-mesh-ip>
+
+# joiner — the operator pastes that line, and this is the whole job
+pp --join <id> --direct --peer <opener-mesh-ip>
 
 # from then on, identical to bus mode
 pp --listen <id>          # in the background
 pp --send <id> -m "..."
 ```
 
+So the operator sees at most two hand-offs: **bootstrap** (get the partner onto the mesh) and **channel** (the `/ping-pong …` line). Both come out of the CLI verbatim. Say "hand this to your partner" and paste it — do not summarize it, and do not rewrite it into your own words, because the block is calibrated to stop the failure below.
+
+### The trap that makes both machines look connected and unable to reach each other
+
+**A tailnet belongs to an account, not to a network.** Two people who each run `tailscale up` and each authenticate with *their own* account end up in **two separate tailnets**, each alone. Both machines report `Connected`, both hold a `100.x` address, neither prints a warning — and they cannot see each other.
+
+Measured in production: a peer opened their own login URL, read "Connected" as success, and the mistake survived until someone actually looked at `tailscale status` and saw a single line.
+
+So: **`tailscale up` succeeding is not evidence of reachability.** The evidence is the *other* machine appearing in `tailscale status`, with the **same account** in the third column. `pp --mesh` checks exactly that and says so.
+
+Exactly one tailnet must own both devices. Two ways to get there, both fine:
+
+- **Pre-auth key** (fewer moving parts): the host mints one at `login.tailscale.com/admin/settings/keys` and sends it; the partner runs `sudo tailscale up --auth-key=<key>`. One command, no URL relay. It is a secret — single-use, short expiry.
+- **URL relay**: the partner runs `sudo tailscale up` and sends the printed URL to the **host**, who opens it and authenticates with the host's account. The partner must not open it.
+
+Recovery when the partner already joined the wrong tailnet: `sudo tailscale logout && sudo tailscale up`, then relay the new URL.
+
 Both sides derive the **same port from the channel id**, so nothing extra travels between them and two channels between the same pair of machines land on different ports.
+
+Use the **`100.x` address** for `--peer`, not the mesh name — MagicDNS depends on each machine's DNS wiring and is not guaranteed (measured broken on a machine whose mesh was otherwise healthy). The CLI already hands out the address for this reason.
 
 What direct mode gives up, so you can decide with it in view:
 
@@ -69,6 +106,8 @@ What direct mode gives up, so you can decide with it in view:
 - **No listener marker, and none is needed.** The TCP connect *is* the presence check: `Connection refused` is ground truth, not a claim that can go stale. That whole class of failure — a marker outliving its process — does not exist here.
 
 Requires `nc` on both machines and the device on the mesh (`tailscale up` once per device). `PP_MESH_IP` overrides the detected address if your mesh is not Tailscale.
+
+**A default-deny host firewall is not the problem it looks like.** On a machine running `ufw` with `deny (incoming)` and no rule for the inbox port, the natural conclusion is that the peer's connection will be dropped — and it is wrong. Tailscale installs its own `ts-input` chain that the kernel's input hook jumps to **before** the firewall's chains, containing an unconditional accept for the mesh interface; verified in a live ruleset, with matching packet counters. Read the ruleset before opening a port you did not need to open. The corollary is worth stating to the operator: everything already listening on `0.0.0.0` is reachable from the mesh, so `ss -tln` is the honest disclosure to make to a partner before they join.
 
 ## First: resolve the CLI
 
@@ -109,21 +148,26 @@ One-time per machine, if any command says "not configured yet" — see [referenc
 
 **Invoked with no argument → you are the INITIATOR:**
 
+0. **Pick the mode before anything else.** Is the other session on a machine that shares a bus with this one — same person, same Unix user? Then bus mode. Is it *someone else's* machine? Then direct mode, and your first command is `"$PP" --mesh`. If it does not say `READY`, hand the operator the block it printed and stop; there is no channel to open yet.
 1. `"$PP" --open --topic "<what this channel is about>" --as <short-label>`
+   (direct mode: add `--direct`; `--peer` only when more than one machine is on the mesh)
 2. Start your listener **in the background**: `"$PP" --listen <id> --retry`
    (`--retry` rides out a dropped link instead of waking you to relaunch; see
    [reference/troubleshooting.md](reference/troubleshooting.md).)
-3. Give the operator the one line to paste into the other session: `/ping-pong <id>`
+3. Hand the operator the block the CLI printed, verbatim, with one sentence: *"pass this to your partner."* In bus mode that block is the single line `/ping-pong <id>`.
 4. Stop and wait. The harness wakes you when the peer writes.
 
 **Invoked with a `pp-xxxxxx` argument → you are the JOINER:**
 
 1. `"$PP" --join <id> --as <short-label>`
+   (direct mode: the operator's pasted line already carries `--direct --peer <ip>` — pass it through unchanged. If the join is refused because this machine is not on the mesh, run `"$PP" --mesh` and hand over what it prints.)
 2. Start your listener **in the background**: `"$PP" --listen <id> --retry`
    (`--retry` rides out a dropped link instead of waking you to relaunch; see
    [reference/troubleshooting.md](reference/troubleshooting.md).)
 3. Send a greeting so the peer knows you're on: `"$PP" --send <id> -m "<greeting + what you're working on>"`
 4. Stop and wait.
+
+**In both roles, the operator's total workload is pasting what you hand them.** Never ask them to read a `tailscale status`, relay an IP, or decide between transports — you can read all of that yourself, and every relay step is a chance for a typo that surfaces much later as a connection refused.
 
 ## Ownership: a channel belongs to a session, not a machine
 
@@ -251,7 +295,9 @@ Keep one topic per channel. Two topics in one channel produce an interleaved inb
 
 | Goal | Command |
 |---|---|
+| **Direct mode: am I and my partner on one mesh?** | `pp --mesh` |
 | Open a channel | `pp --open --topic "..." --as <label>` |
+| Open a direct channel (someone else's machine) | `pp --open --direct --topic "..."` |
 | Join a channel | `pp --join pp-xxxxxx --as <label>` |
 | Wait for one message (run in background) | `pp --listen pp-xxxxxx --retry` |
 | Send a message (preferred — no shell expansion) | `pp --send pp-xxxxxx < file` |
@@ -281,6 +327,9 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Putting backticks (or `$VAR`) inside `-m "..."` | Your shell expands them before `pp` sees the argument — the message is delivered **missing exactly those words**, still grammatical, and the peer cannot tell | Send through stdin: `pp --send <id> < file`. Keep `-m` for a short line, in single quotes |
 | Relaunching `--listen` after a `--send` | Your send consumed nothing, so the previous listener is still up: the new one is refused and a whole wake-up is spent arriving at an empty output | Relaunch only when the previous `--listen` actually returned content |
 | Deciding a listener is dead because its pid is absent on **your** machine | That pid lives in the bus host's pid namespace; you start a second reader and two block on one FIFO | `pp --info <id>` — it runs the liveness check on the bus, where the pid means something |
+| Reading `tailscale up` succeeding as "we are connected" | Each of you authenticated with your own account, so you are in two separate tailnets, both alone, both saying `Connected` — and unreachable | `pp --mesh`. Ready means the *other* machine is listed, with the **same account** in column three |
+| Walking the operator through Tailscale yourself | Every relayed name and address is a typo that shows up later as a connection refused, far from its cause | Hand them the block `--mesh` or `--open` printed, verbatim. Their whole job is pasting it |
+| Opening a firewall port so the peer can reach your inbox | Tailscale's own chain already accepts the mesh interface *before* the firewall's chains — you widened your exposure for nothing | Read the live ruleset first. The mesh needs no port opened |
 
 **A marker is evidence, not proof.** A listener whose session already ended can stay blocked on the bus for hours, marker and all. The send then *succeeds* and the message is lost into a reader nobody is watching. If a peer goes quiet right after a delivery that looked clean, suspect an orphaned listener — [reference/troubleshooting.md](reference/troubleshooting.md).
 

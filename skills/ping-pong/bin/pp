@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="0.8.0"
+PP_VERSION="0.9.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -393,6 +393,184 @@ mesh_ip() {
   printf '%s' "$ip"
 }
 
+# --------------------------------------------------------------- mesh readiness
+#
+# The trap this exists to close, measured in production:
+#
+# Two people each run `tailscale up` and each lands in their OWN tailnet, alone.
+# Both machines report Connected, both hold a 100.x address, neither prints an
+# error - and they cannot reach each other, because a tailnet belongs to an
+# ACCOUNT, not to a network. The peer read "up succeeded" as "we are connected"
+# and it cost a full round trip through the two humans to discover otherwise.
+#
+# So `up` succeeding is not evidence of reachability. The only evidence is the
+# OTHER machine appearing in `tailscale status`. That is what --mesh reports, and
+# in every not-ready state it prints the block the operator hands to their
+# partner - so the bootstrap costs one paste instead of a conversation.
+
+mesh_installed() { command -v tailscale >/dev/null 2>&1; }
+
+# The self line begins with the mesh IP. Anchoring on that is what keeps a
+# logged-out tailscale from handing back the second word of "Logged out." as if
+# it were a hostname - a fallback that only tests for empty does not catch that.
+#
+# Read it out of the FULL status table, not `--self --peers=false`: with peers
+# excluded the account column degrades to a numeric userid, and the account name
+# is the one field that answers "whose tailnet is this" - which is the entire
+# question --mesh exists to settle.
+mesh_line_self() {
+  local ip line
+  ip=$(tailscale ip -4 2>/dev/null | head -1)
+  [ -n "$ip" ] || return 0
+  line=$(tailscale status 2>/dev/null | awk -v ip="$ip" '$1 == ip {print; exit}')
+  [ -n "$line" ] || line=$(tailscale status --self --peers=false 2>/dev/null | awk '$1 ~ /^100\./ {print; exit}')
+  printf '%s' "$line"
+}
+
+mesh_line_peers() {
+  local me="${1:-}"
+  tailscale status 2>/dev/null | awk -v me="$me" '$1 ~ /^100\./ && $1 != me {print}'
+}
+
+mesh_handoff() {
+  local my_ip="$1"
+  cat <<EOF
+
+Hand THIS to your partner (copy the whole block, it is written for them):
+
+--8<---------------------------------------------------------------------------
+We are opening a direct message channel between our two machines over Tailscale.
+Nothing gets exposed to the public internet and neither of us gets a shell on the
+other's box - the entire surface is one TCP port that only the other can reach.
+
+1. Install Tailscale if you do not have it:
+     curl -fsSL https://tailscale.com/install.sh | sudo bash
+   On Arch-based distros prefer the distro package instead: sudo pacman -S tailscale
+
+2. Run:  sudo tailscale up
+
+3. It prints a LOGIN URL. DO NOT OPEN IT YOURSELF. Send the URL back to me.
+   Opening it with your own account puts your machine in YOUR OWN tailnet, by
+   itself. It will say Connected, it will have an address, and it will still be
+   unreachable - a tailnet belongs to an account. Both machines have to end up
+   in ONE tailnet, and I open the URL so that tailnet is the one already holding
+   my machine.
+
+   If you already ran it and logged in with your own account, undo it:
+     sudo tailscale logout
+     sudo tailscale up
+   and send me the new URL.
+
+4. Once I tell you I accepted it, run:  tailscale status
+   It has to list MY machine ($my_ip) as well as yours. Your own line alone
+   means it did not work, whatever the word Connected suggests.
+
+Then tell your agent:  /ping-pong
+It reads this same skill and takes over from there.
+--8<---------------------------------------------------------------------------
+
+Smoother alternative, no URL relay: mint a pre-auth key at
+  https://login.tailscale.com/admin/settings/keys
+and send that instead. They run  sudo tailscale up --auth-key=<key>  and join in
+one command. It is a secret: make it single-use with a short expiry.
+EOF
+}
+
+cmd_mesh() {
+  if ! mesh_installed; then
+    say "mesh: NOT INSTALLED on this machine."
+    say "  Install it, then log in:"
+    say "      curl -fsSL https://tailscale.com/install.sh | sudo bash"
+    say "      sudo tailscale up"
+    say "  On Arch-based distros: sudo pacman -S tailscale && sudo tailscale up"
+    return 1
+  fi
+
+  local self; self=$(mesh_line_self)
+  if [ -z "$self" ]; then
+    say "mesh: installed, but this machine is NOT LOGGED IN."
+    say "  Run:  sudo tailscale up"
+    say ""
+    say "  If your partner is the one who already has a tailnet, do NOT open the"
+    say "  login URL yourself - send it to them. Opening it with your own account"
+    say "  creates a second, separate tailnet where you are alone."
+    return 1
+  fi
+
+  local my_ip my_name my_acct
+  my_ip=$(printf '%s' "$self" | awk '{print $1}')
+  my_name=$(printf '%s' "$self" | awk '{print $2}')
+  my_acct=$(printf '%s' "$self" | awk '{print $3}')
+
+  local peers n
+  peers=$(mesh_line_peers "$my_ip")
+  n=$(printf '%s\n' "$peers" | grep -c '^100\.' 2>/dev/null || true)
+  [ -n "$n" ] || n=0
+
+  if [ "$n" -eq 0 ]; then
+    say "mesh: LOGGED IN BUT ALONE - no other machine in this tailnet."
+    say "  me:    $my_ip  $my_name  $my_acct"
+    say ""
+    say "  Two readings, and this machine cannot tell them apart on its own:"
+    say "    - your partner has simply not joined yet, or"
+    say "    - they ran 'tailscale up' and authenticated with their OWN account,"
+    say "      which put them in a different tailnet where they are also alone."
+    mesh_handoff "$my_ip"
+    return 1
+  fi
+
+  say "mesh: READY - $n machine(s) reachable."
+  say "  me:    $my_ip  $my_name  $my_acct"
+  # Everything from field 5 on is the connection state, and it is worth keeping:
+  # "offline" means that machine is asleep, so no listener can exist on it and a
+  # send will be refused - a fact worth having before opening a channel, not after.
+  printf '%s\n' "$peers" | awk 'NF {s=""; for (i=5; i<=NF; i++) s=s $i " "; printf "  peer:  %s  %s  %s  %s\n", $1, $2, $3, s}'
+  say ""
+  # Same account on both lines is what proves one tailnet rather than two - the
+  # exact confusion that sends a pair of machines into separate, empty tailnets.
+  say "  (both lines showing the same account is what proves you share a tailnet)"
+  if [ "$n" -eq 1 ]; then
+    local only; only=$(printf '%s\n' "$peers" | awk 'NF {print $1; exit}')
+    say "Open a direct channel (--peer is optional with exactly one peer):"
+    say "    pp --open --direct --topic \"<subject>\"        # picks $only"
+  else
+    say "Open a direct channel, naming which peer:"
+    say "    pp --open --direct --peer <ip> --topic \"<subject>\""
+  fi
+  say ""
+  say "  Addresses rather than names on purpose: MagicDNS depends on each machine's"
+  say "  DNS wiring and is not guaranteed, while the 100.x address always resolves."
+  return 0
+}
+
+# Resolve --peer when the operator did not pass one. With exactly one other
+# machine on the mesh there is nothing to choose, and making a human relay a name
+# that both agents can already read is a step whose only product is typos.
+resolve_peer() {
+  local given="${1:-}"
+  if [ -n "$given" ]; then printf '%s' "$given"; return 0; fi
+  mesh_installed || die "no --peer given and tailscale is not installed, so the peer
+    cannot be discovered. Run:  pp --mesh"
+
+  local me peers n
+  me=$(mesh_line_self | awk '{print $1}')
+  [ -n "$me" ] || die "no --peer given and this machine is not on the mesh.
+    Run:  pp --mesh"
+  peers=$(mesh_line_peers "$me")
+  n=$(printf '%s\n' "$peers" | grep -c '^100\.' 2>/dev/null || true)
+  [ -n "$n" ] || n=0
+
+  case "$n" in
+    0) die "no other machine on the mesh, so there is nobody to open a channel with.
+    Being logged in is not the same as sharing a tailnet with your partner.
+    Run:  pp --mesh
+    It reports which of the two it is and prints the block to hand over." ;;
+    1) printf '%s' "$(printf '%s\n' "$peers" | awk 'NF {print $1; exit}')" ;;
+    *) die "$n machines on the mesh - say which one with --peer <ip>:
+$(printf '%s\n' "$peers" | awk 'NF {printf "      %s  %s\n", $1, $2}')" ;;
+  esac
+}
+
 direct_peer() { sed -n 's/^peer=//p' "$(direct_file "$1")" 2>/dev/null | tr -d '[:space:]'; }
 
 write_direct() {
@@ -408,16 +586,10 @@ created=%s
 
 cmd_open_direct() {
   local peer="$1" topic="$2" label="$3"
-  [ -n "$peer" ] || die "--open --direct needs the peer's mesh name: --peer <name>"
+  peer=$(resolve_peer "$peer") || exit 1
   local ip; ip=$(mesh_ip)
   local id; id=$(gen_id)
   local port; port=$(direct_port "$id")
-  # The self line begins with the mesh IP. Anchoring on that is what keeps a
-  # logged-out tailscale from handing back the second word of "Logged out." as
-  # if it were a hostname - an empty-only fallback does not catch garbage.
-  local me
-  me=$(tailscale status --self --peers=false 2>/dev/null | awk '$1 ~ /^100\./ {print $2; exit}')
-  [ -n "$me" ] || me=$(hostname -s 2>/dev/null || echo peer)
 
   mkdir -p "$STATE_DIR"
   printf 'a\n' > "$(side_file "$id")"
@@ -430,8 +602,19 @@ cmd_open_direct() {
   say "  me:        side a  (label: $label, session $(session_id))"
   [ -n "$topic" ] && say "  topic:     $topic"
   say ""
-  say "Hand THIS line to the other session:"
-  say "    /ping-pong $id --direct --peer $me"
+  # The address, not the mesh name: MagicDNS is per-machine DNS wiring and is
+  # not guaranteed - a name that does not resolve fails at connect time, long
+  # after the human has walked away from the handover.
+  say "Hand THIS to your partner (copy the whole block, it is written for them):"
+  say ""
+  say "--8<---------------------------------------------------------------------------"
+  say "The channel is open on my side. Tell your agent exactly this:"
+  say ""
+  say "    /ping-pong $id --direct --peer $ip"
+  say ""
+  say "It reads the ping-pong skill, joins, and starts listening. Nothing else is"
+  say "needed from you."
+  say "--8<---------------------------------------------------------------------------"
   say ""
   say "Then keep your listener running IN THE BACKGROUND:"
   say "    pp --listen $id"
@@ -440,7 +623,7 @@ cmd_open_direct() {
 cmd_join_direct() {
   local id="$1" peer="$2" label="$3" adopt="$4"
   valid_id "$id" || die "invalid id: '$id' (expected form: pp-xxxxxx)"
-  [ -n "$peer" ] || die "--join --direct needs the peer's mesh name: --peer <name>"
+  peer=$(resolve_peer "$peer") || exit 1
   local ip; ip=$(mesh_ip)
   local port; port=$(direct_port "$id")
   assert_owner "$id" "$label" "$adopt"
@@ -1104,9 +1287,16 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   peer over TCP. Your inbox is a port on YOUR machine, bound to the mesh
   interface only. Nothing is exposed publicly and nobody gets a shell.
 
-  pp --open --direct --peer <mesh-name> [--topic "..."]
-  pp --join <id> --direct --peer <mesh-name>
+  pp --mesh                       am I on the mesh, and is my partner? START HERE
+  pp --open --direct [--topic "..."]      --peer is optional with one peer
+  pp --join <id> --direct [--peer <ip>]
   then --listen / --send / --close exactly as usual.
+
+  --mesh is the first command of a direct channel. Being logged in is NOT the
+  same as sharing a tailnet with your partner - two people who each run
+  `tailscale up` land in two separate tailnets, both reporting Connected, both
+  alone. --mesh reports which of those you are in and prints the block to hand
+  over when the peer is still missing.
 
   --as <label>    signature on your messages (default: host:project)
   --force         send even if no listener is detected (blocks up to the timeout)
@@ -1145,6 +1335,7 @@ while [ $# -gt 0 ]; do
     -c|--close) op="close" ;;
     -g|--gc) op="gc" ;;
     --setup) op="setup" ;;
+    --mesh) op="mesh" ;;
     --install) op="install" ;;
     --bus-local|--bus-ssh) setup_args+=("$1") ;;
     -t|--topic) shift; topic="${1:-}" ;;
@@ -1176,6 +1367,7 @@ done
 case "$op" in
   setup) cmd_setup "${setup_args[@]:-}" "${id:-}" ;;
   install) cmd_install ;;
+  mesh) cmd_mesh ;;
   gc) cmd_gc ;;
   adopt) [ -n "$id" ] || die "--adopt needs the channel id"; cmd_adopt "$id" "$label" ;;
   open)

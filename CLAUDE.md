@@ -142,6 +142,59 @@ Still true, and worth keeping: **the retry is the backup, not the answer.** When
 alive, so the failure mode does not get mitigated — it stops existing. The retry
 earns its place only where a channel is mandatory.
 
+## Shipped in 0.9.0: `--mesh`, and the state that looks like success and is not
+
+Direct mode landed in 0.8.0 assuming the mesh was somebody else's problem. It is not: the
+very first real bootstrap failed on it, and the failure is worth recording because **nothing
+in the failing state looks like a failure.**
+
+Two people each ran `tailscale up`. Each authenticated with their *own* account. Tailscale
+puts a device in the tailnet of the account that completes the login, so they landed in two
+separate tailnets, each alone. Both machines printed `Connected`, both held a `100.x`
+address, neither logged a warning. The peer reported success in good faith. It survived a
+full round trip through two humans before anyone read the actual peer list — one line.
+
+The generalizable shape: **an identity-scoped resource looks identical from inside whichever
+scope you ended up in.** Connectivity checks that stop at "the daemon is up and has an
+address" cannot see it, because every one of those facts is true. The check has to name the
+*other* party — here, the peer appearing in `tailscale status` with a matching account
+column. `up` succeeding is evidence about the daemon, not about reachability.
+
+What 0.9.0 does about it:
+
+- **`pp --mesh`** — four states (not installed / not logged in / logged in but alone /
+  ready), exit 0 only on ready, and in each unfinished state it prints the block the operator
+  hands to their partner. The "alone" state deliberately names **both** readings, because a
+  machine cannot tell "partner has not joined yet" from "partner joined the wrong tailnet"
+  from its own side. Saying so is more useful than picking one.
+- **`--peer` became optional** when exactly one other machine is on the mesh. The address was
+  being relayed by a human between two agents that could both read it — a step whose only
+  possible product is a typo, surfacing much later as a connection refused.
+- **The handover is a block, not a procedure.** The CLI prints text written *for the partner*,
+  and the skill tells the agent to paste it verbatim rather than paraphrase. Paraphrasing is
+  how the do-not-open-the-URL rule gets dropped, and that rule is the whole point.
+
+Two measured facts that steer troubleshooting away from dead ends, both now in the docs:
+
+- **A default-deny host firewall does not block the mesh.** With `ufw` at `deny (incoming)`
+  and no rule for the inbox port, the natural conclusion is that the peer gets dropped —
+  wrong. Tailscale installs a `ts-input` chain that the input hook jumps to *before* the
+  firewall's chains, with an unconditional accept for the mesh interface (verified in a live
+  ruleset, with matching packet counters). Opening a port here widens exposure and fixes
+  nothing. The honest corollary belongs in the handover: everything listening on `0.0.0.0`
+  becomes reachable from the mesh.
+- **MagicDNS is not guaranteed**, so `--peer` takes the address rather than the name. Measured
+  broken (`systemd-resolved` + NetworkManager wired incorrectly) on a machine whose mesh was
+  otherwise healthy — and Tailscale reports it only in a health check nothing else surfaces.
+  A name is a second thing that can be broken, and it breaks at connect time, long after the
+  human has walked away from the handover.
+
+Also fixed here: `tailscale status --self --peers=false` renders the account column as a
+numeric userid, while the full status table renders it as the account name. The account name
+is the single field that answers "whose tailnet is this" — the entire question `--mesh`
+exists to settle — so the self line is read out of the full table, with the narrow form kept
+only as a fallback.
+
 ## Updating this skill
 
 After any session that discovers a new failure shape. Keep entries generic — patterns and causes, never machine or client data. The git log of this repo is the diary.

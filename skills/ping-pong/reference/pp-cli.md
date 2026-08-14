@@ -35,6 +35,7 @@ bus_ssh=<alias>
 | `--close` | `-c` | channel id | Removes the channel from the bus and forgets it locally. |
 | `--gc` | `-g` | — | Reaps orphaned readers, clears dead listener markers, drops stale local records. |
 | `--adopt` | — | channel id | Transfers ownership of the channel to this session. |
+| `--mesh` | — | — | Direct mode's first command: reports whether this machine **and the peer** are on one mesh, and prints the block to hand over when they are not. Exit 0 = ready. |
 | `--setup` | — | — | Writes the bus configuration (above). |
 | `--install` | — | — | Copies the script to `~/.local/bin/pp`. |
 | `--help` | `-h` | — | Usage. |
@@ -51,11 +52,43 @@ bus_ssh=<alias>
 | `--force` | `-f` | `--send` | Skip the listener check and write anyway. |
 | `--adopt` | — | open/join/listen/send/close | Override an ownership refusal and claim the channel for this session. |
 | `--direct` | — | `--open` / `--join` | Create or join a **direct** channel: no bus, peer-to-peer over a private mesh. |
-| `--peer <name>` | — | `--open --direct` / `--join --direct` | The peer's mesh name or address. Required in direct mode. |
+| `--peer <addr>` | — | `--open --direct` / `--join --direct` | The peer's mesh address. **Optional** when exactly one other machine is on the mesh — there is nothing to choose, and a relayed address is only an opportunity for a typo. Required once there are two or more. |
 
 ### Direct mode
 
 No bus host, no ssh, no shell granted. Your inbox is a TCP port on your own machine, bound to the mesh interface only; the peer connects to it.
+
+#### `--mesh` — the first command, and the one that prevents the expensive mistake
+
+A tailnet belongs to an **account**, not to a network. Two people who each run `tailscale up` and each authenticate with their own account land in **two separate tailnets**, each alone. Both machines report `Connected`, both hold a `100.x` address, neither prints a warning, and they cannot reach each other. Measured in production, where it survived a full round trip through two humans before anyone read the actual peer list.
+
+`--mesh` reports which of four states you are in, and prints the hand-over text for the ones that are not ready:
+
+| State | Exit | Output |
+|---|---|---|
+| `tailscale` not installed | 1 | Install + `up` commands |
+| Installed, not logged in | 1 | `sudo tailscale up`, plus the warning not to open the URL if the *partner* owns the tailnet |
+| Logged in but alone | 1 | A ready-to-paste block written **for the partner**, covering install, `up`, the do-not-open-the-URL rule, the logout/retry recovery, and the check that proves it worked |
+| Ready | 0 | Both lines with their accounts, and the command to open the channel |
+
+The discriminant it applies, and the one to apply by hand if you ever read a raw `tailscale status`: **the peer must appear, and column three — the account — must match yours.** `up` succeeding is not evidence of anything.
+
+Getting both devices into one tailnet, two supported ways:
+
+- **Pre-auth key.** The host mints one at `login.tailscale.com/admin/settings/keys`; the partner runs `sudo tailscale up --auth-key=<key>`. One command, no relay. It is a secret: single-use, short expiry.
+- **URL relay.** The partner runs `sudo tailscale up` and sends the printed URL to the **host**, who opens it under the host's account.
+
+Already in the wrong tailnet: `sudo tailscale logout && sudo tailscale up`, then relay the new URL.
+
+#### Addresses, not names
+
+`--peer` takes the `100.x` address. MagicDNS depends on each machine's DNS wiring — measured non-functional on a machine whose mesh was otherwise perfectly healthy (`systemd-resolved` and NetworkManager wired together incorrectly, which Tailscale reports only in its health check and which nothing else surfaces). An address always resolves; a name is a second thing that can be broken, and it fails at connect time, long after the handover.
+
+#### Host firewalls do not need a hole
+
+On a machine with `ufw` default-deny incoming and no rule for the inbox port, the obvious conclusion is that the peer will be dropped. It is wrong: Tailscale installs a `ts-input` chain that the kernel's input hook jumps to **before** the firewall's own chains, holding an unconditional accept for the mesh interface. Verified in a live ruleset, with matching packet counters. Read the ruleset before opening a port.
+
+The corollary is the disclosure worth making to a partner before they join: everything on your machine listening on `0.0.0.0` becomes reachable from the mesh. `ss -tln` lists exactly that.
 
 | Piece | Bus mode | Direct mode |
 |---|---|---|
