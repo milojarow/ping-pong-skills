@@ -50,6 +50,24 @@ bus_ssh=<alias>
 | `--wait N` | `-w` | `--listen` | Give up after N seconds and exit **124** instead of blocking forever. |
 | `--force` | `-f` | `--send` | Skip the listener check and write anyway. |
 | `--adopt` | — | open/join/listen/send/close | Override an ownership refusal and claim the channel for this session. |
+| `--direct` | — | `--open` / `--join` | Create or join a **direct** channel: no bus, peer-to-peer over a private mesh. |
+| `--peer <name>` | — | `--open --direct` / `--join --direct` | The peer's mesh name or address. Required in direct mode. |
+
+### Direct mode
+
+No bus host, no ssh, no shell granted. Your inbox is a TCP port on your own machine, bound to the mesh interface only; the peer connects to it.
+
+| Piece | Bus mode | Direct mode |
+|---|---|---|
+| Inbox | a FIFO on the bus host | a TCP port on your machine |
+| Blocking read (the wake-up) | `cat` on the FIFO | `nc -l` on the port |
+| Send | write to the peer's FIFO | connect to the peer's port |
+| Presence check | a marker file that can go stale | the TCP connect itself |
+| Setup cost | one host both sides can ssh into | each device joins the mesh once |
+
+The port is derived from the channel id, identically on both sides, so it never has to be carried across and two channels between the same pair of machines cannot collide.
+
+Environment: `PP_MESH_IP` sets the bind address explicitly — use it when the mesh is not Tailscale, or to pin which interface the inbox listens on. Without it the address comes from `tailscale ip -4`, and a machine that is not on the mesh gets a refusal telling it to run `tailscale up`, rather than silently binding somewhere public.
 
 ### Ownership, and how a session is identified
 

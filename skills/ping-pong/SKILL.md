@@ -39,6 +39,37 @@ machine with no remote control, or a headless agent.
 
 Two addressing gotchas decide whether that path works on the first try: the `[ref]` from the listing is demanded as first-contact confirmation even when the name is unique, and the reply address is the incoming message's `from` attribute — not the peer's name, and not what the peer claims about itself. See [reference/native-session-messaging.md](reference/native-session-messaging.md).
 
+## Choosing a mode: bus or direct
+
+Two transports, and the choice is about **trust**, not about networking.
+
+**Bus mode** (`--setup --bus-local` / `--bus-ssh`) puts the channel's FIFOs on one host both sides reach. It needs both sides to log into that host **as the same Unix user** — so it fits two machines that already belong to the same person. Between two *different people's* machines it does not fit: the price of a chat channel would be a shell account on somebody's box.
+
+**Direct mode** (`--direct`) has no bus at all. Each side's inbox is a TCP port on **its own** machine, bound to a private mesh interface (Tailscale/WireGuard) that both devices joined. The peer connects to it. Nothing is exposed to the public internet, nobody gets a shell, and there is no token to mint or rotate — the mesh's device authorization is the access control.
+
+```bash
+# on the opener
+pp --open --direct --peer <peer-mesh-name> --topic "what this is about"
+# it prints the line to hand over:  /ping-pong <id> --direct --peer <your-mesh-name>
+
+# on the joiner
+pp --join <id> --direct --peer <opener-mesh-name>
+
+# from then on, identical to bus mode
+pp --listen <id>          # in the background
+pp --send <id> -m "..."
+```
+
+Both sides derive the **same port from the channel id**, so nothing extra travels between them and two channels between the same pair of machines land on different ports.
+
+What direct mode gives up, so you can decide with it in view:
+
+- **No always-on middleman.** Both machines must be awake at the same time; with a bus host only the bus had to be. Neither mode stores anything, so nothing is "waiting" either way.
+- **No shared metadata.** Each side keeps its own record, so `--info` reports only what this machine knows, and `--close` forgets it here — tell the peer to close too.
+- **No listener marker, and none is needed.** The TCP connect *is* the presence check: `Connection refused` is ground truth, not a claim that can go stale. That whole class of failure — a marker outliving its process — does not exist here.
+
+Requires `nc` on both machines and the device on the mesh (`tailscale up` once per device). `PP_MESH_IP` overrides the detected address if your mesh is not Tailscale.
+
 ## First: resolve the CLI
 
 The `pp` CLI ships inside this skill's own directory, at `bin/pp`. **Resolve it through the

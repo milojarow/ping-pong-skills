@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="0.7.0"
+PP_VERSION="0.8.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -343,6 +343,182 @@ cmd_setup() {
   esac
 }
 
+# ----------------------------------------------------------------- direct mode
+#
+# A DIRECT channel has no bus at all. Each side's inbox is a TCP port on its own
+# machine, reachable over a private mesh (Tailscale/WireGuard) that both devices
+# joined. The peer connects to it; nothing is exposed to the public internet and
+# no shell is granted to anyone.
+#
+# Why this exists: the bus modes need both sides to log into ONE host as the SAME
+# Unix user. Between two people's machines that is a shell account on somebody's
+# box - the wrong unit of trust for a chat channel. Direct mode grants nothing:
+# the peer can send bytes to one port, and that is the whole surface.
+#
+# The wake-up property survives intact, because it never depended on the FIFO:
+# `nc -l` blocks with zero CPU and exits when a message lands, exactly like the
+# blocked reader on the bus. Run it in the background and the harness wakes you.
+#
+# What direct mode gives up, stated plainly:
+#   - No always-on middleman. Both machines must be awake at the same time;
+#     with a bus host, only the bus had to be. Nothing is stored either way.
+#   - No shared metadata. Each side keeps its own record, so `--info` can only
+#     report what this machine knows.
+#   - No listener marker, and it turns out none is needed: the TCP connect IS
+#     the presence check. "Connection refused" is ground truth, not a claim that
+#     can go stale - the failure mode markers were invented to survive.
+
+direct_file() { printf '%s/%s.direct' "$STATE_DIR" "$1"; }
+is_direct()   { [ -r "$(direct_file "${1:-}")" ]; }
+
+# Both sides derive the SAME port from the SAME channel id, so nothing extra has
+# to be carried across. Different channels land on different ports, which is what
+# keeps two conversations between the same pair of machines isolated.
+direct_port() {
+  local n; n=$(printf '%s' "$1" | cksum | awk '{print $1}')
+  printf '%s' "$(( 47000 + n % 1000 ))"
+}
+
+# Bind to the mesh interface only. Binding to every interface would put the inbox
+# on whatever coffee-shop network the laptop is on next.
+mesh_ip() {
+  local ip
+  if [ -n "${PP_MESH_IP:-}" ]; then printf '%s' "$PP_MESH_IP"; return 0; fi
+  ip=$(tailscale ip -4 2>/dev/null | head -1)
+  [ -n "$ip" ] || die "no mesh address on this machine.
+    Direct mode needs this device on the private mesh, so the inbox is reachable
+    by the peer and by nobody else. Bring it up and log in once:
+      tailscale up
+    Then check it has an address:  tailscale ip -4"
+  printf '%s' "$ip"
+}
+
+direct_peer() { sed -n 's/^peer=//p' "$(direct_file "$1")" 2>/dev/null | tr -d '[:space:]'; }
+
+write_direct() {
+  local id="$1" peer="$2" topic="$3"
+  mkdir -p "$STATE_DIR"
+  printf 'peer=%s
+port=%s
+topic=%s
+created=%s
+' \
+    "$peer" "$(direct_port "$id")" "$topic" "$(date -u +%FT%TZ)" > "$(direct_file "$id")"
+}
+
+cmd_open_direct() {
+  local peer="$1" topic="$2" label="$3"
+  [ -n "$peer" ] || die "--open --direct needs the peer's mesh name: --peer <name>"
+  local ip; ip=$(mesh_ip)
+  local id; id=$(gen_id)
+  local port; port=$(direct_port "$id")
+  # The self line begins with the mesh IP. Anchoring on that is what keeps a
+  # logged-out tailscale from handing back the second word of "Logged out." as
+  # if it were a hostname - an empty-only fallback does not catch garbage.
+  local me
+  me=$(tailscale status --self --peers=false 2>/dev/null | awk '$1 ~ /^100\./ {print $2; exit}')
+  [ -n "$me" ] || me=$(hostname -s 2>/dev/null || echo peer)
+
+  mkdir -p "$STATE_DIR"
+  printf 'a\n' > "$(side_file "$id")"
+  claim_channel "$id" "$label"
+  write_direct "$id" "$peer" "$topic"
+
+  say "Direct channel open: $id"
+  say "  my inbox:  $ip:$port   (mesh interface only)"
+  say "  peer:      $peer:$port"
+  say "  me:        side a  (label: $label, session $(session_id))"
+  [ -n "$topic" ] && say "  topic:     $topic"
+  say ""
+  say "Hand THIS line to the other session:"
+  say "    /ping-pong $id --direct --peer $me"
+  say ""
+  say "Then keep your listener running IN THE BACKGROUND:"
+  say "    pp --listen $id"
+}
+
+cmd_join_direct() {
+  local id="$1" peer="$2" label="$3" adopt="$4"
+  valid_id "$id" || die "invalid id: '$id' (expected form: pp-xxxxxx)"
+  [ -n "$peer" ] || die "--join --direct needs the peer's mesh name: --peer <name>"
+  local ip; ip=$(mesh_ip)
+  local port; port=$(direct_port "$id")
+  assert_owner "$id" "$label" "$adopt"
+
+  mkdir -p "$STATE_DIR"
+  printf 'b\n' > "$(side_file "$id")"
+  write_direct "$id" "$peer" ""
+
+  say "Joined direct channel: $id"
+  say "  my inbox:  $ip:$port   (mesh interface only)"
+  say "  peer:      $peer:$port"
+  say "  me:        side b  (label: $label, session $(session_id))"
+  say ""
+  say "Keep your listener running IN THE BACKGROUND, then greet the peer:"
+  say "    pp --listen $id"
+  say "    pp --send $id -m \"<greeting>\""
+}
+
+cmd_listen_direct() {
+  local id="$1" wait_for="$2" label="$3" adopt="$4"
+  assert_owner "$id" "$label" "$adopt"
+  local ip port; ip=$(mesh_ip); port=$(direct_port "$id")
+
+  if ss -tln 2>/dev/null | grep -q "$ip:$port "; then
+    die "your inbox for $id ($ip:$port) already has a listener.
+    A second reader on one port steals the message from the first, the same
+    failure the bus modes guard against. If you believe it is stale, find it
+    with:  ss -tlnp | grep $port    and stop that process by pid."
+  fi
+
+  local reader="nc -l -s $ip -p $port"
+  [ "$wait_for" -gt 0 ] 2>/dev/null && reader="timeout $wait_for $reader"
+  $reader
+  local rc=$?
+  [ $rc -eq 124 ] && { say "pp: nothing arrived within ${wait_for}s (channel $id is still open)"; exit 124; }
+  return $rc
+}
+
+cmd_send_direct() {
+  local id="$1" body="$2" label="$3" adopt="$4"
+  assert_owner "$id" "$label" "$adopt"
+  local peer port; peer=$(direct_peer "$id"); port=$(direct_port "$id")
+  [ -n "$peer" ] || die "channel $id has no peer recorded on this machine"
+
+  # -v is load-bearing, not chatter: without it nc fails SILENTLY on a refused
+  # connection and there is nothing to tell "peer not listening" apart from any
+  # other failure. On success it writes "succeeded!" to stderr, which is captured
+  # and discarded - the payload on the wire is untouched either way.
+  #
+  # And no pre-flight probe: `nc -z` would CONNECT to the peer's listener, which
+  # exits on the first connection - the check would consume the very listener it
+  # was verifying and deliver nothing.
+  local err
+  err=$({ printf '=== ping-pong %s | from: %s | %s ===\n' "$id" "$label" "$(date -u +%FT%TZ)"
+          printf '%s\n' "$body"
+        } | nc -N -v -w 10 "$peer" "$port" 2>&1 >/dev/null)
+  local rc=$?
+
+  if [ $rc -ne 0 ]; then
+    case "$err" in
+      *[Rr]efused*) die "the peer is not listening on $peer:$port.
+    Nothing was delivered and nothing was stored - there is no queue.
+    Ask the other session to run:  pp --listen $id   then send it again." ;;
+      *) die "could not reach $peer:$port (rc=$rc): ${err:-no error text}.
+    Check both devices are on the mesh:  tailscale status" ;;
+    esac
+  fi
+  say "pp: delivered to $peer:$port (channel $id)"
+}
+
+cmd_close_direct() {
+  local id="$1" label="$2" adopt="$3"
+  assert_owner "$id" "$label" "$adopt"
+  rm -f "$(side_file "$id")" "$(owner_file "$id")" "$(direct_file "$id")"
+  say "pp: direct channel $id forgotten on this machine."
+  say "  The peer keeps its own record - tell it to close too, there is no shared state."
+}
+
 cmd_open() {
   local topic="$1" label="$2"
   need_config
@@ -423,6 +599,7 @@ cmd_join() {
 # blocks and removes it on exit; that marker is the only reliable presence signal.
 cmd_listen() {
   local id="$1" wait_for="$2" label="$3" adopt="$4"
+  is_direct "$id" && { cmd_listen_direct "$@"; return $?; }
   need_config
   version_notice
   valid_id "$id" || die "invalid id: '$id'"
@@ -595,6 +772,7 @@ cmd_listen_retry() {
 
 cmd_send() {
   local id="$1" body="$2" label="$3" force="$4" adopt="$5"
+  is_direct "$id" && { cmd_send_direct "$id" "$body" "$label" "$adopt"; return $?; }
   need_config
   valid_id "$id" || die "invalid id: '$id'"
   local side; side=$(my_side "$id")
@@ -729,6 +907,7 @@ cmd_info() {
 # marker before deleting.
 cmd_close() {
   local id="$1" label="$2" adopt="$3"
+  is_direct "$id" && { cmd_close_direct "$id" "$label" "$adopt"; return $?; }
   need_config
   valid_id "$id" || die "invalid id: '$id'"
   assert_owner "$id" "$label" "$adopt"
@@ -921,7 +1100,15 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   pp --gc                         reap orphaned readers + drop stale local state
   pp --adopt <id>                 take ownership of a channel for THIS session
 
-  --as <label>    signature on your messages (default: short hostname)
+  DIRECT MODE (no bus, no shell): both devices on a private mesh talk peer to
+  peer over TCP. Your inbox is a port on YOUR machine, bound to the mesh
+  interface only. Nothing is exposed publicly and nobody gets a shell.
+
+  pp --open --direct --peer <mesh-name> [--topic "..."]
+  pp --join <id> --direct --peer <mesh-name>
+  then --listen / --send / --close exactly as usual.
+
+  --as <label>    signature on your messages (default: host:project)
   --force         send even if no listener is detected (blocks up to the timeout)
   --wait N        with --listen: give up after N seconds, exit 124
   --retry [N]     with --listen: survive a dropped LINK without waking the
@@ -944,7 +1131,7 @@ EOF
 
 # ---------------------------------------------------------------------- parser
 
-op="" id="" topic="" body="" label="" wait_for=0 force=0 adopt=0 retries=0
+op="" id="" topic="" body="" label="" wait_for=0 force=0 adopt=0 direct=0 peer="" retries=0
 setup_args=()
 
 while [ $# -gt 0 ]; do
@@ -973,6 +1160,8 @@ while [ $# -gt 0 ]; do
       esac
       ;;
     -f|--force) force=1 ;;
+    --direct) direct=1 ;;
+    --peer) shift; peer="${1:-}" ;;
     --adopt) adopt=1; [ -z "$op" ] && op="adopt" ;;
     -h|--help) usage; exit 0 ;;
     -V|--version) say "pp $PP_VERSION"; exit 0 ;;
@@ -989,8 +1178,15 @@ case "$op" in
   install) cmd_install ;;
   gc) cmd_gc ;;
   adopt) [ -n "$id" ] || die "--adopt needs the channel id"; cmd_adopt "$id" "$label" ;;
-  open) cmd_open "$topic" "$label" ;;
-  join) [ -n "$id" ] || die "--join needs the channel id"; cmd_join "$id" "$label" "$adopt" ;;
+  open)
+    if [ "$direct" = "1" ]; then cmd_open_direct "$peer" "$topic" "$label"
+    else cmd_open "$topic" "$label"; fi
+    ;;
+  join)
+    [ -n "$id" ] || die "--join needs the channel id"
+    if [ "$direct" = "1" ]; then cmd_join_direct "$id" "$peer" "$label" "$adopt"
+    else cmd_join "$id" "$label" "$adopt"; fi
+    ;;
   listen)
     [ -n "$id" ] || die "--listen needs the channel id"
     if [ "$retries" -gt 0 ] 2>/dev/null; then
