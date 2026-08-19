@@ -195,6 +195,37 @@ is the single field that answers "whose tailnet is this" — the entire question
 exists to settle — so the self line is read out of the full table, with the narrow form kept
 only as a fallback.
 
+## Known gap: an empty `--send` body is delivered as success
+
+**Not built.** As of 0.9.x, `cmd_send` accepts an empty `$body` and sends it: the
+receiver gets a header with nothing under it, the sender gets `pp: delivered`, exit 0,
+no warning. Measured four times in one day on a single channel.
+
+Why it is worth closing rather than only documenting: this is the failure shape the
+whole protocol is built to avoid — **it looks exactly like success on both sides**. It
+also **costs the receiver a turn**, because every delivery consumes its one-shot
+listener and forces a relaunch. And a message with no text has no legitimate use case
+that would justify either.
+
+The shape a fix would take, and the open questions:
+
+- `cmd_send` refuses an empty (or whitespace-only) body with a `die`, in both the bus
+  path and `cmd_send_direct`, since both glue the sender-written header to the body.
+- Whether to add an `--allow-empty` escape hatch at all. Nothing legitimate is known to
+  need it; adding it pre-emptively creates the exemption that the next silent-empty send
+  will hide behind.
+- Where the check goes: before `assert_owner` / the listener probe (cheapest, and it
+  avoids consuming anything), not after.
+- `--send` reading from stdin has the same hole (`pp --send <id> < empty.txt`), so the
+  guard belongs after the body is assembled, not on the `-m` argument.
+
+Until it exists, the documented remedy is the manual one in
+`reference/troubleshooting.md` ("A message arrived with its HEADER and NO BODY"): check
+`wc -c` before sending, build the text with a quoted heredoc, and isolate with a
+literal one-liner. **Do not document a rejection or an `--allow-empty` flag in the
+skill until the executable actually has it** — a version chain that promises a guard it
+does not ship is exactly the drift this repo has been bitten by before.
+
 ## Updating this skill
 
 After any session that discovers a new failure shape. Keep entries generic — patterns and causes, never machine or client data. The git log of this repo is the diary.

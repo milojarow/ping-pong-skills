@@ -244,6 +244,81 @@ Since v0.2.0 three guards close this off, and the errors name the situation:
 
 Not a closed channel (that exits non-zero) and not a timeout (that exits 124). Exit 0 with an empty body means **another reader consumed the message on your side**. Run `pp --info <id>` to see who holds the marker and `pp --gc` to clear a stale one. If a second session is genuinely attached, one of you is on the wrong channel.
 
+## A message arrived with its HEADER and NO BODY
+
+Measured over a full day on one channel: four consecutive messages from one side
+landed as a header with nothing under it. The sender saw `pp: delivered` all four
+times and spent hours believing it had answered.
+
+### The blame is ALWAYS the sender's — this is what saves the investigation
+
+In `cmd_send` (and identically in the direct-mode path) the **header is written by
+whoever sends**, glued to the body in the same stream:
+
+```bash
+{ printf '=== ping-pong %s | from: %s (side %s) | %s ===\n' ...
+  printf '%s\n' "$body"
+} | bus_stream "timeout $SEND_TIMEOUT cat > .../to-$out"
+```
+
+So: **if the header arrived intact, the transport worked.** An empty body cannot be
+channel truncation, nor a `--retry` re-attach, nor the receiver's reader. It is
+`$body` already empty at the moment of the call.
+
+Corollary for the RECEIVER: do not spend a minute on your reader, your link or your
+drops. Tell the sender its `$body` is going out empty and hand it the lines above.
+
+### How `$body` ends up empty with nothing failing
+
+All of these share one signature: exit 0, `delivered`, and no warning.
+
+- `-m "$(cat file)"` where the file is empty, missing, or relative to another cwd —
+  `$(cat nosuchfile)` expands to nothing and the command does not fail.
+- A heredoc whose content never reached the file.
+- A variable from an earlier turn: every Bash tool invocation starts a **new** shell,
+  so `MSG="…"` set two commands ago no longer exists.
+- **Backticks inside double quotes**: the shell EXECUTES them. `-m "use \`foo\`"`
+  eats the word, and if the message was only that, the body is empty. Same mechanism
+  as [the message that arrived with words missing](#the-message-was-delivered-but-arrived-with-words-missing)
+  — this is its total case.
+
+### The two defences
+
+1. **Check the size BEFORE sending** — a `wc -c` is cheaper than a day of silence:
+
+   ```bash
+   cat > /tmp/m.txt <<'END'
+   text with `backticks`, $vars and "quotes" kept safe
+   END
+   wc -c /tmp/m.txt
+   pp --send <id> -m "$(cat /tmp/m.txt)"
+   ```
+
+   The **quoted** heredoc delimiter (`<<'END'`) disables every expansion, which is
+   what makes building the text safe. Better still, send the file through stdin
+   (`pp --send <id> < /tmp/m.txt`) — see [pp-cli.md](pp-cli.md#sending-a-message-prefer-stdin-keep--m-for-one-liners).
+
+2. **The one-line test that isolates it**, no files and no variables:
+
+   ```bash
+   pp --send <id> -m 'BODY-TEST-1'
+   ```
+
+   Arrives with text → the problem is how you build the body. Arrives empty too →
+   then it is the sender's `pp` or shell.
+
+### Diagnosing it from the receiving side without guessing
+
+The header's timestamp is stamped by the SENDER, so it is usable for correlation: in
+the observed case two of the empty deliveries fell ~90 s and ~2 min after messages
+from this side, which proved the peer was awake and answering. Beware the false
+pattern, though — two of the four turned out to be **earlier** than anything this side
+had sent, and comparing against the real mtimes of one's own files killed that theory
+before it was believed.
+
+**Note the cost while it lasts:** each empty delivery still CONSUMES the receiver's
+listener and forces a relaunch, so it burns a turn on both sides.
+
 ## The message was delivered but arrived with words missing
 
 Not a `pp` failure — the body was damaged by **your own shell** before `pp` received it, and the delivery that followed was perfectly correct.
