@@ -10,7 +10,7 @@
       "name": "ping-pong-skills",
       "source": "./",
       "description": "Direct session-to-session messaging over a shared bus host. Each channel is isolated, so several agent pairs can work in parallel without crosstalk.",
-      "version": "0.9.3",
+      "version": "0.9.4",
       "author": {
         "name": "milojarow",
         "url": "https://github.com/milojarow"
