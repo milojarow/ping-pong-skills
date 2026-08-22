@@ -148,6 +148,39 @@ pp --info <id>       # the authority: marker present or not
 
 A reader with no marker is a raw `cat` (or a listener from an older build). Reach for `--send --force` there, and prefer switching that side to `pp --listen` so the state stays visible.
 
+## The probe is the cheap ATTEMPT, not a parse of `--info`'s status — and "no listener" contains "listen"
+
+Measured during a coordinated deploy with the peer's side down. A retry loop
+deciding whether the peer had a listener yet parsed `pp --info` with:
+
+```bash
+grep -qiE 'side a.*listen'
+```
+
+The real line `pp --info` prints when there is **no** listener is `side a: no
+listener`. **"no listener" contains "listen"** — the pattern matched exactly
+when the channel said the opposite, the send fired on the first attempt, and
+the loop exited having never delivered the message. The pattern was guessed,
+not measured against a real line of output.
+
+**The fix is not a tighter regex.** Hardening it (`'side a: listening'`, or
+anchoring the negative) leaves the class alive — `--info`'s output format can
+change later and the detector lies again, silently. The fix is changing
+instrument: **when the attempt is cheap and non-blocking, the attempt IS the
+probe.** `pp --send` bounces back in ~2s with a clear message when there's no
+listener — that's ground truth for the exact moment of the send, with no
+window between "I asked" and "I acted". Keep `--info` for logging only, and
+print its line literally — never an interpretation of it.
+
+Generalize: ask-then-act has a race and two parsers to keep in sync;
+attempt-and-read-the-bounce has neither. Prefer the attempt whenever it is
+cheap, idempotent, and non-blocking.
+
+(Same incident, a second and already-documented trap: `pkill -f 'seq 1 45'`
+self-matched its own command line and killed the wrong process — `pkill -f`
+patterns match every cmdline, including the shell that is running the kill
+command itself. See [Cleaning up](#cleaning-up).)
+
 ## A marker is a claim, not proof — and `--info` now says which
 
 The `listening-<side>` file is removed by an EXIT trap. That works when the listener ends cleanly; it does **not** run on `SIGKILL`, so a session killed hard (restart, closed terminal, `kill -9`) leaves the file behind announcing a listener that no longer exists.
