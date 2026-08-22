@@ -176,6 +176,24 @@ Generalize: ask-then-act has a race and two parsers to keep in sync;
 attempt-and-read-the-bounce has neither. Prefer the attempt whenever it is
 cheap, idempotent, and non-blocking.
 
+The retry loop that follows from that parses no state at all:
+
+```bash
+for i in $(seq 1 60); do
+  out=$(pp --send <id> < msg.txt 2>&1)
+  case "$out" in *delivered*) exit 0;; esac   # the effect, not the status
+  sleep 20
+done
+```
+
+Two details decide whether it works. **The verdict is taken on the `delivered`
+line, not on the wrapper's exit code** — a background command in the agent
+harness can report `exit 0` for a send that never left. And if you genuinely
+must read `--info`, **anchor on the affirmative form, in uppercase**:
+`grep -q '^  side a: LISTENING'` — with `-q`, without `-i`. That is the only
+one of the two lines that is not a substring of the other; a `grep -i listen`
+brings the tautology straight back.
+
 (Same incident, a second and already-documented trap: `pkill -f 'seq 1 45'`
 self-matched its own command line and killed the wrong process — `pkill -f`
 patterns match every cmdline, including the shell that is running the kill
