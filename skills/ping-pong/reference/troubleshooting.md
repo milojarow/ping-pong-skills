@@ -462,3 +462,28 @@ Two guards before firing:
 **Reach for `pp --gc` before doing any of that by hand.** Since 0.4.x it is the automatic reaper, and it runs on the bus, so it sees what your machine cannot: besides the token-proved orphans it owns, it kills any reader on the bus whose parent or grandparent is pid 1 — a reader that survived its ssh gets **reparented**, which is a fact no local state and no version can hide. That backstop needs no token, so it reaches listeners from builds too old to have written one. `--gc` also runs on its own before `--open`, `--join` and `--list`.
 
 Hand-killing is for what remains after that: a reader that is still correctly parented but abandoned, or a bus you can reach only by ssh. Treat an unexplained silent peer as a possible orphan and check `--info` against whether that session still exists.
+
+### `--gc` does not reap a `listening-*` marker whose reader process already died — and the refusal message points at it anyway
+
+`--listen` can refuse with "side a of channel `<id>` ALREADY has a live listener (pid `<N>` on the bus). If that listener is stale, clear it: `pp --gc`" — and running exactly that can leave the marker untouched. Measured: `pp --gc` reported `checked 3 listener record(s), dropped 0 stale channel record(s)` — it reaps **channels** with no listener on either side and long silence, not an individual `listening-<side>` record whose process is simply gone. `pp --adopt` does not touch it either: it changes session ownership, and the stale `listening-a` marker survives the adoption untouched.
+
+So the error message's own suggested fix is a dead end for this specific shape of staleness. Diagnose instead of guessing:
+
+```bash
+pp --info <id>          # get the pid AND which side the marker is on
+ps -p <PID>             # alive on THIS machine?
+```
+
+`--info` names which machine the marker belongs to (`<host>:<project> pid=... token=... since=...`). **Only a pid on your own side is yours to judge** — a pid belonging to the peer's side runs on their machine, and checking it with a local `ps` always reads "dead" (it was never yours to see), which would delete a marker for a listener that is actually alive and waiting.
+
+Once the pid is confirmed dead **and** confirmed to be your own side's marker, clear it directly on the bus and relisten:
+
+```bash
+ssh <bus> "rm -f /tmp/ping-pong/<id>/listening-a"   # or listening-b — your OWN side only
+pp --info <id>                                       # → "side a: no listener"
+pp --listen <id> --retry
+```
+
+🔴 **Never delete the `listening-*` marker for the OTHER side.** That process may be alive and waiting; removing its marker does not kill it, but it does make the channel lie about who is listening — the next `--send` can then go out with `--force` against a FIFO that actually has a reader.
+
+**The preventive fix is the turn contract, not a bigger `--gc`.** This marker goes stale exactly when a session listens, receives, and ends its turn without relaunching — the next turn on that machine finds the door jammed shut by its own ghost. Relaunching `--listen` before replying (see [the turn contract](../SKILL.md#the-turn-contract)) is what keeps the marker from outliving its reader in the first place.
