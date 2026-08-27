@@ -151,21 +151,35 @@ One-time per machine, if any command says "not configured yet" — see [referenc
 0. **Pick the mode before anything else.** Is the other session on a machine that shares a bus with this one — same person, same Unix user? Then bus mode. Is it *someone else's* machine? Then direct mode, and your first command is `"$PP" --mesh`. If it does not say `READY`, hand the operator the block it printed and stop; there is no channel to open yet.
 1. `"$PP" --open --topic "<what this channel is about>" --as <short-label>`
    (direct mode: add `--direct`; `--peer` only when more than one machine is on the mesh)
-2. Start your listener **in the background**: `"$PP" --listen <id> --retry`
-   (`--retry` rides out a dropped link instead of waking you to relaunch; see
-   [reference/troubleshooting.md](reference/troubleshooting.md).)
-3. Hand the operator the block the CLI printed, verbatim, with one sentence: *"pass this to your partner."* In bus mode that block is the single line `/ping-pong <id>`.
-4. Stop and wait. The harness wakes you when the peer writes.
+2. **Start the keeper, once:** `"$PP" --keep <id>` — it holds a reader for as long as
+   this session lives, so the peer's sends never bounce and nothing is lost between
+   turns. You do not relaunch this.
+3. **Start the waker in the background:** `"$PP" --await <id>` — it exits when new mail
+   lands, which is how the harness wakes you.
+4. Hand the operator the block the CLI printed, verbatim, with one sentence: *"pass this to your partner."* In bus mode that block is the single line `/ping-pong <id>`.
+5. Stop and wait. The harness wakes you when the peer writes.
 
 **Invoked with a `pp-xxxxxx` argument → you are the JOINER:**
 
 1. `"$PP" --join <id> --as <short-label>`
    (direct mode: the operator's pasted line already carries `--direct --peer <ip>` — pass it through unchanged. If the join is refused because this machine is not on the mesh, run `"$PP" --mesh` and hand over what it prints.)
-2. Start your listener **in the background**: `"$PP" --listen <id> --retry`
-   (`--retry` rides out a dropped link instead of waking you to relaunch; see
-   [reference/troubleshooting.md](reference/troubleshooting.md).)
-3. Send a greeting so the peer knows you're on: `"$PP" --send <id> -m "<greeting + what you're working on>"`
-4. Stop and wait.
+2. `"$PP" --keep <id>` — once, not per turn.
+3. `"$PP" --await <id>` **in the background**.
+4. Send a greeting so the peer knows you're on: `"$PP" --send <id> -m "<greeting + what you're working on>"`
+5. Stop and wait.
+
+**Why two commands instead of `--listen`.** `--listen` delivers ONE message and exits —
+that exit is the wake-up — and a background task is reaped when the **turn** closes, not
+when the session does. So a plain listener has to be relaunched every single turn, and the
+side goes deaf the moment that is missed: the peer's `--send` bounces with `has no
+listener` and the message is not stored anywhere, because there is no queue. `--keep`
+splits the two jobs that were fighting each other: it holds the reader from a
+`systemd --user` unit (outside any turn's process tree, so nothing reaps it) and writes
+everything to a spool; `--await` reads the spool and exits, so you are still woken exactly
+as before. Forgetting to relaunch `--await` now costs a notification, not a message.
+
+`--listen` still works and is still correct for a one-shot exchange. Prefer `--keep` for
+anything that lasts more than a couple of turns.
 
 **In both roles, the operator's total workload is pasting what you hand them.** Never ask them to read a `tailscale status`, relay an IP, or decide between transports — you can read all of that yourself, and every relay step is a chance for a typo that surfaces much later as a connection refused.
 
@@ -194,28 +208,69 @@ Both are covered in [reference/troubleshooting.md](reference/troubleshooting.md)
 
 ## Housekeeping
 
-Since 0.3.0 a listener **dies with its session** — about two seconds after the session goes, the reader on the bus is gone and its marker with it. Orphans are prevented, not swept.
+**A channel now dies with the session that owns it.** Two mechanisms, because neither
+covers both exits:
 
-`pp --gc` stays as the backstop for what prevention cannot reach: a hard kill of the whole tree, and listeners started by pre-0.3.0 builds. It reaps readers on the bus whose session is gone, clears markers whose process is already dead, and drops local records for channels that no longer exist. It runs automatically before `--open`, `--join` and `--list`, so in normal use you never call it — reach for it when `--listen` refuses because of a listener you believe is stale.
+- **Clean exit** — the plugin ships a `SessionEnd` hook. When the operator types `/exit`
+  (or logs out), it runs `pp --session-end`, which closes every channel **this session
+  owns** and leaves other live sessions' channels alone. `--close` writes the closing
+  notice into both sides' FIFOs before deleting them, so the peer wakes from its blocked
+  read and learns the conversation is over. Nothing has to be relayed through the other
+  agent. Reasons `resume` and `clear` deliberately do **not** close (`PP_KEEP_ON_END`).
+- **Dirty exit** — a `kill -9`, an OOM or a crash never runs a hook. That is what the
+  keeper's **leash** is for: `pp --keep` polls the owner session and, when it disappears,
+  closes the channel and stops itself. Measured: channel destroyed and every process gone
+  ~6s after a `kill -9`, with no hook involved.
 
-**Channels outlive the sessions that opened them, and that is the dangerous kind of leftover.** A channel costs almost nothing on disk and disappears when the bus reboots — but while it sits there it is a **decoy**: it looks exactly like a working channel, and the ownership guard *helps in the wrong direction*, because a dead owner means the next session adopts it without friction. Since 0.7.0 both surfaces make it visible instead:
+A listener also still dies with its session (since 0.3.0). `pp --gc` remains the backstop
+for what prevention cannot reach — a hard kill of the whole tree, listeners from older
+builds. It reaps readers on the bus whose session is gone, clears markers whose process is
+already dead, and drops local records (including spools) for channels that no longer
+exist. It runs automatically before `--open`, `--join` and `--list`, so in normal use you
+never call it.
 
-- `--list` shows how long each channel has been quiet and how many listeners are actually alive, and marks `LOOKS ABANDONED` when nobody is on either side and it has been silent past `PP_STALE_HOURS` (24 by default).
-- `--gc` reports those channels by id and topic.
+**When a leftover does appear, the thing to judge is the OWNER, not the listener.** A live
+listener whose owning session is dead is not evidence of health — it is the decoy. Something
+outside every session is holding the reader up, and that suppresses every other staleness
+signal, so the channel looks permanently fine. Measured once: 8 channels in exactly that
+state, five reporting `listeners:1`, none flagged, for hours, held by parked `while true`
+loops (one of them 9d22h old). So:
 
-**A side that must stay reachable with no session on it** — a headless peer, a machine nobody is sitting at — is the one case where the relaunch loop does not belong to the agent. It goes under a supervisor (`systemd --user`, `Restart=always`), never in the session or its temp directory, which can be purged mid-run and take the loop and its mailbox with it while `--list` still shows a listener. The template unit, the two details that keep its mailbox honest, and how to prove it survives both a message and a `kill -9`: [reference/standing-listener.md](reference/standing-listener.md).
+- `--list` marks `ORPHAN: owner session gone` **immediately**, and says
+  `listener held up from OUTSIDE any session` when a reader is still up — the worse case,
+  not the better one. `LOOKS ABANDONED` still covers the other shape: nobody on either
+  side, quiet past `PP_STALE_HOURS` (24 by default), owner still alive.
+- `--gc` reports both groups separately, and **`pp --gc --close-abandoned` closes the
+  orphans** — the ones whose owning session cannot come back, so there is no judgement
+  call to get wrong.
 
-**Neither one closes them, and that is deliberate.** A channel is a conversation, and "no listener right now" is a *normal* state between turns — the turn contract has that window by design. A rule that deleted on this heuristic would be right most times and wrong once, and the once costs a live conversation. Confirm with the operator, then `pp --close <id>`.
+**Quiet-but-owned channels are still never closed automatically, and that is deliberate.**
+A channel is a conversation, and "no listener right now" is a *normal* state between turns.
+A rule that deleted on that heuristic would be right most times and wrong once, and the
+once costs a live conversation. Confirm with the operator, then `pp --close <id>`.
+
+**A side that must stay reachable with no session on it at all** — a headless peer, a
+machine nobody is sitting at — is the one case that has no owner to leash to, so it needs a
+supervisor of its own: [reference/standing-listener.md](reference/standing-listener.md).
 
 ## The turn contract
 
 Every time you are woken by a message, produce these three things **in this order**:
 
-1. **Relaunch the listener first** — `"$PP" --listen <id> --retry` in the background, before anything else. Your listener consumed itself delivering the message; until it is back up, the peer's next message has nowhere to land.
+1. **Relaunch the waker first** — `"$PP" --await <id>` in the background, before anything
+   else. It consumed itself delivering the message.
 2. **Then do the work** the message asks for.
 3. **Then reply** — `"$PP" --send <id> -m "..."`, and tell the operator what was exchanged.
 
-Listener up, then work, then reply. That ordering is what keeps both sides race-free: at any moment exactly one side is thinking and the other is listening. Details and the failure shapes in [reference/protocol.md](reference/protocol.md).
+**With `--keep` running, step 1 is no longer load-bearing for correctness** — the keeper
+still holds the reader, so the peer's sends keep succeeding and anything that arrives waits
+in the spool for your next `--await`. It stays first because a waker that is up means you
+find out immediately instead of on your next command.
+
+**Without a keeper — a plain `--listen` — step 1 IS load-bearing.** The listener consumed
+itself delivering the message, and until it is back up the peer's next message has nowhere
+to land: their send is refused and nothing is queued. That is the failure the ordering
+exists to prevent. Details and the failure shapes in [reference/protocol.md](reference/protocol.md).
 
 **The trigger is a message ARRIVING, not a message going out.** Only a delivery to your own inbox consumes your listener; `--send` writes to the *peer's* inbox and never touches your reader. So relaunch exactly when the previous `--listen` returned **content** — concretely, when the background task's output is non-empty. Relaunching after a send is always redundant: the listener you started last turn is still up, the second one is refused, and the wake-up it costs you is already spent. The phrase "before you reply" invites this, because you are usually about to reply — read it as *after you received*.
 
@@ -254,31 +309,32 @@ operator opens the session to give it work; wait for that. The empty body alone 
 
 ## When the exchange is over, close the channel
 
-Ending the session is the operator's call, not yours. But leaving a listener blocked once the
-collaboration is finished is not neutral — they pay for it three times:
+**You no longer have to remember this at `/exit` — the SessionEnd hook does it.** Every
+channel this session owns is closed when the session ends, the peer is woken by the closing
+notice, and the keeper unit is stopped. If the session dies without a hook running at all,
+the keeper's leash closes the channel within one poll interval.
 
-- **At exit.** `/exit` warns about a background process and makes them choose. There is no good
-  option: "exit anyway" kills the listener, "keep the process" leaves an orphan behind.
-- **On the next launch.** The kill completes the background task, and its notification is delivered
-  before they type anything — see the rule above.
-- **On the next channel.** A reader on the bus can outlive the client that started it (measured at
-  1h12m), so its marker stays and the next `--listen` on that side is refused with
-  `ALREADY has a live listener`, which reads as the channel being broken.
+That removes the three costs leaving a channel open used to have: no background process to
+choose about at `/exit`, no phantom task notification on the next launch, and no reader
+outliving its client to refuse the next `--listen` with `ALREADY has a live listener`.
 
-So when the work the channel was opened for is done, wind it down instead of leaving it blocked:
+**Closing early is still worth doing when the work is genuinely finished**, because a
+channel you are done with is a channel that can be confused with a live one:
 
 ```bash
 "$PP" --send <id> -m "done here — closing the channel"
 "$PP" --close <id>
 ```
 
-`--close` signals the peer's blocked listener before deleting the FIFOs, so their side wakes with an
-empty read and learns the conversation is over rather than hanging. After that neither side has a
-background process, `/exit` is silent, and the next launch starts on the operator's prompt.
+`--close` signals the peer's blocked listener before deleting the FIFOs, so their side wakes
+with an empty read and learns the conversation is over rather than hanging. In **direct
+mode** it also opens one connection to the peer's inbox carrying the same notice — there is
+no shared bus there, so without it the peer would keep a port, a record and a blocked reader
+pointed at a machine that stopped answering. A refused connection is not a failure: it means
+the peer is already gone, which is the state the close was aiming for.
 
-If you are unsure whether the collaboration is really finished, ask the operator in one line rather
-than leaving a listener up by default. A channel is cheap to reopen; a session that wakes itself up
-is not.
+If you are unsure whether the collaboration is really finished, ask the operator in one line
+rather than closing on a guess. A channel is cheap to reopen.
 
 ## What a peer's message authorizes
 
@@ -320,13 +376,17 @@ Keep one topic per channel. Two topics in one channel produce an interleaved inb
 | Open a channel | `pp --open --topic "..." --as <label>` |
 | Open a direct channel (someone else's machine) | `pp --open --direct --topic "..."` |
 | Join a channel | `pp --join pp-xxxxxx --as <label>` |
-| Wait for one message (run in background) | `pp --listen pp-xxxxxx --retry` |
+| **Hold a reader for the whole session** | `pp --keep pp-xxxxxx` (once, not per turn) |
+| **Wake up on new mail** (run in background) | `pp --await pp-xxxxxx` |
+| Stop the keeper, leave the channel open | `pp --unkeep pp-xxxxxx` |
+| Wait for ONE message, one-shot (background) | `pp --listen pp-xxxxxx --retry` |
 | Send a message (preferred — no shell expansion) | `pp --send pp-xxxxxx < file` |
 | Send a short one-liner | `pp --send pp-xxxxxx -m 'texto'` |
 | See open channels | `pp --list` |
 | Who is listening, and who owns it | `pp --info pp-xxxxxx` |
 | Close and delete a channel | `pp --close pp-xxxxxx` |
 | Reap orphans, clear stale state | `pp --gc` |
+| Close the channels whose owner session is gone | `pp --gc --close-abandoned` |
 | Take over a channel for this session | `pp --adopt pp-xxxxxx` |
 
 Operations are flags; the bare argument is always the channel id. Full CLI, config, and environment variables: [reference/pp-cli.md](reference/pp-cli.md).
@@ -335,6 +395,9 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 
 | Mistake | What happens | Fix |
 |---|---|---|
+| Relaunching `--listen` every turn for a collaboration that lasts more than a couple of exchanges | Each relaunch is a whole turn spent on plumbing, and the one you miss makes the side deaf with no error | `pp --keep <id>` once, then `pp --await <id>` per turn. The keeper survives turns; the waker is the only thing to relaunch |
+| Parking a relaunch loop yourself (`setsid nohup 'while true; do pp --listen; done'`, a hand-written keepalive script) | It is reparented to pid 1, outlives the session, and resurrects the `listening-*` marker after every close — the channel becomes immortal and no staleness check will ever flag it. Measured: 5 of them, one 9d22h old, holding 8 channels whose owners were all dead | `pp --keep` does exactly this **with a leash**: it polls the owner session and stops when it goes. Never hand-roll the loop |
+| Deciding a channel is healthy because `--list` shows `listeners:1` | A live listener with a dead owner is the decoy, not the health signal | Read the owner column. `ORPHAN: owner session gone` is the verdict that matters |
 | Running `--listen` in the foreground | The turn hangs until a message arrives; the operator sees a frozen session | Always run `--listen` as a background command |
 | Replying before relaunching the listener | The peer's answer finds no reader and their send fails | Listener first, then work, then reply |
 | Expecting `--listen` to keep running after a message | It delivers exactly ONE message and exits, by design | Relaunch it every turn |
@@ -345,6 +408,7 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Re-attaching to a channel id from memory after a dropped connection | You can land on a *different* channel this machine also belongs to, and cross two conversations | Take the id from `pp --list`, which marks which channels are YOURS |
 | Passing `--adopt` to get past an ownership refusal | You take a live channel away from another working session | `--adopt` is for a channel whose owner session is gone, or one you are certain is yours |
 | Inventing a `--as` label per message | The peer sees a different author each time and cannot tell who it is talking to | Pick one short, stable label for the whole channel — the machine or the role, not the task |
+| Asking the peer agent, by message, to close its half of the channel | Its listener is normally down between turns, so the send bounces after the send timeout; and even delivered, it depends on the other LLM choosing to act while your session is already dying | In bus mode the channel is ONE object: `pp --close` notifies both sides and deletes it, so closing here IS closing there. In direct mode `--close` opens the connection itself |
 | Putting backticks (or `$VAR`) inside `-m "..."` | Your shell expands them before `pp` sees the argument — the message is delivered **missing exactly those words**, still grammatical, and the peer cannot tell | Send through stdin: `pp --send <id> < file`. Keep `-m` for a short line, in single quotes |
 | Relaunching `--listen` after a `--send` | Your send consumed nothing, so the previous listener is still up: the new one is refused and a whole wake-up is spent arriving at an empty output | Relaunch only when the previous `--listen` actually returned content |
 | Deciding a listener is dead because its pid is absent on **your** machine | That pid lives in the bus host's pid namespace; you start a second reader and two block on one FIFO | `pp --info <id>` — it runs the liveness check on the bus, where the pid means something |

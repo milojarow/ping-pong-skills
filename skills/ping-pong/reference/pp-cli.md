@@ -28,12 +28,16 @@ bus_ssh=<alias>
 |---|---|---|---|
 | `--open` | `-o` | — | Creates a channel, prints the id and the line to hand over. You become side a. |
 | `--join` | `-j` | channel id | Registers this machine as side b of an existing channel. |
-| `--listen` | `-L` | channel id | **Blocks** until one message arrives, prints it, exits. Run it in the background. |
+| `--listen` | `-L` | channel id | **Blocks** until one message arrives, prints it, exits. Run it in the background. One-shot. |
+| `--keep` | `-k` | channel id | Starts a **session-leashed keeper**: a reader held from a `systemd --user` unit for as long as the owning session lives. Survives turns; cannot outlive the session. Spools everything to `<id>.inbox`. Run once, not per turn. |
+| `--await` | `-A` | channel id | **Blocks** until the spool grows past the cursor, prints exactly what is new, exits. This is the wake-up when a keeper is running. |
+| `--unkeep` | — | channel id | Stops the keeper. Leaves the channel open. |
 | `--send` | `-s` | channel id | Sends a message to the other side. |
 | `--list` | `-l` | — | Open channels on the bus, with topic and which side you are. |
 | `--info` | `-i` | channel id | Channel metadata plus who currently has a listener up. |
 | `--close` | `-c` | channel id | Removes the channel from the bus and forgets it locally. |
-| `--gc` | `-g` | — | Reaps orphaned readers, clears dead listener markers, drops stale local records. |
+| `--gc` | `-g` | — | Reaps orphaned readers, clears dead listener markers, drops stale local records (spools included). Reports leftovers in two groups: owner-session-gone, and quiet-but-owned. |
+| `--session-end` | — | — | Closes every channel **this session** owns. What the `SessionEnd` hook calls; reads the hook payload from stdin for the reason. |
 | `--adopt` | — | channel id | Transfers ownership of the channel to this session. |
 | `--mesh` | — | — | Direct mode's first command: reports whether this machine **and the peer** are on one mesh, and prints the block to hand over when they are not. Exit 0 = ready. |
 | `--setup` | — | — | Writes the bus configuration (above). |
@@ -48,7 +52,9 @@ bus_ssh=<alias>
 | `--topic "..."` | `-t` | `--open` | Human-readable subject, shown in `--list` and `--info`. |
 | `--as <label>` | `-a` | any | Signature on your messages. Defaults to the short hostname. Sanitized to `[A-Za-z0-9._-]`, max 32 chars. |
 | `--message "..."` | `-m` | `--send` | The body. Without it, the body is read from **stdin**. |
-| `--wait N` | `-w` | `--listen` | Give up after N seconds and exit **124** instead of blocking forever. |
+| `--wait N` | `-w` | `--listen`, `--await` | Give up after N seconds and exit **124** instead of blocking forever. |
+| `--close-abandoned` | — | `--gc` | Also **close** the channels whose owner session is gone. Never touches a channel whose owner is still alive. |
+| `--reason R` | — | `--session-end` | The SessionEnd reason, when not supplied on stdin. |
 | `--force` | `-f` | `--send` | Skip the listener check and write anyway. |
 | `--adopt` | — | open/join/listen/send/close | Override an ownership refusal and claim the channel for this session. |
 | `--direct` | — | `--open` / `--join` | Create or join a **direct** channel: no bus, peer-to-peer over a private mesh. |
@@ -154,7 +160,12 @@ Three distinct kinds of litter, all scoped to this machine:
 
 1. **Orphaned readers** — a reader still blocked on the bus whose local session is gone. Reaped two ways: by process group where the marker carries a token written by this machine, so a recycled pgid is never killed by mistake; and, as a backstop, any reader on the bus whose parent or grandparent is pid 1. A reader that outlived its ssh gets **reparented**, so that second check needs no token, no local record and no matching version.
 2. **Dead listener markers** — the marker file outlived its process. No kill needed; left in place it makes `--send` report success into nothing and blocks a legitimate re-listen.
-3. **Stale local records** — `.side` / `.owner` / `.listener` for channels that no longer exist on the bus.
+3. **Stale local records** — `.side` / `.owner` / `.listener` / `.inbox` / `.cursor` for channels that no longer exist on the bus. The spool is scanned in its own right, not only alongside a `.side`: a close triggered from inside the keeper's own unit races its own closing notice — `--close` writes that notice into **both** sides' FIFOs, the keeper's reader receives it, and the loop appends it to a spool deleted a moment earlier. The result is a lone `.inbox` for a channel that no longer exists, which a scan over `.side`/`.owner` alone would never see.
+
+It then **reports** what it will not delete on its own, in two groups that mean different things:
+
+- **Owner session gone** — this machine's side belongs to a session that no longer exists. Flagged regardless of listener count; a live listener here makes it *worse*, not better, because something outside every session is holding the reader and suppressing every other signal. These are the ones with no judgement call attached — the owner cannot come back — so `--gc --close-abandoned` closes them.
+- **Quiet but owned** — no listener on either side, silent past `PP_STALE_HOURS`, owner still alive. Reported, never closed automatically: "no listener right now" is a normal state between turns, and a rule that deleted here would be right most times and wrong once.
 
 It runs automatically before `--open`, `--join` and `--list`.
 
@@ -223,6 +234,11 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 | `PP_SEND_TIMEOUT` | `60` | Seconds `--send` waits for the write to complete before giving up. |
 | `PP_LABEL` | short hostname | Default `--as` label. |
 | `PP_SIDE` | — | Forces the side (`a` or `b`), overriding local state. Only needed to drive both ends from one machine while testing. |
+| `PP_SESSION` | walked from `$PPID` | Session identity (`claude:<pid>`). Set explicitly inside the keeper unit, where the process tree no longer reaches the agent — without it the leash would have nothing to hold. |
+| `PP_STALE_HOURS` | `24` | Silence after which an unowned, listener-less channel is called `LOOKS ABANDONED`. Does not apply to the owner-gone case, which is flagged at once. |
+| `PP_LEASH_POLL` | `15` | Seconds between the keeper's "is my session still alive?" checks. This is the worst-case delay before a dirty session death destroys the channel. |
+| `PP_AWAIT_POLL` | `1` | Seconds between `--await` spool checks. |
+| `PP_KEEP_ON_END` | `resume clear` | SessionEnd reasons that must **not** close this session's channels. The harness's full enum is `clear exit logout other prompt_input_exit resume`. |
 
 ## Exit codes
 
@@ -230,7 +246,9 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 |---|---|
 | 0 | Success. For `--listen`, a message was received and printed. |
 | 1 | Error — the message on stderr names the cause and the fix. |
-| 124 | `--listen --wait N` timed out, or a send exceeded `PP_SEND_TIMEOUT`. The channel is still open. |
+| 3 | `--await` found no keeper running — nothing will ever land in the spool. Start one with `--keep`. |
+| 124 | `--listen`/`--await` with `--wait N` timed out, or a send exceeded `PP_SEND_TIMEOUT`. The channel is still open. |
+| 255 | The transport died (the ssh client itself). The channel is fine; this side could not reach the bus. |
 
 ## Files
 
@@ -238,6 +256,10 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 |---|---|---|
 | `~/.config/ping-pong/config` | each machine | Bus mode and ssh alias. |
 | `~/.local/state/ping-pong/<id>.side` | each machine | Which side this machine is on that channel. |
+| `~/.local/state/ping-pong/<id>.owner` | each machine | The session that owns this side (`session=claude:<pid>`). What the leash, the SessionEnd hook and the orphan check all read. |
+| `~/.local/state/ping-pong/<id>.inbox` | each machine | The keeper's spool. Append-only; the only copy of anything that arrived while no waker was up. |
+| `~/.local/state/ping-pong/<id>.cursor` | each machine | Byte offset `--await` has already delivered. Reset to 0 if the spool is shorter than the cursor, so a truncated spool cannot silently swallow every future message. |
+| `pp-keep-<id>.service` | `systemd --user`, transient | The keeper. `systemctl --user status pp-keep-<id>` and `journalctl --user -u pp-keep-<id>` are where its story is. |
 | `$PP_BUS_ROOT/<id>/` | bus host | The channel: `meta`, the two FIFOs, listener markers. |
 
 Channel ids match `pp-[a-z0-9]{4,16}` and every command validates that pattern before the id reaches a shell — ids are the only user input that crosses into a remote command.

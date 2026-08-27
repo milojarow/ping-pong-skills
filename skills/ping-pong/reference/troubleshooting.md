@@ -529,3 +529,65 @@ pp --listen <id> --retry
 🔴 **Never delete the `listening-*` marker for the OTHER side.** That process may be alive and waiting; removing its marker does not kill it, but it does make the channel lie about who is listening — the next `--send` can then go out with `--force` against a FIFO that actually has a reader.
 
 **The preventive fix is the turn contract, not a bigger `--gc`.** This marker goes stale exactly when a session listens, receives, and ends its turn without relaunching — the next turn on that machine finds the door jammed shut by its own ghost. Relaunching `--listen` before replying (see [the turn contract](../SKILL.md#the-turn-contract)) is what keeps the marker from outliving its reader in the first place.
+
+---
+
+## `--keep` / `--await` failure shapes
+
+### `--await` returns immediately with exit 3
+
+`pp: no keeper is running for <id>` — nothing writes the spool, so blocking on it would be
+indistinguishable from a quiet peer. Start `pp --keep <id>` first. This is deliberate: an
+`--await` that blocked forever on a file nobody writes is the same silent-deafness the
+keeper exists to remove.
+
+### The keeper is `active` but no `listening-*` marker exists on the bus
+
+Give it a second. `systemd-run` returns as soon as the unit is *started*, and the reader
+writes its marker a fraction of a second later. A check that races the start reads as a
+broken keeper. Measured, and it is only ever a race at start — if the marker is still
+missing after a couple of seconds, read `journalctl --user -u pp-keep-<id>`.
+
+### The keeper stopped and the channel is gone, and nobody typed `/exit`
+
+That is the **leash**, and it is working. It polls the owning session every
+`PP_LEASH_POLL` seconds and, when the session is gone, closes the channel and stops the
+unit. The journal says so in as many words:
+
+```
+pp: owner session claude:<pid> is gone - closing channel <id> and stopping the keeper
+```
+
+This is the only thing that covers a `kill -9`, an OOM or a crash — none of those run a
+`SessionEnd` hook. If you did not expect it, what died is the session, not the channel.
+
+### A lone `<id>.inbox` for a channel that no longer exists
+
+A close triggered from inside the keeper's own unit races its own closing notice:
+`--close` writes that notice into **both** sides' FIFOs, the keeper's reader receives it,
+and the loop appends it to a spool that was deleted a moment earlier. Harmless, and
+`--gc` sweeps it — including automatically, before the next `--open` / `--join` / `--list`.
+
+### A close from inside the keeper left `.owner` / `.side` behind (fixed in 1.0.0)
+
+`--close` stops the keeper, and stopping it means `systemctl --user stop`, which kills the
+whole unit cgroup — including the caller, when the caller is the leash. Before 1.0.0 the
+local files were removed *after* that call, so they survived a "successful" close. The
+order is now local state first, unit second. If you see this on an older build, that is why.
+
+### The SessionEnd hook did not close anything
+
+Check the reason. `resume` and `clear` are excluded on purpose (`PP_KEEP_ON_END`): a
+resumed session must find its channels, and `/clear` keeps the process alive so the leash
+would not fire either — closing there would delete a channel the operator can still see and
+still wants. Every other reason (`exit`, `logout`, `prompt_input_exit`, `other`) closes.
+
+The hook is also failsafe by construction: it exits 0 on any error, because nothing about
+ping-pong may delay a session closing. That means a real failure is silent — reproduce it
+by hand with `pp --session-end --reason exit` if you need the error text.
+
+### Channels owned by ANOTHER live session were not closed
+
+Correct. `--session-end` only touches channels whose `.owner` names *this* session.
+Several agent sessions share one user and one state directory, and treating that as
+ownership is what crossed two live conversations once already.

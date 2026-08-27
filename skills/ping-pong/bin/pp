@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="0.9.4"
+PP_VERSION="1.0.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -30,6 +30,23 @@ SEND_TIMEOUT="${PP_SEND_TIMEOUT:-60}"
 # disconnect/reconnect cycles measured on WiFi and on a phone tether.
 PP_RETRY_DEFAULT="${PP_RETRY_DEFAULT:-60}"
 PP_RETRY_DELAY="${PP_RETRY_DELAY:-5}"
+# --keep: the leash. The keeper runs OUTSIDE the turn's process tree (see
+# cmd_keep), so nothing the harness reaps can take it down - which is exactly
+# what makes it able to become an immortal orphan. PP_LEASH_POLL is how often it
+# asks "is the session that opened this channel still alive?". Short enough that
+# a dead session is noticed within a turn, long enough to cost nothing.
+PP_LEASH_POLL="${PP_LEASH_POLL:-15}"
+# --await polls the spool. A blocking read on a growing file has no portable
+# primitive that also EXITS on new data, and 1s of latency is invisible next to
+# a turn.
+PP_AWAIT_POLL="${PP_AWAIT_POLL:-1}"
+# SessionEnd reasons that must NOT close this session's channels. Measured enum
+# in the harness: clear, exit, logout, other, prompt_input_exit, resume.
+#   resume - the session is coming back and must find its channels.
+#   clear  - /clear wipes the conversation but the PROCESS lives on, so the leash
+#            would not fire either; closing here would delete a channel the
+#            operator can still see in --list and still wants.
+PP_KEEP_ON_END="${PP_KEEP_ON_END:-resume clear}"
 
 bus_mode=""
 bus_ssh=""
@@ -214,6 +231,42 @@ version_notice() {
 side_file()     { printf '%s/%s.side' "$STATE_DIR" "$1"; }
 owner_file()    { printf '%s/%s.owner' "$STATE_DIR" "$1"; }
 listener_file() { printf '%s/%s.listener' "$STATE_DIR" "$1"; }
+
+# The spool is what breaks the old trade-off. A listener that survives the turn
+# has to live outside the session's process tree, and then its output no longer
+# reaches the harness as a notification: "survives longer" was paid for with
+# "you find out less". With a spool the keeper writes where it lands and --await
+# reads from there, so nothing is lost between turns AND the agent still gets
+# woken. The cursor is what makes --await resumable: it is a byte offset, so a
+# message that arrived while no waker was up is delivered on the next --await
+# instead of being skipped.
+spool_file()    { printf '%s/%s.inbox' "$STATE_DIR" "$1"; }
+cursor_file()   { printf '%s/%s.cursor' "$STATE_DIR" "$1"; }
+# The SIDE is part of the name, not just the channel. Two sessions on one machine
+# can be the two ends of one channel over a local bus, and with a channel-only
+# unit name the second --keep matches the first one's unit and reports "already
+# up" - a keeper it does not have. A name that can be right by accident is the
+# same false green this command was written to remove.
+keeper_unit()   { printf 'pp-keep-%s-%s' "$1" "${2:-x}"; }
+
+# systemd --user is the only domicile on this box that survives a turn without
+# also surviving the session - it survives on its own, and the leash inside
+# cmd_keep_run is what supplies the second half. Absent it, --keep still works,
+# but only for the length of one turn; say so rather than pretending.
+have_user_systemd() {
+  command -v systemd-run >/dev/null 2>&1 &&
+  command -v systemctl >/dev/null 2>&1 &&
+  systemctl --user is-system-running >/dev/null 2>&1
+}
+
+keeper_state() {
+  have_user_systemd || { printf 'unsupported'; return 0; }
+  local side; side=$(tr -d '[:space:]' < "$(side_file "$1")" 2>/dev/null || true)
+  [ -n "$side" ] || { printf 'unknown'; return 0; }
+  systemctl --user is-active "$(keeper_unit "$1" "$side")" 2>/dev/null || true
+}
+
+self_path() { readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$0"; }
 
 my_side() {
   local id="$1"
@@ -694,12 +747,35 @@ cmd_send_direct() {
   say "pp: delivered to $peer:$port (channel $id)"
 }
 
+# Direct mode has no shared object, so "forgetting it here" used to leave the
+# peer holding a port, a record and a blocked reader pointed at a machine that
+# stopped answering - a tunnel to nowhere, and the operator had to relay the
+# closure by hand. It does not have to be relayed: the peer's reader is blocked
+# on that socket, so one connection carrying the same closing notice bus mode
+# writes into the FIFO wakes it exactly the same way.
+#
+# A refused connection is NOT a failure here. It means the peer is already gone,
+# which is the state this command is trying to reach - report it and finish the
+# close. Never abort a close because the other end was already down.
 cmd_close_direct() {
   local id="$1" label="$2" adopt="$3"
   assert_owner "$id" "$label" "$adopt"
-  rm -f "$(side_file "$id")" "$(owner_file "$id")" "$(direct_file "$id")"
-  say "pp: direct channel $id forgotten on this machine."
-  say "  The peer keeps its own record - tell it to close too, there is no shared state."
+
+  local peer port
+  peer=$(direct_peer "$id"); port=$(direct_port "$id")
+  if [ -n "$peer" ] && [ -n "$port" ] && command -v nc >/dev/null 2>&1; then
+    if printf '=== ping-pong %s | the other side CLOSED this channel ===\n' "$id" |
+         nc -N -w 5 "$peer" "$port" >/dev/null 2>&1; then
+      say "pp: told the peer at $peer:$port that $id is closing"
+    else
+      say "pp: the peer at $peer:$port was not reachable (already gone) - closing anyway"
+    fi
+  fi
+
+  rm -f "$(side_file "$id")" "$(owner_file "$id")" "$(direct_file "$id")" \
+        "$(spool_file "$id")" "$(cursor_file "$id")"
+  say "pp: direct channel $id closed on this machine."
+  cmd_unkeep "$id" >/dev/null 2>&1 || true
 }
 
 cmd_open() {
@@ -953,6 +1029,289 @@ cmd_listen_retry() {
   done
 }
 
+# --------------------------------------------------------------- keep / await
+#
+# The problem these two solve together, and why it takes two commands.
+#
+# `--listen` delivers ONE message and exits, because the agent's wake-up IS the
+# background task exiting. That is not a wart, it is the whole mechanism - and
+# it means the reader is down between turns. Worse, measured on this harness:
+# a background task is REAPED when the TURN closes, not when the session does
+# (SIGTERM within seconds, 3/3). So a reader launched by the agent cannot even
+# survive to the next turn, and every turn has to relaunch it. Miss one and the
+# side goes deaf with no error: the peer's --send bounces with "has no listener"
+# and the message is not queued anywhere, because there is no queue.
+#
+# The obvious fix - park a relaunch loop with setsid/nohup - is how this ends up
+# with immortal orphans: reparented to pid 1, it outlives the session, resurrects
+# the listening-* marker within a second of any close, and makes every channel
+# look permanently healthy. Measured on one box: 5 of them, one 9d22h old,
+# holding 8 channels open whose owning sessions were all dead.
+#
+# So the reader needs BOTH properties, and they pull in opposite directions:
+#   survive the turn   -> it must live outside the session's process tree
+#   die with the session -> something must still tie it to the session
+#
+# --keep supplies both. It runs the loop in a systemd --user transient unit
+# (outside any turn's tree, so nothing reaps it) and the loop holds a LEASH: it
+# polls the owner session and stops itself the moment that session is gone. An
+# unleashed keeper is the orphan; a leashed one cannot become it.
+#
+# The output problem that used to make this trade-off painful - a process outside
+# the tree cannot notify the harness - is solved by the spool: the keeper writes
+# every message to $STATE_DIR/<id>.inbox, and --await blocks on that file and
+# exits when it grows. The agent is woken exactly as before, but now forgetting
+# to relaunch the waker costs a notification, not a message.
+
+cmd_keep() {
+  local id="$1" label="$2" adopt="$3"
+  need_config
+  require_channel "$id"
+  assert_owner "$id" "$label" "$adopt"
+
+  local owner; owner=$(session_id)
+  local side; side=$(my_side "$id")
+  local unit; unit=$(keeper_unit "$id" "$side")
+  local self; self=$(self_path)
+
+  case "$(keeper_state "$id")" in
+    active|activating)
+      say "pp: keeper for $id is already up (unit $unit)"
+      say "    wake up on new mail with:  pp --await $id"
+      return 0 ;;
+  esac
+
+  mkdir -p "$STATE_DIR"
+  : > "$(spool_file "$id")" 2>/dev/null || true
+
+  if ! have_user_systemd; then
+    note "no user systemd here - running the keeper in the FOREGROUND.
+    It will die when this turn closes, which is the failure --keep exists to fix.
+    Run it as a background command and expect to relaunch it every turn, or
+    install a user systemd instance."
+    cmd_keep_run "$id" "$label" "$owner"
+    return $?
+  fi
+
+  # PP_SESSION is load-bearing: inside the unit the parent is systemd, so the
+  # walk in session_id() would find no agent and return 'nosession' - the leash
+  # would have nothing to hold. Passing it in is what keeps the tie explicit.
+  # Every one of these has to be passed explicitly. A unit does NOT inherit the
+  # invoking shell's environment - it gets the user manager's - so anything the
+  # CLI resolves from the environment is resolved differently inside. Missing
+  # XDG_STATE_HOME was the sharp one: STATE_DIR fell back to the default, the
+  # channel's .side file was not there, and the keeper died on "not registered on
+  # this machine" while the unit still reported active for a moment. Silent, and
+  # exactly the class of failure this command exists to remove.
+  systemd-run --user --quiet \
+    --unit="$unit" \
+    --description="ping-pong keeper for $id (session $owner)" \
+    --property=Restart=no \
+    --setenv=PP_SESSION="$owner" \
+    --setenv=PP_BUS_ROOT="$BUS_ROOT" \
+    --setenv=PP_LEASH_POLL="$PP_LEASH_POLL" \
+    --setenv=PP_RETRY_DELAY="$PP_RETRY_DELAY" \
+    --setenv=HOME="$HOME" \
+    --setenv=XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}" \
+    --setenv=XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
+    -- "$self" --keep-run "$id" --as "$label" \
+    || die "could not start the keeper unit $unit"
+
+  # Starting is not running. systemd-run returns as soon as the unit is started,
+  # and everything that can go wrong inside it goes wrong after that - so a
+  # command that reported success here would be claiming a reader it never saw.
+  # Wait for the marker the reader itself writes on the bus; that is the only
+  # evidence that the keeper is actually attached.
+  local waited=0 attached=0
+  while [ "$waited" -lt 5 ]; do
+    [ "$(bus_listener_state "$id" "$(my_side "$id")")" = "live" ] && { attached=1; break; }
+    case "$(keeper_state "$id")" in active|activating) : ;; *) break ;; esac
+    sleep 1; waited=$((waited + 1))
+  done
+
+  if [ "$attached" != "1" ]; then
+    note "the keeper unit started but no reader appeared on the bus within ${waited}s.
+    It is NOT holding the channel. What it printed:
+$(journalctl --user -u "$unit" --no-pager -n 5 -o cat 2>/dev/null | sed 's/^/      /')
+    Unit state: $(keeper_state "$id")"
+    return 1
+  fi
+
+  say "pp: keeper up for $id (unit $unit, leashed to session $owner)"
+  say "    it holds a reader on the bus for as long as this session lives, so the"
+  say "    peer's sends never bounce and nothing is lost between turns."
+  say "    wake up on new mail with:  pp --await $id     (run it in the background)"
+}
+
+# The loop itself. Runs inside the unit. Two things end it: the channel closing,
+# or the leash going slack.
+cmd_keep_run() {
+  local id="$1" label="$2" owner="${3:-$(session_id)}"
+  local spool; spool=$(spool_file "$id")
+  mkdir -p "$STATE_DIR"; touch "$spool"
+
+  # The leash. It has to run CONCURRENTLY: the reader blocks in open(2) on a
+  # FIFO with no signal path home, so a check between messages would never fire
+  # while it is blocked - which is precisely the state an orphan sits in for
+  # days. This watchdog is what makes "dies with its session" true rather than
+  # aspirational.
+  #
+  # And when it fires it CLOSES the channel, it does not merely stop listening.
+  # That is the dead-man's switch for the case the SessionEnd hook cannot reach:
+  # a kill -9, a crash, a laptop lid. The peer's blocked listener is signalled by
+  # --close before the FIFOs go, so it wakes and learns the conversation is over
+  # instead of holding a tunnel to nobody.
+  (
+    while :; do
+      sleep "$PP_LEASH_POLL"
+      if ! session_alive "$owner"; then
+        note "owner session $owner is gone - closing channel $id and stopping the keeper"
+        PP_SESSION="$owner" "$(self_path)" --close "$id" --as "$label" >/dev/null 2>&1 || true
+        if have_user_systemd; then
+          systemctl --user stop "$(keeper_unit "$id" "$(my_side "$id" 2>/dev/null || echo x)")" >/dev/null 2>&1 || true
+        fi
+        kill -TERM "$$" 2>/dev/null
+        exit 0
+      fi
+    done
+  ) &
+  # Deliberately NOT a local: the EXIT trap runs after this function has already
+  # returned, and a local is out of scope by then - under `set -u` the cleanup
+  # itself becomes the error, which is how a clean shutdown ended up logging
+  # "leash: unbound variable" as its last word.
+  _PP_LEASH_PID=$!
+  trap 'kill "${_PP_LEASH_PID:-0}" 2>/dev/null || true' EXIT INT TERM HUP
+
+  local out rc drops=0 closed=0
+  while :; do
+    session_alive "$owner" || { note "owner session $owner is gone - keeper stops"; break; }
+
+    out=$(cmd_listen "$id" 0 "$label" 0); rc=$?
+    case "$rc" in
+      0)
+        if [ -n "$out" ]; then
+          # Append, never truncate: the spool is the only copy of anything that
+          # arrived while no waker was up.
+          printf '%s\n' "$out" >> "$spool"
+          drops=0
+          continue
+        fi
+        note "channel $id closed by the peer - keeper stops"
+        closed=1
+        break ;;
+      255)
+        # Transport only. Unlimited by design: the retry budget exists to stop a
+        # blind loop from hiding a bug, and the leash already bounds this one -
+        # it cannot outlive the session no matter how long the link stays down.
+        drops=$((drops + 1))
+        note "link lost ($drops) on $id - reattaching in ${PP_RETRY_DELAY}s"
+        sleep "$PP_RETRY_DELAY"
+        reap_my_orphan "$id"
+        continue ;;
+      1)
+        # rc=1 covers two very different endings and they must not share a
+        # message. The ordinary one is the peer closing while this reader was
+        # between attaches: the next --listen finds no channel. Reporting that as
+        # "ownership, or a live listener" names a cause that is not there and
+        # sends whoever reads the journal chasing it.
+        if [ "$(bus "[ -d '$BUS_ROOT/$id' ] && echo yes || echo no" 2>/dev/null | tr -d '[:space:]')" = "no" ]; then
+          note "channel $id is gone from the bus - keeper stops"
+          closed=1
+        else
+          note "keeper refused on $id (ownership, or a live listener on this side) - stopping"
+        fi
+        break ;;
+      *)
+        note "keeper on $id exited $rc with no message - not a transport failure, stopping"
+        break ;;
+    esac
+  done
+
+  trap - EXIT INT TERM HUP
+  kill "${_PP_LEASH_PID:-0}" 2>/dev/null || true
+  # If the channel is gone, so is the point of its spool - and whatever landed in
+  # it last is the closing notice this keeper wrote to itself. Drop it here so a
+  # clean shutdown leaves nothing for the next --gc to explain.
+  #
+  # The flag, not a filesystem test: $BUS_ROOT is a path on the BUS, and under
+  # bus_mode=ssh it does not exist locally at all - a local `[ -d ]` would call
+  # every live channel gone and delete a spool with unread mail in it.
+  [ "$closed" = "1" ] && rm -f "$spool" "$(cursor_file "$id")"
+  return 0
+}
+
+# Stops every keeper for this channel, matched by PREFIX rather than by exact
+# name. --close removes the local .side before this runs (it has to: stopping the
+# unit can kill the caller), so by then there is no side left to build the exact
+# name from. The prefix is what survives that ordering.
+cmd_unkeep() {
+  local id="$1" found=0 u
+  have_user_systemd || { say "pp: no keeper running for $id"; return 0; }
+  for u in $(systemctl --user list-units --all --no-legend "$(keeper_unit "$id" '*').service" 2>/dev/null | awk '{print $1}' | sed 's/^[^a-zA-Z0-9]*//'); do
+    [ -n "$u" ] || continue
+    systemctl --user stop "$u" >/dev/null 2>&1 || true
+    # A stopped transient unit lingers until reset; without this a later --keep
+    # on the same channel and side is refused for a name systemd already knows.
+    systemctl --user reset-failed "$u" >/dev/null 2>&1 || true
+    found=1
+  done
+  [ "$found" = "1" ] && say "pp: keeper stopped for $id" || say "pp: no keeper running for $id"
+  return 0
+}
+
+# The waker. Blocks until the spool grows past the cursor, prints exactly what is
+# new, and exits - the same contract --listen has with the harness, so the agent
+# is woken the same way it always was.
+#
+# The difference that matters: this is now the only thing the agent has to
+# relaunch, and forgetting costs a notification rather than a message. The keeper
+# is still holding the reader, so the peer's sends keep succeeding and everything
+# that arrives is in the spool waiting for the next --await.
+cmd_await() {
+  local id="$1" wait_for="${2:-0}"
+  need_config
+  local spool cursor; spool=$(spool_file "$id"); cursor=$(cursor_file "$id")
+  mkdir -p "$STATE_DIR"; touch "$spool"
+
+  local cur=0
+  [ -r "$cursor" ] && cur=$(tr -dc '0-9' < "$cursor")
+  [ -n "$cur" ] || cur=0
+
+  # A truncated or replaced spool (a --close, a reboot) must not leave the cursor
+  # pointing past the end - that would swallow every future message in silence.
+  local size; size=$(stat -c %s "$spool" 2>/dev/null || echo 0)
+  [ "$size" -lt "$cur" ] && cur=0
+
+  local waited=0
+  while :; do
+    size=$(stat -c %s "$spool" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$cur" ]; then
+      tail -c "+$((cur + 1))" "$spool"
+      printf '%s\n' "$size" > "$cursor"
+      return 0
+    fi
+
+    # No keeper, no mail is ever coming. Say so instead of blocking forever on a
+    # file nobody writes - that silence is indistinguishable from a quiet peer.
+    case "$(keeper_state "$id")" in
+      active|activating|unsupported) : ;;
+      *)
+        note "no keeper is running for $id - nothing will ever land in the spool.
+    Start one with:  pp --keep $id"
+        return 3 ;;
+    esac
+
+    if [ "$wait_for" -gt 0 ] 2>/dev/null; then
+      waited=$((waited + PP_AWAIT_POLL))
+      if [ "$waited" -ge "$wait_for" ]; then
+        say "pp: nothing arrived within ${wait_for}s (channel $id is still open)"
+        return 124
+      fi
+    fi
+    sleep "$PP_AWAIT_POLL"
+  done
+}
+
 cmd_send() {
   local id="$1" body="$2" label="$3" force="$4" adopt="$5"
   is_direct "$id" && { cmd_send_direct "$id" "$body" "$label" "$adopt"; return $?; }
@@ -1031,20 +1390,38 @@ cmd_list() {
   local stale_s=$(( ${PP_STALE_HOURS:-24} * 3600 ))
   say "Open channels on $(bus_label):$BUS_ROOT"
   printf '%s\n' "$out" | while IFS=$'\t' read -r id sides live sil age topic; do
-    local mine="" owner flag=""
+    local mine="" owner flag="" owner_dead=0 keep=""
     if [ -r "$(side_file "$id")" ]; then
       mine=" (this machine: side $(tr -d '[:space:]' < "$(side_file "$id")")"
       owner=$(sed -n 's/^session=//p' "$(owner_file "$id")" 2>/dev/null | tr -d '[:space:]')
       if [ -z "$owner" ]; then mine="$mine, unclaimed)"
       elif [ "$owner" = "$me" ]; then mine="$mine, YOURS)"
-      else mine="$mine, owned by $owner)"; fi
+      else
+        mine="$mine, owned by $owner)"
+        session_alive "$owner" || owner_dead=1
+      fi
+      case "$(keeper_state "$id")" in active|activating) keep="  keeper:up" ;; esac
     fi
-    # No listener on either side AND quiet past the threshold. Not proof of
-    # abandonment - both sides are legitimately down between turns - but it is
-    # the state a forgotten channel sits in, and it is worth seeing.
-    [ "${live:-0}" = "0" ] && [ "${age:--1}" -ge "$stale_s" ] 2>/dev/null \
-      && flag="  <-- LOOKS ABANDONED"
-    printf '  %-12s %-30s listeners:%s  %s%s%s\n' "$id" "$sides" "${live:-?}" "$sil" "$mine" "$flag"
+
+    # Judge the OWNER, not the listener. A live listener whose owning session is
+    # dead is not evidence of health - it is the decoy: something outside every
+    # session is holding the reader up (a parked relaunch loop, a keeper that
+    # lost its leash), which suppresses every other staleness signal and makes a
+    # dead channel look permanently fine. Measured: 8 channels in exactly this
+    # state, 5 of them reporting listeners:1, none flagged, for hours.
+    if [ "$owner_dead" = "1" ]; then
+      if [ "${live:-0}" != "0" ]; then
+        flag="  <-- ORPHAN: owner session gone, listener held up from OUTSIDE any session"
+      else
+        flag="  <-- ORPHAN: owner session gone"
+      fi
+    elif [ "${live:-0}" = "0" ] && [ "${age:--1}" -ge "$stale_s" ] 2>/dev/null; then
+      # No listener on either side AND quiet past the threshold. Not proof of
+      # abandonment - both sides are legitimately down between turns - but it is
+      # the state a forgotten channel sits in, and it is worth seeing.
+      flag="  <-- LOOKS ABANDONED"
+    fi
+    printf '  %-12s %-30s listeners:%s%s  %s%s%s\n' "$id" "$sides" "${live:-?}" "$keep" "$sil" "$mine" "$flag"
     [ -n "$topic" ] && printf '  %-12s topic: %s\n' "" "$topic"
   done
 }
@@ -1101,8 +1478,78 @@ cmd_close() {
       fi
     done
     rm -rf '$BUS_ROOT/$id'" || die "could not delete the channel on the bus"
-  rm -f "$(side_file "$id")" "$(owner_file "$id")" "$(listener_file "$id")"
+  # ORDER MATTERS, and it is not the obvious one. The local files go FIRST.
+  #
+  # The keeper has to go with the channel: it lives outside the session's process
+  # tree on purpose, so nothing else here will stop it, and one left re-attaching
+  # to a deleted id is the immortal-orphan shape all over again. But stopping it
+  # means `systemctl --user stop`, which kills the whole unit cgroup - and the
+  # leash calls this very function FROM INSIDE that cgroup when the owner session
+  # dies. Unkeeping first therefore kills the caller mid-close, and the local
+  # state files survive a "successful" close. Measured: .owner/.side/.inbox left
+  # behind on every leash-triggered close until this was reordered.
+  rm -f "$(side_file "$id")" "$(owner_file "$id")" "$(listener_file "$id")" \
+        "$(spool_file "$id")" "$(cursor_file "$id")"
   say "pp: channel $id closed and deleted from the bus (active listeners were notified)"
+  cmd_unkeep "$id" >/dev/null 2>&1 || true
+}
+
+# Close every channel this session owns. This is what the SessionEnd hook calls,
+# and it is the clean half of "the channel dies with the session".
+#
+# Why a hook and not just the leash: the leash inside the keeper polls, so it
+# closes seconds LATER and only if a keeper was running. The hook closes at the
+# moment the operator types /exit, for every channel, keeper or not. The leash
+# then covers what the hook structurally cannot reach - a kill -9 or a crash
+# never runs a hook at all.
+#
+# Only channels owned by THIS session are touched. Another live session on the
+# same machine keeps its channels: several agent sessions share one user and one
+# state directory, and mistaking that for ownership is what crossed two live
+# conversations once already.
+cmd_session_end() {
+  local reason="${1:-}"
+
+  # The harness passes the hook payload on stdin as JSON. Take the reason from
+  # there when it was not given as an argument, without requiring jq.
+  if [ -z "$reason" ] && [ ! -t 0 ]; then
+    local payload; payload=$(cat 2>/dev/null || true)
+    reason=$(printf '%s' "$payload" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([a-z_]*\)".*/\1/p' | head -1)
+  fi
+
+  for skip in $PP_KEEP_ON_END; do
+    if [ "$reason" = "$skip" ]; then
+      note "session end (reason=$reason) - keeping this session's channels"
+      return 0
+    fi
+  done
+
+  local me; me=$(session_id)
+  [ "$me" = "nosession" ] && return 0
+
+  mkdir -p "$STATE_DIR"
+  local closed=0 f id owner
+  for f in "$STATE_DIR"/*.owner; do
+    [ -e "$f" ] || continue
+    owner=$(sed -n 's/^session=//p' "$f" 2>/dev/null | tr -d '[:space:]')
+    [ "$owner" = "$me" ] || continue
+    id=$(basename "$f" .owner)
+    valid_id "$id" || continue
+    # --close signals the peer's blocked listener before deleting the FIFOs, so
+    # the other session wakes with an empty read and learns the conversation is
+    # over. That is the whole of "destroyed by both sides": the channel is ONE
+    # object on ONE bus, so closing it here IS closing it there. Nothing has to
+    # be relayed through the other agent, which is just as well - its listener is
+    # normally down between turns, so a message would have bounced.
+    if cmd_close "$id" "$(default_label)" 0 >/dev/null 2>&1; then
+      note "closed channel $id (session ended, reason=${reason:-unknown})"
+      closed=$((closed + 1))
+    else
+      cmd_unkeep "$id" >/dev/null 2>&1 || true
+    fi
+  done
+  [ "$closed" -gt 0 ] && note "session end: $closed channel(s) closed"
+  return 0
 }
 
 # Reap this machine's orphans: a remote reader whose local process is gone.
@@ -1134,6 +1581,7 @@ gc_channel() {
 }
 
 cmd_gc() {
+  local close_abandoned="${1:-0}"
   need_config
   local n=0 s=0
   mkdir -p "$STATE_DIR"
@@ -1196,25 +1644,47 @@ cmd_gc() {
   fi
 
   # Local records for channels that no longer exist on the bus.
+  # The spool and cursor are scanned too, not just side/owner. A close triggered
+  # from inside the keeper's own unit races its own closing notice: --close
+  # writes that notice into BOTH sides' FIFOs, the keeper's reader receives it,
+  # and the loop appends it to a spool that was deleted a moment earlier. The
+  # result is a lone 65-byte .inbox for a channel that no longer exists - which
+  # a scan over side/owner alone would never see.
   local alive; alive=$(bus "ls -1 '$BUS_ROOT' 2>/dev/null | grep '^pp-' || true")
-  for f in "$STATE_DIR"/*.side "$STATE_DIR"/*.owner; do
+  for f in "$STATE_DIR"/*.side "$STATE_DIR"/*.owner "$STATE_DIR"/*.inbox "$STATE_DIR"/*.cursor; do
     [ -e "$f" ] || continue
     local id; id=$(basename "$f"); id="${id%.*}"
+    valid_id "$id" || continue
+    [ -e "$STATE_DIR/$id.side" ] || [ -e "$STATE_DIR/$id.owner" ] || [ -e "$STATE_DIR/$id.inbox" ] || [ -e "$STATE_DIR/$id.cursor" ] || continue
     if ! printf '%s\n' "$alive" | grep -qx "$id"; then
-      rm -f "$STATE_DIR/$id.side" "$STATE_DIR/$id.owner" "$STATE_DIR/$id.listener"
+      rm -f "$STATE_DIR/$id.side" "$STATE_DIR/$id.owner" "$STATE_DIR/$id.listener" \
+            "$STATE_DIR/$id.inbox" "$STATE_DIR/$id.cursor"
       say "  dropped stale local state for $id (channel no longer on the bus)"
       s=$((s+1))
     fi
   done
 
-  # Channels nobody is on, quiet past the threshold. These are REPORTED, never
-  # closed. A channel is a conversation, and "no listener right now" is a normal
-  # state between turns - the turn contract has that window by design. A heuristic
-  # that deletes would be right most times and wrong once, and the once costs a
-  # live conversation. Closing stays a decision for whoever has the context.
+  # Channels that look like leftovers. Two different shapes, and only one of
+  # them is what the old code looked for:
+  #
+  #   quiet + no listener   - the classic forgotten channel. Reported, never
+  #                           closed on its own: "no listener right now" is a
+  #                           NORMAL state between turns, so a heuristic that
+  #                           deleted here would be right most times and wrong
+  #                           once, and the once costs a live conversation.
+  #   owner session gone    - this machine's side belongs to a session that no
+  #                           longer exists. A listener may still be up and that
+  #                           makes it WORSE, not better: something outside every
+  #                           session is holding it, and it suppresses every
+  #                           other signal. The old gate skipped these entirely
+  #                           (`[ $live -gt 0 ] && continue`), which is why 8 of
+  #                           them sat unreported for hours.
+  #
+  # So the bus is asked for the facts it has (listeners, silence) and the owner
+  # question is answered locally, where the owning pid actually means something.
   local stale_s=$(( ${PP_STALE_HOURS:-24} * 3600 ))
-  local abandoned
-  abandoned=$(bus "now=\$(date +%s)
+  local facts
+  facts=$(bus "now=\$(date +%s)
     for d in '$BUS_ROOT'/pp-*; do
       [ -d \"\$d\" ] || continue
       live=0
@@ -1223,24 +1693,71 @@ cmd_gc() {
         p=\$(sed -n 's/.*pid=\([0-9]*\).*/\1/p' \"\$m\")
         [ -n \"\$p\" ] && kill -0 \"\$p\" 2>/dev/null && live=\$((live+1))
       done
-      [ \$live -gt 0 ] && continue
       act=\$(cat \"\$d/activity\" 2>/dev/null)
       [ -n \"\$act\" ] || act=\$(stat -c %Y \"\$d/meta\" 2>/dev/null)
       [ -n \"\$act\" ] || continue
-      age=\$((now-act))
-      [ \$age -ge $stale_s ] || continue
       t=\$(sed -n 's/^topic=//p' \"\$d/meta\" 2>/dev/null | cut -c1-46)
-      printf '%s\t%s\n' \"\$(basename \$d)\" \"\$t\"
+      printf '%s\t%s\t%s\t%s\n' \"\$(basename \$d)\" \"\$live\" \"\$((now-act))\" \"\$t\"
     done" 2>/dev/null)
 
-  if [ -n "$abandoned" ]; then
+  local orphans="" quiet=""
+  if [ -n "$facts" ]; then
+    while IFS=$'\t' read -r aid alive aage atopic; do
+      [ -n "$aid" ] || continue
+      local aowner="" dead=0
+      if [ -r "$(owner_file "$aid")" ]; then
+        aowner=$(sed -n 's/^session=//p' "$(owner_file "$aid")" 2>/dev/null | tr -d '[:space:]')
+        [ -n "$aowner" ] && ! session_alive "$aowner" && dead=1
+      fi
+      if [ "$dead" = "1" ]; then
+        orphans="${orphans}${aid}\t${alive}\t${aowner}\t${atopic}\n"
+      elif [ "${alive:-0}" = "0" ] && [ "${aage:--1}" -ge "$stale_s" ] 2>/dev/null; then
+        quiet="${quiet}${aid}\t${atopic}\n"
+      fi
+    done <<< "$facts"
+  fi
+
+  if [ -n "$orphans" ]; then
+    say ""
+    say "pp: channels whose OWNER SESSION on this machine is gone:"
+    printf '%b' "$orphans" | while IFS=$'\t' read -r aid alive aowner atopic; do
+      [ -n "$aid" ] || continue
+      if [ "${alive:-0}" != "0" ]; then
+        say "  $aid  (owner $aowner gone, but $alive listener(s) still up - held from OUTSIDE any session)  ${atopic:-<no topic>}"
+      else
+        say "  $aid  (owner $aowner gone)  ${atopic:-<no topic>}"
+      fi
+    done
+    if [ "$close_abandoned" = "1" ]; then
+      say "  --close-abandoned given: closing them now."
+      printf '%b' "$orphans" | while IFS=$'\t' read -r aid alive aowner atopic; do
+        [ -n "$aid" ] || continue
+        # A keeper that lost its leash would resurrect the marker between the
+        # notify and the delete, so it goes first. Stopping it is safe here by
+        # construction: its owner session is already gone.
+        cmd_unkeep "$aid" >/dev/null 2>&1 || true
+        if cmd_close "$aid" "$(default_label)" 1 >/dev/null 2>&1; then
+          say "    closed $aid"
+        else
+          say "    could NOT close $aid - close it by hand: pp --close $aid --adopt"
+        fi
+      done
+    else
+      say "  NOT closed. These are the ones that are safe to sweep - the session that"
+      say "  owned them cannot come back. When you want them gone:"
+      say "    pp --gc --close-abandoned"
+    fi
+  fi
+
+  if [ -n "$quiet" ]; then
     say ""
     say "pp: channels with no listener on either side, quiet for over ${PP_STALE_HOURS:-24}h:"
-    printf '%s\n' "$abandoned" | while IFS=$'\t' read -r aid atopic; do
+    printf '%b' "$quiet" | while IFS=$'\t' read -r aid atopic; do
       [ -n "$aid" ] && say "  $aid  ${atopic:-<no topic>}"
     done
     say "  NOT closed - a channel is a conversation, and both sides are legitimately"
-    say "  down between turns. Confirm with the operator, then: pp --close <id>"
+    say "  down between turns. Their owners are still alive, so this is a judgement"
+    say "  call, not a sweep. Confirm with the operator, then: pp --close <id>"
   fi
 
   say "pp: checked $n listener record(s), dropped $s stale channel record(s)"
@@ -1281,7 +1798,23 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   pp --info <id>                  channel metadata, owner, and who is listening
   pp --close <id>                 close and delete the channel
   pp --gc                         reap orphaned readers + drop stale local state
+  pp --gc --close-abandoned       also CLOSE channels whose owner session is gone
   pp --adopt <id>                 take ownership of a channel for THIS session
+
+  STAYING UP FOR A WHOLE SESSION (what --listen alone cannot do):
+
+  pp --keep <id>                  hold a reader for as long as THIS session lives
+  pp --await <id>                 BLOCK until new mail is in the spool, print, exit
+  pp --unkeep <id>                stop the keeper, leave the channel open
+
+  --listen delivers one message and exits, and a background task is reaped when
+  the TURN closes - so a plain listener has to be relaunched every turn and the
+  side goes deaf whenever that is missed. --keep runs the reader in a systemd
+  --user unit, outside any turn's process tree, so it survives turns; and it
+  holds a LEASH on the session that started it, so it cannot outlive it the way
+  a parked `while true` loop does. Everything it receives lands in a spool, and
+  --await is what wakes the agent from there. Forgetting to relaunch --await
+  costs a notification, not a message.
 
   DIRECT MODE (no bus, no shell): both devices on a private mesh talk peer to
   peer over TCP. Your inbox is a port on YOUR machine, bound to the mesh
@@ -1306,13 +1839,17 @@ pp - ping-pong: an isolated message channel between two agent sessions.
                   default 60, 5s apart); a refusal or a closed channel still
                   exits at once. Drops are always reported on stderr.
   --adopt         with open/join/listen/send/close: override an ownership refusal
+  --close-abandoned  with --gc: close the channels whose owner session is gone
+  --session-end [--reason R]  close every channel THIS session owns (SessionEnd hook)
 
   --install       copy this script to ~/.local/bin/pp
   -h, --help      this help
   -V, --version   version
 
   Env: PP_BUS_ROOT (default /tmp/ping-pong), PP_SEND_TIMEOUT (60),
-       PP_LABEL, PP_SIDE (force side a|b), PP_SESSION (override session identity).
+       PP_LABEL, PP_SIDE (force side a|b), PP_SESSION (override session identity),
+       PP_STALE_HOURS (24), PP_LEASH_POLL (15), PP_AWAIT_POLL (1),
+       PP_KEEP_ON_END (SessionEnd reasons that do NOT close: "resume clear").
 
   GOLDEN RULE: after receiving a message, relaunch --listen BEFORE you reply.
   A channel belongs to the SESSION that opened or joined it, not to the machine.
@@ -1322,6 +1859,7 @@ EOF
 # ---------------------------------------------------------------------- parser
 
 op="" id="" topic="" body="" label="" wait_for=0 force=0 adopt=0 direct=0 peer="" retries=0
+close_abandoned=0 reason=""
 setup_args=()
 
 while [ $# -gt 0 ]; do
@@ -1334,6 +1872,13 @@ while [ $# -gt 0 ]; do
     -i|--info) op="info" ;;
     -c|--close) op="close" ;;
     -g|--gc) op="gc" ;;
+    -k|--keep) op="keep" ;;
+    --keep-run) op="keep-run" ;;
+    --unkeep) op="unkeep" ;;
+    -A|--await) op="await" ;;
+    --close-abandoned) close_abandoned=1; [ -z "$op" ] && op="gc" ;;
+    --session-end) op="session-end" ;;
+    --reason) shift; reason="${1:-}" ;;
     --setup) op="setup" ;;
     --mesh) op="mesh" ;;
     --install) op="install" ;;
@@ -1368,7 +1913,24 @@ case "$op" in
   setup) cmd_setup "${setup_args[@]:-}" "${id:-}" ;;
   install) cmd_install ;;
   mesh) cmd_mesh ;;
-  gc) cmd_gc ;;
+  gc) cmd_gc "$close_abandoned" ;;
+  session-end) cmd_session_end "$reason" ;;
+  keep)
+    [ -n "$id" ] || die "--keep needs the channel id"
+    cmd_keep "$id" "$label" "$adopt"
+    ;;
+  keep-run)
+    [ -n "$id" ] || die "--keep-run needs the channel id"
+    cmd_keep_run "$id" "$label"
+    ;;
+  unkeep)
+    [ -n "$id" ] || die "--unkeep needs the channel id"
+    cmd_unkeep "$id"
+    ;;
+  await)
+    [ -n "$id" ] || die "--await needs the channel id"
+    cmd_await "$id" "$wait_for"
+    ;;
   adopt) [ -n "$id" ] || die "--adopt needs the channel id"; cmd_adopt "$id" "$label" ;;
   open)
     if [ "$direct" = "1" ]; then cmd_open_direct "$peer" "$topic" "$label"

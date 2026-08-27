@@ -1,5 +1,18 @@
 # A standing listener: the relaunch loop belongs to a supervisor, not to the session
 
+> **Since 1.0.0, read this only for a side with NO session on it at all.**
+>
+> For the ordinary case — a channel between two agent sessions — use `pp --keep`. It puts
+> the reader in a `systemd --user` transient unit for you (the same domicile this document
+> argues for, and for the same reason: a background task is reaped when the **turn** closes)
+> but it also holds a **leash** on the owning session and stops when that session goes. That
+> leash is the whole difference between a supervised listener and an immortal orphan, and it
+> is why you should not hand-roll the unit below for a channel that has an owner.
+>
+> What follows still applies to a side that must stay reachable with nobody sitting at it —
+> a headless peer, a machine with no agent session. There is no owner to leash to there, so
+> the supervisor has to be the whole answer, and `Restart=always` is correct.
+
 `--listen` delivers exactly one message and exits — that is the wake-up mechanism, and inside a
 live agent session the turn contract relaunches it every turn. This page is about the other case:
 **a side that must stay reachable while no agent session is up on it** — a headless peer, a VPS,
