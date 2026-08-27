@@ -82,6 +82,48 @@ One side, one listener: a second `--listen` on a side that already has a live re
 an interactive session that wants to take that side stops the unit first
 (`systemctl --user stop pp-guard@<id>`) instead of fighting the refusal.
 
+## A loop parked outside every session is not a cheap supervisor
+
+The failure above — a loop dying with its session — has a mirror image that is worse,
+not milder: a relaunch loop hung off `setsid`/`nohup` with no session and no supervisor
+above it either, for example `sh -c 'while true; do pp --listen <id> --retry; done'`
+detached from the shell that started it.
+
+That loop has no owner a session can be checked against, so it outlives forever and
+re-registers the `listening-<side>` marker within about a second of the previous
+`--listen` exiting. The effect on the two abandonment surfaces is the opposite of what
+it looks like:
+
+- `--list` gates `LOOKS ABANDONED` on whether a listener is currently alive. One live
+  listener suppresses the flag.
+- `--gc`'s abandoned-channel report gates the same way: any channel with a live listener
+  on either side is skipped.
+
+Neither one asks whether the *owning session* is still alive — only `--close` checks the
+owner recorded in the channel's state, which is why `--close` correctly reports "previous
+owner session is gone" on a channel that `--list`/`--gc` just called healthy. **A live
+listener whose owning session is dead is not evidence the channel is in use — with no
+owner behind it, it is the exact shape of an abandoned channel, not a live one:** the next
+`--close` or `--adopt` walks in with zero resistance, because a dead owner is precisely
+what makes ownership permissive.
+
+This is also why "orphans are prevented, not swept" (above) has a boundary. It holds only
+as long as the listener's process ancestry terminates in an agent session. A detached
+`while true` loop breaks that chain on purpose — its parent is `nohup`/`setsid`, not a
+session — so nothing downstream of the listener ever finds out the session is gone.
+
+If a channel must survive with nobody at the keyboard, that is exactly the case this file
+is for: put the loop under `systemd --user` with `Restart=always`, not a bare `nohup`.
+Under systemd the loop has a name, `systemctl --user status` lists it, `stop` ends it, and
+an operator sweeping for orphans can find and account for it. Under a detached `nohup` it
+is invisible to everything except a manual process-tree walk, and it will out-survive both
+the session that meant to own it and the channel it is keeping falsely alive.
+
+Cleaning one up once it is found is the same recipe as [Retiring an old
+guard](#retiring-an-old-guard) below: kill the loop's root process (before its `pp
+--listen` child can relaunch it), confirm the marker does not come back, then `pp --close`
+the channel and `pp --gc` to drop the local record.
+
 ## Retiring an old guard
 
 Killing the wrapper leaves its `pp --listen` children alive — they are re-parented and keep stealing

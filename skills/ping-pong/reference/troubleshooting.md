@@ -463,6 +463,39 @@ Two guards before firing:
 
 Hand-killing is for what remains after that: a reader that is still correctly parented but abandoned, or a bus you can reach only by ssh. Treat an unexplained silent peer as a possible orphan and check `--info` against whether that session still exists.
 
+### Sweeping for orphaned channels finds live listeners on channels whose owner is dead, and `--gc` reports 0
+
+Asked to clear out abandoned channels, `--list` and `--gc` can both come back clean while
+several channels are actually dead: every one of them shows a live listener, so neither
+surface flags them. The listener staying alive is not health here — it is the symptom.
+The cause is a relaunch loop parked **outside any session** (see [reference/standing-listener.md](standing-listener.md#a-loop-parked-outside-every-session-is-not-a-cheap-supervisor)):
+it re-registers the marker faster than anything can observe it missing, so `kill -0` on
+the listener pid — which is all `--list`/`--gc` check — always says "alive."
+
+The signal that actually tells them apart from a healthy channel is the **owner**, not the
+listener, and only `--close` looks at it:
+
+```bash
+pp --close <id>     # if it prints "previous owner session (...) is gone", the channel
+                     # was abandoned despite listeners:1 — the owner check just proved it
+```
+
+Doing this at scale:
+
+1. `pp --list` to enumerate every channel, then `pp --close <id>` on each — the message
+   distinguishes a real close from a hollow one.
+2. For every channel that turns out abandoned, find and kill the external relaunch loop
+   keeping its listener alive, **root process first** so it cannot respawn a child while
+   you work down the tree; a loop with no session behind it will not stop on its own.
+3. Re-run `pp --gc` afterward to drop local records once no marker keeps re-appearing.
+
+There is no single command that does this sequence today — `--gc`'s "report, never close"
+default is deliberate and correct, so a bulk sweep is manual `--close` plus a manual kill
+of whatever is external to `pp`. If you built or find one-off relaunch scripts doing this
+job (a `while true; do pp --listen … ; done` under `nohup`, or a hand-rolled keepalive),
+retire them under `systemd --user` instead of restarting them bare — see
+[reference/standing-listener.md](standing-listener.md).
+
 ### `--gc` does not reap a `listening-*` marker whose reader process already died — and the refusal message points at it anyway
 
 `--listen` can refuse with "side a of channel `<id>` ALREADY has a live listener (pid `<N>` on the bus). If that listener is stale, clear it: `pp --gc`" — and running exactly that can leave the marker untouched. Measured: `pp --gc` reported `checked 3 listener record(s), dropped 0 stale channel record(s)` — it reaps **channels** with no listener on either side and long silence, not an individual `listening-<side>` record whose process is simply gone. `pp --adopt` does not touch it either: it changes session ownership, and the stale `listening-a` marker survives the adoption untouched.
