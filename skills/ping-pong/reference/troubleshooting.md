@@ -124,6 +124,15 @@ exactly while it degrades everything else on the machine.
 Without the flag, each drop still costs a turn — that is the pre-0.5.0 behaviour
 and the reason the flag exists.
 
+**The default retry budget is far short of what the transport can actually survive.**
+60 attempts × 5s is about 5 minutes, and the listener gives up there as a policy
+choice, not because the link is actually dead — the ssh connection underneath it
+carries `ServerAliveInterval=30` × `ServerAliveCountMax=1000`, roughly 8.3 hours of
+tolerance to a dead link before the client itself gives up. On an outage expected to
+run longer than a few minutes — a laptop asleep overnight, a scheduled network
+change — pass a larger bound explicitly rather than trusting the default to outlast
+it: `pp --listen <id> --retry 2000`.
+
 ## `--listen` returned instantly with no message
 
 The channel does not exist on the bus. Almost always: the **bus host rebooted** and wiped `/tmp`. `pp --list` will show nothing. Open a new channel — the id is disposable.

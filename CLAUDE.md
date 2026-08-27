@@ -226,6 +226,63 @@ literal one-liner. **Do not document a rejection or an `--allow-empty` flag in t
 skill until the executable actually has it** — a version chain that promises a guard it
 does not ship is exactly the drift this repo has been bitten by before.
 
+## Known gap: nothing keeps a listener up for the life of a session, and nothing closes a channel when a session ends
+
+**Not built.** The turn contract keeps a listener up by convention — relaunch after every
+delivery — but nothing enforces it. Three independent paths leave a side deaf with no
+automatic recovery: the agent simply forgets, the harness tears down the background task
+(an `/exit` choice, a Monitor timeout, teardown), or the `--retry` budget runs out. All
+three end the same way: the marker looks fine, the side is silent, and the operator has to
+notice and ask for a relaunch.
+
+A relaunch loop with no owner (`nohup`/`setsid ... while true; do pp --listen ...; done`,
+detached from any session) does keep the side answering — by defeating the abandonment
+surfaces documented in [reference/standing-listener.md](skills/ping-pong/reference/standing-listener.md#a-loop-parked-outside-every-session-is-not-a-cheap-supervisor).
+It has no upper bound either: such loops have been found still running days after every
+session that opened them ended, keeping channels looking healthy with dead owners on both
+sides. Whatever closes the reliability gap has to be leashed to the owning session's actual
+lifetime, not run forever.
+
+The shape a fix would take: a supervisor loop that relaunches the reader with no retry cap
+— never giving up the way `--retry`'s bounded budget does — but that checks the existing
+`session_alive()` helper against the owning pid already recorded in the channel's marker on
+every cycle, and exits the moment that pid is gone. That leash is what a bare background
+loop lacks, and it is also why such a supervisor cannot double as the thing the harness
+waits on: a process that never exits can never deliver a wake-up. The two roles split —
+one loop holds the FIFO open and spools whatever arrives; a second, disposable one blocks
+on the spool and exits on the first new line, which is what the harness actually watches.
+
+Session end has the same shape of gap on the other requirement. The plugin ships no hooks
+today (no `hooks/hooks.json`, no `hooks` key in `plugin.json`), so nothing runs when a
+session ends. The listener already dies with its session; the channel object does not, and
+the next session to see that id adopts it with no friction (the dead-owner case ownership
+was built to make findable, not to prevent). A `SessionEnd` hook that closes only the
+channels this session owns would close it on a clean exit — bus mode's `--close` already
+notifies the peer's blocked reader before deleting anything, so the peer wakes with an
+empty read and learns the conversation ended without needing to run anything itself.
+Direct mode's close does not carry the same guarantee yet: it only forgets the local record
+and tells the human to relay the news, leaving the peer's reader pointed at a socket that
+will refuse forever. The fix for that transport is a best-effort one-shot notice to the
+peer's inbox before forgetting the local record, treating a refused connection as
+confirmation the peer is already gone, not as an error to abort on.
+
+Open question to verify empirically before shipping the hook, not to guess: which values a
+`SessionEnd` hook's `reason` field can take, and which of them must **not** close the
+channel — a `resume` has to find its channel still there.
+
+What a `SessionEnd` hook cannot reach: a hard kill, a crash, a lid closed mid-session.
+Nothing fires there, and the channel is left exactly as it is today. The shape of a
+mitigation is a periodic liveness stamp each side updates, with the other side's loop
+surfacing a stale stamp to its agent for a decision — never closing on the heuristic
+itself, which is the same "report, never close" boundary `--gc` already draws for
+abandoned channels.
+
+Separately: clearing a batch of already-abandoned channels is manual today — enumerate,
+`--close` each one, kill root processes before children so they cannot respawn a marker
+while working down the tree. `--gc`'s "report, never close" default is correct and should
+not change; what is missing is an explicit opt-in bulk operation for once the operator has
+already said yes to closing them.
+
 ## Updating this skill
 
 After any session that discovers a new failure shape. Keep entries generic — patterns and causes, never machine or client data. The git log of this repo is the diary.
