@@ -181,6 +181,11 @@ as before. Forgetting to relaunch `--await` now costs a notification, not a mess
 `--listen` still works and is still correct for a one-shot exchange. Prefer `--keep` for
 anything that lasts more than a couple of turns.
 
+**Relaunching `--await` by hand every turn can be replaced with an event-driven watcher**
+that wakes the session only when the spool actually grows — see
+[reference/inotify-wake.md](reference/inotify-wake.md) for the design and the traps in
+building one (inotify coalesces writes, a blind window at startup, and more).
+
 **In both roles, the operator's total workload is pasting what you hand them.** Never ask them to read a `tailscale status`, relay an IP, or decide between transports — you can read all of that yourself, and every relay step is a chance for a typo that surfaces much later as a connection refused.
 
 ## Ownership: a channel belongs to a session, not a machine
