@@ -1,4 +1,70 @@
-# inotify coalesces — count coverage, not events
+# Event-driven wake: an inotify watcher instead of relaunching `--await`
+
+`--await` still has to be relaunched in the background once per turn (see the turn
+contract in `SKILL.md`). For a session that stays open a long time, wire the spool file to
+a persistent, event-driven watcher instead, so nothing has to be relaunched by hand.
+
+## The design
+
+    keeper (`pp --keep`)   → writes each delivery into the spool
+                              (`~/.local/state/ping-pong/<id>.inbox`)
+    inotify                → the KERNEL fires an event when the spool is closed after a write
+    a persistent watcher   → turns that event into a short notification to the session
+
+Set up once per session with a persistent background watcher (for example a harness's
+`Monitor(..., persistent=true)` wired to a small wrapper script). The notification should
+carry only the **timbre** — which channel, who wrote, how many lines, the spool path — not
+the message body. Dumping the whole delivery into the notification defeats the point: the
+full text is already sitting in the spool for `--await` to read on demand.
+
+## Other correctness details a wrapper script needs
+
+Each of these is backed by a measured failure, not a hypothetical one:
+
+- **Name each capture file with sub-second resolution (nanoseconds), not whole seconds.**
+  Two deliveries landing in the same second collide on a seconds-resolution name: the
+  second capture truncates the first one to empty before it is read. The observed
+  symptom was a notification confidently announcing "93 lines" while the file it pointed
+  to was 0 bytes — true when written, false half a second later.
+- **Only notify when the capture file actually has bytes** (`[ -s "$tmp" ]`). Without that
+  guard, every write that doesn't bring new mail still fires a notification that sends the
+  session to go read nothing. An empty file is not a message.
+- **Fail loudly if the inotify tooling isn't installed.** A pipeline built on it (piping
+  its output into a read loop) silently produces nothing and returns no error when the
+  binary is missing — the watcher looks armed forever and never fires. The dependency is
+  not guaranteed to be present on every machine — verify before reusing a script as-is. A
+  `tail -F` on the spool, which talks to the same kernel facility directly, is the portable
+  fallback where the package isn't available.
+- **Watch the containing directory and filter by the exact filename you expect, never a
+  glob.** That directory is typically shared by every channel/project on the same
+  machine — a glob picks up traffic that belongs to a completely different, unrelated
+  conversation on the same box.
+
+## Two different silences: the keeper is down vs. the bus is gone
+
+A spool that has stopped growing looks identical to a peer that has gone quiet. There are
+two distinct causes, and only one of them is visible to the obvious check:
+
+| cause | how to detect it |
+|---|---|
+| the keeper process died | a service-manager liveness check on the keeper unit — cheap, immediate |
+| the underlying bus/channel was reset out from under a still-running keeper | the liveness check keeps reporting the unit as `active` |
+
+The second case is the trap, and it was measured, not assumed: the channel's backing
+directory was removed out from under a live keeper, and the keeper's own supervisor kept
+calling it healthy for over a minute afterward, its reader blocked on a pipe that no
+longer existed. What actually catches it is asking the channel itself — `pp --info <id>`
+reports the channel as gone once the bus no longer has it, and full metadata with no false
+alarm while it's alive. That probe is slower than the local liveness check (it can cost a
+network round trip), so poll it on a longer interval than the cheap check; a costly probe
+run too often becomes its own denial of service.
+
+This matters because the failure mode in both cases is **silence**, which is
+indistinguishable from the peer simply not having written anything yet. Without a pulse
+check, a session can believe it is listening for hours while nothing is actually being
+watched.
+
+## inotify coalesces — count coverage, not events
 
 A tempting control for any watcher built on inotify is "write twice, confirm exactly 2
 events fire." That control is invalid, and it fails in a way that looks like flakiness
@@ -37,3 +103,11 @@ Waiting for a watch to be armed with a blind `sleep` is a race, not a fix, and i
 made an early version of this flaky to reproduce. `inotifywait` run without `-q` prints
 `Watches established.` on stderr — that line is the actual ready signal, not a guessed
 delay.
+
+## Nothing is lost if the watcher crashes
+
+The spool is append-only and the read cursor only advances on a successful drain, so a
+dead watcher does not lose mail — the next `--await` (manual or re-armed) picks up
+everything written since the last successful read. This was confirmed by recovering a
+complete message with a direct read of the spool after a naming bug had made it vanish
+from the watcher's own output file.
