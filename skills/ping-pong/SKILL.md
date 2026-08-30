@@ -188,6 +188,15 @@ as before. Forgetting to relaunch `--await` now costs a notification, not a mess
 `--listen` still works and is still correct for a one-shot exchange. Prefer `--keep` for
 anything that lasts more than a couple of turns.
 
+**How long a background `--await` survives is not predictable from inside the session.**
+Measured on the same channel, same build, same session: it survived dozens of turns, then
+started getting reaped on every single turn afterward, with nothing about the setup having
+changed in between. A run of survival buys nothing toward the next turn. Treat a background
+waker as disposable on every turn regardless of its track record so far, and relaunch it
+without first checking whether it is still alive. The keeper is what makes that cheap to be
+wrong about: losing the waker costs a notification, never a message, because the keeper
+already wrote it to the spool before the waker was there to notice.
+
 **Relaunching `--await` by hand every turn can be replaced with an event-driven watcher**
 that wakes the session only when the spool actually grows — see
 [reference/inotify-wake.md](reference/inotify-wake.md) for the design and the traps in
