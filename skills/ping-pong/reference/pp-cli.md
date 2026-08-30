@@ -154,6 +154,27 @@ Three outcomes:
 | Owner session is gone | Adopted automatically, with a note on stderr |
 | Called from a plain shell, no agent ancestor | Checks are permissive — sessions cannot be told apart |
 
+### `--list` is bus-wide, not session-scoped — and it prints other clients' topics
+
+`--list` enumerates **every** channel directory on the bus, not just the ones this session
+owns or is part of. Each line includes the free-text `--topic` verbatim (human prose, often
+naming a client and what the work is about) plus both sides' labels (machine:project) and the
+owner. There is no flag to narrow it — `--help` describes it as "open channels on the bus,"
+which is the whole bus.
+
+This matters most for an operator running several sessions for different clients at once, each
+with a deliberate boundary between them. `--list` crosses that boundary silently: it reads like
+routine housekeeping ("is my channel still up?"), and the side effect is that every other
+channel's topic and labels land in *this* session's transcript — a transcript that cannot be
+un-written once it happens. Nothing has to be sent for the leak to occur; listing is enough.
+
+**Until this is scoped upstream** (see `CLAUDE.md`'s known-gap entry), treat `--list` as
+showing more than you asked for: read only the id/listener/owner columns you need, and avoid
+pasting its raw output somewhere that mixes clients — including a shared transcript, a status
+message to a peer, or a log. The same bus-wide reach applies to `--gc --close-abandoned` (can
+close another job's channel) and `--adopt <id>` (can take one); neither was measured to leak
+data the way `--list` does, but both touch the same shared bus and deserve the same caution.
+
 ### What `--gc` sweeps
 
 Three distinct kinds of litter, all scoped to this machine:

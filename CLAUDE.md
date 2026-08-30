@@ -308,6 +308,33 @@ The shape a fix would take, in order of preference:
 reads the owner file** — that would be exactly the version-chain drift this repo has already
 been bitten by (see the version-chain note above).
 
+## Known gap: `--list` is bus-wide and prints other clients' topics with no way to scope it
+
+**Not built.** `cmd_list` walks every `pp-*` directory under `$BUS_ROOT` unconditionally and
+prints each one's `--topic` verbatim plus both sides' labels and owner — there is no filter by
+session, by `cwd`, or by ownership. An operator running several sessions for different clients
+gets the full inventory of everyone else's channels the moment they check whether their own is
+still up. Measured behavior and the interim mitigation (read narrowly, don't paste the raw
+output across a client boundary) are documented in
+[reference/pp-cli.md](skills/ping-pong/reference/pp-cli.md#--list-is-bus-wide-not-session-scoped--and-it-prints-other-clients-topics).
+
+The shape a fix would take, in order of preference:
+
+- `--list` scoped by default to channels this session is part of (owner match, same as
+  `--gc`'s owner check already computes), with an explicit `--all` to opt into the full-bus
+  view. This is the safer default since the common case ("is my channel still up?") never
+  needed the rest.
+- If the default must not change: redact `--topic` and both side labels for channels this
+  session does not own, printing only `<id> listeners:N keeper:up/down` — enough to know
+  something else is running, without disclosing what.
+- The same question applies to `--gc --close-abandoned` (can close another job's channel) and
+  `--adopt <id>` (can take one) — not measured as a leak, but the same bus-wide reach, and
+  worth the same review before it is called fixed.
+
+**Do not document a `--all` flag or per-session scoping in the skill until `cmd_list` actually
+implements it** — the version-chain drift this repo has already been bitten by applies here
+too: a flag documented before it ships teaches an agent to run something that does not exist.
+
 ## Updating this skill
 
 After any session that discovers a new failure shape. Keep entries generic — patterns and causes, never machine or client data. The git log of this repo is the diary.
