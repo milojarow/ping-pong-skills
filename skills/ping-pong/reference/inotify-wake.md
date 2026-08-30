@@ -53,6 +53,55 @@ Each of these is backed by a measured failure, not a hypothetical one:
   machine — a glob picks up traffic that belongs to a completely different, unrelated
   conversation on the same box.
 
+## This design does not apply to a DIRECT channel as-is — there is no keeper, so no spool
+
+Everything above starts from "the keeper writes the spool, inotify fires on the write." A
+channel opened with `--open --direct` has no keeper today (`--keep`/`--info` hit the bus and
+fail there — see [troubleshooting.md](troubleshooting.md#--keep-and---info-on-a-direct-channel-say-does-not-exist-on-the-bus)),
+and therefore never gets a `.inbox` / `.cursor` pair — a direct channel's state on disk is only
+`<id>.direct`, `<id>.owner`, `<id>.side`. Arming a watch on a spool path that will never be
+created is not a broken watcher, it is a correctly-armed watch on nothing: it stays silent
+forever, and that silence is indistinguishable from a quiet peer, which is exactly the failure
+mode this whole document exists to design around.
+
+**The fix does not need a bus.** Direct mode already has what a feeder needs — a blocking
+read (`pp --listen <id> --retry`) — it is just not wired to a spool. A loop that supplies the
+missing half, entirely outside `bin/pp`:
+
+```bash
+# direct-mode feeder: plays the keeper's role for one channel, no bus involved
+while :; do
+  body=$(pp --listen "$id" --retry 2>>"$err")
+  rc=$?
+  [ $rc -eq 0 ] && [ -n "$body" ] || continue        # empty/refused: nothing to spool
+  printf '%s\n' "$body" >> "$spool"
+  n=$(printf '%s\n' "$body" | wc -l)
+  echo "MAIL $id from:$(printf '%s' "$body" | sed -n 's/.*from: \([^ ]*\).*/\1/p') lines:$n spool:$spool"
+done
+```
+
+Run under the harness's persistent Monitor (never a bare background loop — see
+[standing-listener.md](standing-listener.md#a-loop-parked-outside-every-session-is-not-a-cheap-supervisor)
+for why that distinction matters), it is leashed to the session's own lifetime, so it cannot
+become the immortal loop SKILL.md prohibits — and inotify becomes unnecessary, because the
+loop already knows the instant mail lands; it does not need the kernel to tell it.
+
+Every correctness rule already on this page still applies to that spool once it exists:
+nanosecond-resolution capture names, notify only when the capture actually has bytes, drain
+before arming, and the guard-plus-drain pairing for the cursor covered later in this document
+— any hand-rolled reader over this spool must copy it, not just the "pending mail" half.
+
+**One more detail specific to the direct-mode loop above:** run `--listen --retry`, never a
+bare `--listen`. Between one iteration and the next the inbox port is released and re-bound,
+and that gap is a race — a send that lands during it is a transport failure, not a real
+absence of mail. A bare `--listen` has no recovery from that and the feeder loop dies silently;
+`--retry` re-attaches on exactly that class of failure and keeps surfacing on a real refusal or
+a closed channel, so no genuine failure gets swallowed by the retry.
+
+The proposal to make this a real `--keep` for direct mode — instead of a loop built per
+session — is tracked as a known gap in `CLAUDE.md`; nothing here should be read as saying that
+exists today.
+
 ## Two different silences: the keeper is down vs. the bus is gone
 
 A spool that has stopped growing looks identical to a peer that has gone quiet. A watcher
