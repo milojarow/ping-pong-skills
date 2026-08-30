@@ -55,8 +55,18 @@ Each of these is backed by a measured failure, not a hypothetical one:
 
 ## Two different silences: the keeper is down vs. the bus is gone
 
-A spool that has stopped growing looks identical to a peer that has gone quiet. There are
-two distinct causes, and only one of them is visible to the obvious check:
+A spool that has stopped growing looks identical to a peer that has gone quiet. A watcher
+built to check only "did it grow" inherits that same blindness: measured, a first version
+watching just spool growth and keeper liveness stayed silent through two separate channel
+disappearances in one day, because the only thing it could report was "the expected signal
+did not arrive" — indistinguishable from "nobody has written yet." **Watch the pipe, not
+only the content**: growth proves a message arrived, keeper-liveness proves a reader is
+still there, and channel presence (`pp --info <id>` / `pp --list`) proves the pipe itself
+still exists. A watcher that only watches the first one can never report the absence of the
+other two.
+
+There are two distinct causes behind the spool going quiet, and only one of them is visible
+to the obvious check:
 
 | cause | how to detect it |
 |---|---|
