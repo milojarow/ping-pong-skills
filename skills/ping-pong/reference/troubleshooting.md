@@ -618,6 +618,46 @@ document `--keep`/`--info` as working in direct mode until they actually branch 
 
 ## `--keep` / `--await` failure shapes
 
+### `--keep` falls back to FOREGROUND even though `systemctl --user list-units` shows plenty running
+
+The message is `pp: no user systemd here - running the keeper in the FOREGROUND` — which reads
+as "there is no user systemd manager on this machine," and the same terminal's
+`systemctl --user list-units` can contradict that outright, listing dozens of active units,
+including other channels' keepers.
+
+The detector (`have_user_systemd()`) tests availability with the exit code of
+`systemctl --user is-system-running`, and that command answers a different question than the
+one being asked: it reports the manager's **health**, not its **existence**. It exits 0 only for
+`running`; `degraded`, `starting`, `maintenance` and `stopping` all exit 1 — and `degraded`
+means "the manager works fine, some unrelated unit is sitting in `failed`." A single failed
+user unit anywhere on the machine — nothing to do with `pp` — is enough to make every
+`pp --keep` on that box silently degrade to the one mode `--keep` exists to avoid, with no
+message that points at the real cause.
+
+Measured: a unit that kills itself on purpose with `KillSignal=SIGKILL` (a common pattern for
+avoiding a visible flash while swapping units under `Conflicts=`) reports `Result: signal` and
+lands in `failed` every time it runs that path. With that unit present, the user manager sits in
+`degraded` permanently, and `--keep` on that machine falls to the foreground forever — until the
+unrelated unit is cleared.
+
+**Diagnose:**
+
+```bash
+systemctl --user is-system-running       # degraded / starting / maintenance / stopping / offline / unknown
+systemctl --user list-units --failed     # which unit is failed, and why
+```
+
+`offline`, `unknown`, and an empty string are the only answers that actually mean "no user
+manager here." Everything else — `running`, `degraded`, `starting`, `maintenance`, `stopping` —
+means `systemd-run --user` still works.
+
+**Workaround today:** clear or fix the failed unit (`systemctl --user reset-failed <unit>`
+if it should not respawn, or fix whatever keeps failing) to bring the manager back to
+`running`, then retry `--keep`. If the unit fails on every run by design (as in the SIGKILL
+case above), the manager stays `degraded` on that machine and `--keep` has no path back to the
+background mode until the CLI itself stops trusting the exit code — see the known-gap entry in
+`CLAUDE.md` for the fix that has not shipped.
+
 ### How far behind you are is a byte count — never `mtime`
 
 Two ways to get this wrong, both measured on the same channel back to back:

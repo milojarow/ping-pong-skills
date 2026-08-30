@@ -407,6 +407,33 @@ The shape a fix would take, in order of preference:
 `pp` actually enforces one** — today the only correct claim is that state inherits the
 environment's umask, and the mitigation is manual.
 
+## Known gap: `have_user_systemd()` reads the manager's health, not its existence
+
+**Not built.** `have_user_systemd()` (`bin/pp`) gates on the exit code of
+`systemctl --user is-system-running`, which is 0 only for `running`. `degraded`, `starting`,
+`maintenance` and `stopping` all exit 1 even though `systemd-run --user` works fine in every
+one of those states — `degraded` in particular just means some unrelated unit is `failed`.
+Any single failed user unit anywhere on the machine, with nothing to do with `pp`, is enough
+to make `--keep` silently fall back to the foreground mode it exists to avoid, with a message
+("no user systemd here") that misnames the cause. Measured behavior and the diagnosis are
+documented in
+[reference/troubleshooting.md](skills/ping-pong/reference/troubleshooting.md#--keep-falls-back-to-foreground-even-though-systemctl---user-list-units-shows-plenty-running).
+
+The shape a fix would take:
+
+- Replace the exit-code check with a state allowlist: accept `running`, `degraded`,
+  `starting`, `maintenance`; reject `offline`, `unknown`, and the empty string (the only
+  answers that actually mean "no user manager here").
+- Longer term, an even more honest probe answers "can I start a unit?" by attempting one
+  (`systemd-run --user --unit=<probe> true`) rather than reading a health status at all —
+  the same ask-vs-attempt distinction already applied elsewhere in this file's troubleshooting
+  entries (see the `--info` substring-match gap in
+  [reference/troubleshooting.md](skills/ping-pong/reference/troubleshooting.md#the-probe-is-the-cheap-attempt-not-a-parse-of---infos-status--and-no-listener-contains-listen)).
+
+**Do not document `--keep` as tolerating a `degraded` user manager until `have_user_systemd()`
+actually accepts that state** — today a single unrelated failed unit can degrade `--keep` on
+that machine permanently.
+
 ## Updating this skill
 
 After any session that discovers a new failure shape. Keep entries generic — patterns and causes, never machine or client data. The git log of this repo is the diary.
