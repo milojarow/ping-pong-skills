@@ -4,6 +4,19 @@
 contract in `SKILL.md`). For a session that stays open a long time, wire the spool file to
 a persistent, event-driven watcher instead, so nothing has to be relaunched by hand.
 
+**There is no webhook primitive in ping-pong** — nothing lets the peer's send reach into
+the harness and invoke you directly. The combination below is the practical equivalent:
+`--keep` holds a reader outside any turn's process tree and spools every delivery, and a
+persistent watcher on that spool turns the OS-level write into a harness task-notification.
+From the harness's side that notification **is** the webhook — it re-invokes the session
+with the unread bytes already sitting in the spool, no polling loop and no timer parked
+anywhere.
+
+**Each side has to arm its own.** Waking on a delivery to your spool says nothing about
+whether the peer has the same arrangement — if the peer also needs event-driven wake-up,
+that is a second, independent setup on their side, worth agreeing over the channel rather
+than assuming.
+
 ## The design
 
     keeper (`pp --keep`)   → writes each delivery into the spool
