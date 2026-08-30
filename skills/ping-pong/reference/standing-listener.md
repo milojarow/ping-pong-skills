@@ -70,6 +70,26 @@ delivery into a mailbox.
   is listens in flight, not messages. Counting files as messages makes "has it arrived yet?" answer
   yes when nothing has — measured, with a plain `ls | wc -l`.
 
+## Updating the wrapper while it is running: replace with `mv`, never edit in place
+
+The wrapper this guard runs is a long-lived script an interpreter is still reading when you go
+to change it — `bash` does not read a script file in one gulp, it reads by **offset** while
+executing. Editing the file in place can shift the offsets out from under a process already
+partway through it, and what it executes next is garbage or half of an unrelated line.
+
+    # wrong — a running wrapper can read offsets that just moved
+    python3 -c "...edits the wrapper file in place..."
+
+    # right
+    ...write the new version to pp-guard.new...
+    bash -n pp-guard.new         # syntax check before it goes anywhere near a live process
+    mv pp-guard.new pp-guard     # atomic: the old inode stays valid until the old process exits
+
+Full cycle for a change to the wrapper: write the new version to a temp file, `bash -n` it,
+`mv` it into place, **then** stop the old unit and restart with the new one — in that order.
+Stopping the unit before the `mv` only widens the window where nothing is draining the inbox,
+for no benefit; the `mv` itself is what makes the swap safe regardless of when you stop it.
+
 ## State goes outside the session's temporary directory
 
 The mailbox belongs in a durable per-user path — `~/.local/state/pp-guard/<channel>/` — never in
