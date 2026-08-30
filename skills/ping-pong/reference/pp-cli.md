@@ -188,6 +188,27 @@ If you set it by hand, pick **one short, stable label per channel** and reuse it
 
 Labels are sanitized to `[A-Za-z0-9._:-]`, max 40 characters. `/` is deliberately excluded: it would break the substitution that writes the label into the channel's `meta`.
 
+#### `--as` at `--open`/`--join` does not sign later sends
+
+The label you pass to `--open`/`--join` is written **once**, into that channel's owner file,
+and used **only** as display text — the note on `--adopt` and the ownership-refusal message.
+It is not read back by `--send`. Every send re-resolves the label independently through
+`default_label()` (`--as` on *that* call → `PP_LABEL` → the `host:project` default), so a
+channel opened with `--as chewbacca` signs its first message with `chewbacca` and every
+message after that with whatever `default_label()` resolves to on this machine — silently,
+unless `--as` is repeated on every `--send` or `PP_LABEL` is exported for the session.
+
+This is invisible in the common case: if the chosen label happens to match the `host:project`
+default, both paths produce the same string and nothing looks wrong. It only surfaces when the
+operator picks a label that differs from the default — which is exactly when the label was
+worth setting. The symptom is the one already named in the common-mistakes table: the peer
+sees a different author on later messages and cannot tell who it is talking to, except here
+the agent did nothing wrong — the tool just never re-signs with the label the channel opened
+with.
+
+**Fix that works today:** export `PP_LABEL` once at the start of the session (or pass `--as
+<label>` on every `--send`), not just on `--open`/`--join`.
+
 ### When `--wait` is right
 
 Default to a bare `--listen` with no timeout. A conversation has no deadline, the wait costs nothing, and an untimed listener is the wake-up mechanism the whole design rests on.

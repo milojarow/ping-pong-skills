@@ -283,6 +283,31 @@ while working down the tree. `--gc`'s "report, never close" default is correct a
 not change; what is missing is an explicit opt-in bulk operation for once the operator has
 already said yes to closing them.
 
+## Known gap: `--as` at `--open`/`--join` is not remembered by `--send`
+
+**Not built.** `claim_channel()` writes the `--as` label into the channel's owner file, but the
+only reader of that field (`assert_owner()`) uses it for display text — the `--adopt` note and
+the ownership-refusal message. Every `--send` (bus and direct) signs with its own `$label`
+parameter, filled independently by that invocation's `--as` or, absent that, by
+`default_label()`. So a channel opened with a chosen label silently drifts to the
+`host:project` default on the second message unless the label is repeated or `PP_LABEL` is
+exported. Measured behavior and the manual workaround are documented in
+[reference/pp-cli.md](skills/ping-pong/reference/pp-cli.md#-as-at---open-join-does-not-sign-later-sends).
+
+The shape a fix would take, in order of preference:
+
+- `default_label()` checks the channel's own owner file first (`label=` for this id) before
+  falling back to `PP_LABEL` / `host:project`. This matches what the operator already believes
+  happens, and needs no new flag.
+- If that behavior change is unwanted, `--open`/`--join` print an explicit line telling the
+  agent to export `PP_LABEL` or repeat `--as`, so the gap is surfaced instead of silently hit.
+- Document `PP_LABEL` in the SKILL.md quick-reference table — today it only exists inside
+  `default_label()` in the source and in the environment-variables table of `pp-cli.md`.
+
+**Do not document a "remembers `--as`" behavior in the skill until `default_label()` actually
+reads the owner file** — that would be exactly the version-chain drift this repo has already
+been bitten by (see the version-chain note above).
+
 ## Updating this skill
 
 After any session that discovers a new failure shape. Keep entries generic — patterns and causes, never machine or client data. The git log of this repo is the diary.
