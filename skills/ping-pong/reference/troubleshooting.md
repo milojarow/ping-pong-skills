@@ -407,6 +407,15 @@ pp --send pp-k7m2qx < /path/to/message.txt
 
 `--listen` was run in the **foreground**. It is supposed to block; that is the wake-up mechanism. It must run as a background command so the session stays responsive and the harness notifies you on arrival.
 
+## A background listener died with no `pp`-level error to read
+
+Read the **harness's own task label** before suspecting `pp`, the channel, or the bus. A
+background command that is still running when the turn that started it ends gets reaped by
+the harness, and that shows up in the harness's own accounting as `[killed]` — not as an
+error from `pp`, not as a channel fault, and not as a dead bus. Measured: six deaths in a
+row, all labeled `[killed]`, with the channel, permissions and bus all untouched the whole
+time. Check the label first; only go looking at the channel if it says something else.
+
 ## Timestamps disagree by hours between the two sides
 
 Bus hosts commonly run UTC while workstations run local time. `pp` stamps every message in UTC precisely so headers are comparable. If you correlate a `pp` header against a local log, convert explicitly — do not subtract a hardcoded offset, since regions with daylight saving shift twice a year.
