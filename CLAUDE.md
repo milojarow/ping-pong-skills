@@ -385,6 +385,28 @@ reader stealing delivery).
 **Do not document this loop as a shipped `--keep`-equivalent** — it is a pattern to build per
 session, not a flag `bin/pp` has.
 
+## Known gap: local channel state inherits the process umask instead of a fixed private mode
+
+**Not built.** Every `mkdir -p "$STATE_DIR"` in `bin/pp` (about a dozen call sites) relies on
+the caller's umask; only the ssh-remote bus-root creation path forces `umask 077` / `chmod 700`
+today. The local files a bare `--open`/`--join`/`--keep` creates — `<id>.side`, `<id>.owner`,
+`<id>.direct`, and the keeper's spool `<id>.inbox` — are born world-readable on any machine
+whose default umask is `022`, and group-writable too under `0002`. Measured behavior and the
+interim, by-hand mitigation are documented in
+[reference/pp-cli.md](skills/ping-pong/reference/pp-cli.md#state-on-disk-inherits-the-process-umask--a-private-channel-is-not-private-by-default).
+
+The shape a fix would take, in order of preference:
+
+- Force it at creation: `mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"` once, plus
+  `umask 077` around every block that writes `.direct` / `.owner` / `.side` / `.inbox` —
+  cheaper than auditing every call site individually, and it also covers ones added later.
+- Extend `--gc` to also tighten permissions on what is already on disk for existing
+  installations, not just reap stale records.
+
+**Do not document a permission guarantee, or a `--gc` permission sweep, in the skill until
+`pp` actually enforces one** — today the only correct claim is that state inherits the
+environment's umask, and the mitigation is manual.
+
 ## Updating this skill
 
 After any session that discovers a new failure shape. Keep entries generic — patterns and causes, never machine or client data. The git log of this repo is the diary.

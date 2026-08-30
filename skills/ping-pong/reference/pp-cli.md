@@ -304,4 +304,46 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 | `pp-keep-<id>.service` | `systemd --user`, transient | The keeper. `systemctl --user status pp-keep-<id>` and `journalctl --user -u pp-keep-<id>` are where its story is. |
 | `$PP_BUS_ROOT/<id>/` | bus host | The channel: `meta`, the two FIFOs, listener markers. |
 
+### State on disk inherits the process umask — a private channel is not private by default
+
+`pp` creates its own local state with whatever umask the calling shell has, never a fixed one
+of its own. Every file a channel writes locally — `<id>.side`, `<id>.owner`, `<id>.direct`
+(peer + port, direct mode) and, once a keeper is running, the spool `<id>.inbox` (the full text
+of everything that crossed the channel) — inherits that umask instead of a private mode.
+
+Measured independently on two machines with two different default umasks:
+
+| umask | files | dir |
+|---|---|---|
+| `0002` | `-rw-rw-r--` | `drwxrwxr-x` |
+| `022`  | `-rw-r--r--` | `drwxr-xr-x` |
+
+Both come out world-readable, and the first is also group-writable. That is worse than a fixed
+bad permission: the exposure depends on the environment `pp` happens to run in, not on anything
+the skill controls or documents.
+
+Scope it honestly. On a single-user machine where the only uid with a login shell is the owner,
+this is not an active leak — the realistic audience is a service account, another process
+running under a different uid, or an assumption that breaks if this directory is ever copied
+elsewhere. It is hardening, not an incident in progress, but it is the wrong default for a
+skill whose whole point is a private channel.
+
+**Until `pp` sets its own permissions on write** (tracked in `CLAUDE.md`'s known-gap entry),
+harden it by hand once per machine:
+
+    mkdir -p ~/.local/state/ping-pong && chmod 700 ~/.local/state/ping-pong
+
+Any third-party script that writes into that directory on its own — a hand-rolled watcher, a
+drainer — should `umask 077` before it does, but that does not substitute for the fix belonging
+in `pp` itself: the files a bare `--open`/`--join`/`--keep` creates are still born with whatever
+the shell's umask happens to be.
+
+**For a watcher's own capture files, prefer `$XDG_RUNTIME_DIR` over `/tmp`.** The permission
+argument is secondary to this one: `/run/user/<uid>` is normally mounted `tmpfs`
+(`mode=700`, owned by the uid), so a captured message body never touches a block device at
+all. A `chmod 700` on a `/tmp` directory stops a casual read; it does nothing about recovering
+the bytes from disk afterward — the distinction between "cannot be read" and "was never
+written" that actually matters when deciding whether a secret can cross the channel. Verify the
+mount with `findmnt /run/user/<uid>` before relying on it.
+
 Channel ids match `pp-[a-z0-9]{4,16}` and every command validates that pattern before the id reaches a shell — ids are the only user input that crosses into a remote command.
