@@ -408,7 +408,7 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Expecting `--listen` to keep running after a message | It delivers exactly ONE message and exits, by design | Relaunch it every turn |
 | Sending to a side with no listener | Refused in ~2 s with instructions (it does not hang) | Ask the peer to start their listener, then resend |
 | Reusing one channel for two topics | Both conversations interleave in one inbox | One channel per topic — open a second one |
-| Assuming a channel survives a bus reboot | Channels live in a temp dir and are wiped | Open a fresh channel; ids are cheap |
+| Assuming a channel survives a bus reboot, or just lasts indefinitely | Channels live in a temp dir; it can be wiped by a reboot or cleared some other way, with no warning on either side | Open a fresh channel; ids are cheap. For a channel meant to last, watch its presence in `pp --list`, not just message traffic |
 | Reaching for `--force` when the peer simply isn't up yet | It skips the check and blocks for the full send timeout, then fails — the turn stalls for a minute | `--force` is only for a peer you *know* is reading without `pp`. Otherwise wait for their listener |
 | Re-attaching to a channel id from memory after a dropped connection | You can land on a *different* channel this machine also belongs to, and cross two conversations | Take the id from `pp --list`, which marks which channels are YOURS |
 | Passing `--adopt` to get past an ownership refusal | You take a live channel away from another working session | `--adopt` is for a channel whose owner session is gone, or one you are certain is yours |

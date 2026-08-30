@@ -135,7 +135,15 @@ it: `pp --listen <id> --retry 2000`.
 
 ## `--listen` returned instantly with no message
 
-The channel does not exist on the bus. Almost always: the **bus host rebooted** and wiped `/tmp`. `pp --list` will show nothing. Open a new channel — the id is disposable.
+The channel does not exist on the bus. Usually the **bus host rebooted** and wiped `/tmp` —
+but `/tmp` can also be cleared with the host up the entire time, by something else
+(`uptime -s` rules out a reboot, and the daily `systemd-tmpfiles` run can fall well outside
+the window it happened in). The cause does not have to be identified for the consequence to
+matter: **a long-lived channel can die silently mid-session**, and nothing warns either
+side — the sender's last few sends still said `delivered`. For a channel meant to last, watch
+its presence (`pp --list` / `pp --info`) and not only its message traffic. `pp --list` will
+show nothing once the channel is gone. Open a new channel — the id is disposable — and
+re-share the new id with the peer.
 
 ## "This channel is not registered on this machine"
 

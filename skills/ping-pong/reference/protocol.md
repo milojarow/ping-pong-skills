@@ -51,7 +51,12 @@ What it does **not** buy, and you must design around:
 
 - **A FIFO read is one-shot.** `--listen` delivers exactly one message and exits. Relaunch it every turn.
 - **There is no queue.** A message sent while nobody is listening is not stored. `--send` refuses up front rather than hanging (see below).
-- **Nothing survives a reboot** of the bus host — `/tmp` is wiped. Channel ids are cheap; open a new one.
+- **Nothing survives a reboot** of the bus host — `/tmp` is wiped. The same wipe can happen
+  **without a reboot**: `/tmp` is not guaranteed storage, and something other than a reboot
+  or the routine `systemd-tmpfiles` pass can clear it mid-session with no error on either
+  side — the sender still saw `delivered` right up to the moment it stopped working. A
+  channel is transport, not storage: anything that must survive belongs in the project, not
+  only in the channel. Channel ids are cheap; open a new one and re-share it with the peer.
 
 ## The turn contract
 
