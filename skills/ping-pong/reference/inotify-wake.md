@@ -211,6 +211,49 @@ tail -c +$((off+1)) "$SPOOL"; printf '%s' "$size" > "$CUR"
 depends on the agent remembering the right `tail` invocation, the guarantee lives in the
 agent's memory, not in the cursor on disk — the opposite of what a cursor is for.
 
+## Reopening a channel under the same id can leave the cursor pointing past the new spool's end
+
+A cursor file survives a clean channel close even though the spool it was tracking does not.
+Rejoin the same id later and the read cursor can be far ahead of a spool that was just
+recreated from empty — and from there, messages vanish with **no signal at all**: no error, no
+log line, nothing in `--list`.
+
+Why it is silent: the drain's own `tail -c +$((off+1))` on a cursor past end-of-file reads
+nothing and reports nothing wrong. And the pre-arm guard from the section above —
+`size > off` — is **false** whenever the cursor is ahead of the spool, so it does not even
+raise PENDING. Both sides end up believing the channel is quiet.
+
+**The built-in `pp` already carries the fix, in `cmd_await`, as one line:**
+
+    size=$(stat -c %s "$spool"); [ "$size" -lt "$cur" ] && cur=0
+
+Any hand-rolled reader built directly on the spool — which is exactly what the event-driven
+design on this page invites — has to copy this line itself; nothing enforces it from outside
+`cmd_await`. Add it to both the watcher's guard and the drain:
+
+    if [ "$size" -lt "$off" ]; then
+      echo "STALE CURSOR: cursor=$off > spool=$size — reset to 0"
+      off=0; printf '0' > "$CUR"
+    fi
+
+**Verify with a negative control, not just a positive one.** A run that behaves correctly with
+the guard in place proves less than a run that behaves *incorrectly* without it — the negative
+control is what confirms the guard is the thing changing the outcome, not coincidence. Without
+the fix, a drainer facing a cursor far past the spool's size reports something like
+`(nothing new: cursor=999999 spool=3166)` — the two numbers it prints in the same breath already
+contradict the claim, but nothing reads them before affirming "nothing new."
+
+**Confirmed against a live reopen, not only synthetically:** the same asymmetric cleanup that
+clears `.direct`/`.owner`/`.side`/`.inbox` on close but leaves the separately-written `.cursor`
+behind reproduced this on the very first ordinary reopen after the fix landed — a larger
+backlog than the case that motivated the fix in the first place, because the cursor had
+accumulated a full prior conversation's worth of bytes. The guard caught it and reset to 0
+before the first message was lost.
+
+This only shows up on a **reopen** of the same channel id — a channel opened once and never
+revisited cannot exhibit it, which is exactly why it is easy to ship a reader that has never
+seen the bug.
+
 ## Nothing is lost if the watcher crashes
 
 The spool is append-only and the read cursor only advances on a successful drain, so a
