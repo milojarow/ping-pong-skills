@@ -168,6 +168,13 @@ One-time per machine, if any command says "not configured yet" — see [referenc
 4. Send a greeting so the peer knows you're on: `"$PP" --send <id> -m "<greeting + what you're working on>"`
 5. Stop and wait.
 
+**This first greeting can legitimately bounce with `has no listener`.** The operator gets
+the id to paste the moment the initiator's `--open` prints it — which can be before the
+initiator itself reaches its own `--keep` a step later. A refusal here is not a broken
+channel, it means you arrived first. Retry once plain; if it still refuses, send this one
+greeting with `--force` rather than waiting on the full send timeout. Every later send in
+the conversation should still wait for a real listener instead of reaching for `--force`.
+
 **Why two commands instead of `--listen`.** `--listen` delivers ONE message and exits —
 that exit is the wake-up — and a background task is reaped when the **turn** closes, not
 when the session does. So a plain listener has to be relaunched every single turn, and the
@@ -409,7 +416,7 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Sending to a side with no listener | Refused in ~2 s with instructions (it does not hang) | Ask the peer to start their listener, then resend |
 | Reusing one channel for two topics | Both conversations interleave in one inbox | One channel per topic — open a second one |
 | Assuming a channel survives a bus reboot, or just lasts indefinitely | Channels live in a temp dir; it can be wiped by a reboot or cleared some other way, with no warning on either side | Open a fresh channel; ids are cheap. For a channel meant to last, watch its presence in `pp --list`, not just message traffic |
-| Reaching for `--force` when the peer simply isn't up yet | It skips the check and blocks for the full send timeout, then fails — the turn stalls for a minute | `--force` is only for a peer you *know* is reading without `pp`. Otherwise wait for their listener |
+| Reaching for `--force` when the peer simply isn't up yet | It skips the check and blocks for the full send timeout, then fails — the turn stalls for a minute | `--force` is only for a peer you *know* is reading without `pp`. Otherwise wait for their listener (the JOINER's first-contact greeting is the one deliberate exception — see above) |
 | Re-attaching to a channel id from memory after a dropped connection | You can land on a *different* channel this machine also belongs to, and cross two conversations | Take the id from `pp --list`, which marks which channels are YOURS |
 | Passing `--adopt` to get past an ownership refusal | You take a live channel away from another working session | `--adopt` is for a channel whose owner session is gone, or one you are certain is yours |
 | Inventing a `--as` label per message | The peer sees a different author each time and cannot tell who it is talking to | Pick one short, stable label for the whole channel — the machine or the role, not the task |
