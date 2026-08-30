@@ -617,6 +617,32 @@ pp: owner session claude:<pid> is gone - closing channel <id> and stopping the k
 This is the only thing that covers a `kill -9`, an OOM or a crash — none of those run a
 `SessionEnd` hook. If you did not expect it, what died is the session, not the channel.
 
+### A keeper crashes on its own — silent to you, loud to the peer
+
+The keeper's transient unit ships with `Restart=no`, and nothing revives it after a crash or
+an OOM kill: `systemctl --user show pp-keep-<channel>-<side> -p Restart -p NRestarts --value`
+reads `no` / `0` even right after the kill. `PP_LEASH_POLL` covers the keeper noticing that
+**its own session** died — it does not cover the keeper process dying while the session is
+still fine.
+
+With the channel still open on the bus, the two sides see opposite things:
+
+- **The peer sees it immediately and loudly** — their `--send` is refused up front with
+  `has no listener`, before it even attempts to write.
+- **You see nothing.** Your `--await` stays blocked on a spool nobody is feeding: no error,
+  no exit, indistinguishable from a peer who simply hasn't written yet.
+
+So: **a peer reporting `has no listener` on a side you believe has a keeper running is
+evidence that your keeper died**, not evidence the peer got something wrong. Confirm
+directly instead of assuming either way:
+
+```bash
+systemctl --user is-active pp-keep-<channel>-<side>
+```
+
+Nothing restarts a crashed keeper automatically; once you've confirmed it's down, bring it
+back with `pp --keep <id>`.
+
 ### A lone `<id>.inbox` for a channel that no longer exists
 
 A close triggered from inside the keeper's own unit races its own closing notice:
