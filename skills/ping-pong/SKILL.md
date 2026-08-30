@@ -283,6 +283,46 @@ once costs a live conversation. Confirm with the operator, then `pp --close <id>
 machine nobody is sitting at — is the one case that has no owner to leash to, so it needs a
 supervisor of its own: [reference/standing-listener.md](reference/standing-listener.md).
 
+### A model safeguard can take down or degrade one side mid-collaboration — with no signal in the channel
+
+This has happened more than once and deserves a recovery procedure, not just a note. A
+provider-side safeguard can block a turn outright, or leave a session running but degraded,
+without either state producing any signal on the channel itself: the degraded side's listener
+is still up, so `--send` to it still reports delivered and `--list` still calls it healthy.
+What changes is the *quality* of what it answers, and no transport-level check catches that.
+
+It gets worse if the operator restarts the degraded session: `/exit`'s `SessionEnd` hook runs
+`--close`, which closes the channel on **both** sides — and the surviving side then sees an
+empty read that the rest of this document teaches it to read as "a second reader stole the
+message." That diagnosis is wrong here; the cause is upstream of the channel entirely.
+
+**In direct mode, the surviving side's local state outlives the peer's `--close` — this is not
+obvious from the rest of this document, and the wording in "When the exchange is over" below
+even reads the opposite way.** Measured: after the peer exits cleanly and its hook runs
+`--close`, the closing notice arrives here as an ordinary message, but this side's own state —
+`<id>.direct`, `<id>.owner`, `<id>.side`, the spool, and its listener — is **not** torn down.
+Direct mode keeps no shared metadata by design ("each side keeps its own record"); `--close`
+in that mode is local plus a courtesy notice to the peer, not a destruction of the peer's half.
+
+Consequence: a replacement session can **join the same id again**, with the same `--join` line,
+and the channel comes back without opening a new one.
+
+- **The surviving side must not close its own half on receiving the peer's closing notice.**
+  Closing it is what actually destroys the id; leaving it up is what lets the replacement
+  rejoin.
+- The replacement session joins with the same id; the port is derived from the id and needs no
+  hand-off.
+- If the join is refused for ownership (local state still recorded under the previous session),
+  `--adopt` resolves it — automatically, if the previous session is already gone.
+- The surviving side can tell a clean exit from a dirty one without probing anything: a closing
+  notice arrived means clean; no notice means dirty. Either way the id keeps working as long as
+  this side never closes it.
+
+**For the operator:** a replacement session starts with none of the agreed context — everything
+told to the previous session has to be repeated. Open the re-briefing by naming explicitly what
+is now **obsolete**, not only what still holds; the replacement can otherwise end up executing a
+plan that was already revised twice.
+
 ## The turn contract
 
 Every time you are woken by a message, produce these three things **in this order**:
