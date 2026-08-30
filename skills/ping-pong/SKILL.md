@@ -425,6 +425,49 @@ Two rules that make the collaboration auditable instead of merely cooperative:
 Both, with the measured incident where the relayed conclusion was exactly inverted:
 [reference/relayed-instructions.md](reference/relayed-instructions.md).
 
+## What the channel actually buys you: a second, independent observation
+
+The value of a two-agent channel is not throughput or task-splitting — it is a **second
+measurement of the same fact, from someone who did not make the first claim.** Measured, with a
+count: in one real working session — two agents, two machines, a shared repo — five confident
+claims made from memory turned out to be false, spread almost evenly across both sides. Not one
+of them was caught by the agent who said it; all five were caught by the other side, going to
+check.
+
+That rules out the comfortable reading that one agent is "the careful one." Neither is — both
+fail the same way, in the same direction (citing a source from memory that was one `grep` away),
+and what corrects it is not either agent's diligence, it is that there are **two** observations
+of the same fact and they can disagree.
+
+What follows from that:
+
+- **Anything with only one observation is not settled**, however solid it sounds. A single agent
+  measuring carefully produces a true but fragile fact; it becomes robust once the other side
+  reproduces it independently.
+- **The most dangerous claim is not the one nobody checked — it is the one ONE side measured
+  correctly and the OTHER repeated from memory a few messages later.** In the transcript it reads
+  exactly like confirmed knowledge, and it already carries the authority of having been verified
+  once.
+- **Ask for evidence in a form the peer can check against the same source**, not a form that
+  requires trusting you. `git ls-remote origin main` after a push is checkable by the peer against
+  the same server; a local HEAD hash has to be taken on faith.
+- The rule runs in both directions. A peer who only verifies what it receives and never offers
+  anything checkable of its own turns the channel into a hierarchy instead of a cross-check.
+
+### The condition that makes it work, and that disappears silently: symmetry
+
+Cross-checking came free in the measured session for a specific, non-default reason: **neither
+side had authority over the other.** In a channel with a "primary" and an "auxiliary" role — an
+orchestrator and a worker, a reviewer and the reviewed — the auxiliary keeps receiving claims but
+stops auditing them, because auditing becomes socially expensive even when it costs nothing
+technically. The failure is invisible from the outside: the channel keeps delivering messages,
+both sides keep answering, and the only thing that disappears is the second observation — which
+was the actual product.
+
+Anything that introduces rank between the two ends — a coordinator role, a skill that declares
+one side the source of truth, an instruction telling one agent to defer to the other — turns the
+mechanism off without turning the channel off.
+
 ## Several channels at once
 
 Channels are isolated by construction — separate directories, separate pipes — so nothing special is needed for two *pairs* of sessions to work in parallel: each pair opens its own channel and neither can see the other's traffic.
