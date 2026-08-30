@@ -176,6 +176,41 @@ made an early version of this flaky to reproduce. `inotifywait` run without `-q`
 `Watches established.` on stderr — that line is the actual ready signal, not a guessed
 delay.
 
+## The pending-mail guard and the drain that advances the cursor are one mechanism, not two
+
+Shipping half of this pair does not weaken the bug, it inverts it. Any hand-rolled watcher
+built on this spool needs both pieces below, and needs them changing the same cursor file.
+
+Three versions of the same pre-arm check, in the order they get tried:
+
+1. **`[ -s "$SPOOL" ]`** — "the spool has bytes" is not "there is unread mail". The spool is
+   append-only and never truncated, so this fires PENDING on every single re-arm for the rest
+   of the channel's life, even once everything in it has already been read. Symmetric with the
+   failure already named above: a full file is not new mail either, the same way an empty one
+   is not silence.
+2. **Compare against a cursor that nothing ever advances.** This looks like the fix and is
+   worse: since the cursor never moves, the reported backlog only grows, turn after turn —
+   louder than (1), and louder in the wrong direction.
+3. **Compare against a cursor that the drain step always advances on a successful read.**
+   Correct — but only if the guard and the drain are the same pipeline, not a guard that fires
+   and a separate command someone has to remember to run.
+
+```bash
+# guard, inside the watcher, before it arms
+off=$(cat "$STATE/$ID.cursor" 2>/dev/null || echo 0)
+size=$(wc -c < "$SPOOL")
+[ "$size" -gt "$off" ] && echo "PENDING $ID | $((size-off)) bytes undrained"
+
+# drain, run when the watcher wakes the session
+off=$(cat "$CUR" 2>/dev/null || echo 0); size=$(wc -c < "$SPOOL")
+[ "$size" -le "$off" ] && { echo "(nothing new)"; exit 0; }
+tail -c +$((off+1)) "$SPOOL"; printf '%s' "$size" > "$CUR"
+```
+
+**Put the drain in a script, not a command typed by hand.** As long as advancing the cursor
+depends on the agent remembering the right `tail` invocation, the guarantee lives in the
+agent's memory, not in the cursor on disk — the opposite of what a cursor is for.
+
 ## Nothing is lost if the watcher crashes
 
 The spool is append-only and the read cursor only advances on a successful drain, so a
