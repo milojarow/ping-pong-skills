@@ -643,6 +643,35 @@ systemctl --user is-active pp-keep-<channel>-<side>
 Nothing restarts a crashed keeper automatically; once you've confirmed it's down, bring it
 back with `pp --keep <id>`.
 
+### One keeper in `failed` state blanks `keeper:up` for every OTHER channel too
+
+Measured with a controlled kill: with several healthy channels open, including one
+belonging to a different session, killing a single keeper's `MainPID` doesn't just drop
+that channel's `keeper:up` marker — every channel's `keeper:up` disappears from `--list` in
+the same instant, including channels owned by other sessions entirely.
+`systemctl --user reset-failed` on the dead unit brings the other markers back, but the
+killed keeper is still dead and its own channel still correctly shows none — the display
+recovered, nothing else did.
+
+Consequences, worst first:
+
+- **A single crashed keeper anywhere on the machine reads as a global outage** in `--list`.
+- **It crosses sessions** — another session's channel can look keeper-less because of a
+  crash it had nothing to do with.
+- **The discriminator is gone.** With the marker blank everywhere, `--list` no longer says
+  *which* keeper actually died.
+
+Until this is fixed upstream, `--list`'s `keeper:up` is not the instrument for "is MY keeper
+alive" — use the direct check instead:
+
+```bash
+systemctl --user is-active pp-keep-<channel>-<side>
+```
+
+Same family as the substring-matching health-check trap earlier in this file ("no listener"
+containing the substring "listen"): a detector that fails toward "not here" instead of
+"unknown".
+
 ### A lone `<id>.inbox` for a channel that no longer exists
 
 A close triggered from inside the keeper's own unit races its own closing notice:
