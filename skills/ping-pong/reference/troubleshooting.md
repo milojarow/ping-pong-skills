@@ -416,6 +416,16 @@ error from `pp`, not as a channel fault, and not as a dead bus. Measured: six de
 row, all labeled `[killed]`, with the channel, permissions and bus all untouched the whole
 time. Check the label first; only go looking at the channel if it says something else.
 
+## `pp --list | head -N` can "prove" a channel is missing that really is not
+
+Each channel occupies **two lines** in `--list` output (the data line plus its own `topic:`
+line), on top of the header — so a `head -5` covers barely one channel and a half. Piping
+through `head` (or a narrow `grep`) to skim the list is fine; using that same truncated
+output as evidence that something is **absent** is not. A truncated instrument produces
+false absences, and a false absence sends you off to fix something that was never broken.
+Read `--list` (and `--info`) in full whenever the question is "is this here or not" — `head`
+is for glancing, not for concluding.
+
 ## Timestamps disagree by hours between the two sides
 
 Bus hosts commonly run UTC while workstations run local time. `pp` stamps every message in UTC precisely so headers are comparable. If you correlate a `pp` header against a local log, convert explicitly — do not subtract a hardcoded offset, since regions with daylight saving shift twice a year.
