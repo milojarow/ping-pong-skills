@@ -561,6 +561,35 @@ pp --listen <id> --retry
 
 ## `--keep` / `--await` failure shapes
 
+### How far behind you are is a byte count — never `mtime`
+
+Two ways to get this wrong, both measured on the same channel back to back:
+
+- **The inbox's `mtime` is not the time of the last message.** `--await` touches the inbox
+  file when it *reads* it, so the mtime advances on every read even when nothing new
+  arrived. A fresh inbox mtime next to an old-looking cursor file reads as "unread mail
+  waiting" and can just as easily mean the opposite — fully drained, just read a while ago.
+- **A file's size is not its content.** Guessing what the cursor file *says* from how many
+  bytes it *takes* is arithmetic performed on an assumption, not a measurement — two
+  different cursor values can happen to take the same number of bytes.
+
+The only correct instrument is the byte difference between the two files, read for real:
+
+```bash
+S=~/.local/state/ping-pong
+ib=$(wc -c < "$S/<channel>.inbox")
+cu=$(cat "$S/<channel>.cursor" 2>/dev/null || echo 0)
+echo "unread: $(( ib - cu )) bytes"
+```
+
+No `.cursor` file plus a 0-byte inbox means a new, untouched channel — normal, not a fault.
+To see who wrote and when without consuming anything, the headers are already sitting in
+the spool: `grep -n '^=== ping-pong' ~/.local/state/ping-pong/<channel>.inbox`.
+
+General shape of the mistake, useful beyond this one case: **a proxy that usually agrees
+with the truth (an mtime, a size) is worse than having no instrument at all**, because it
+fails exactly the first time you lean on it for something that matters.
+
 ### `--await` returns immediately with exit 3
 
 `pp: no keeper is running for <id>` — nothing writes the spool, so blocking on it would be
