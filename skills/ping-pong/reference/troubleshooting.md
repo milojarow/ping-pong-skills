@@ -452,6 +452,29 @@ Two cases `--close` cannot rescue, because there is no marker to find them by:
 
 Both have to be killed by pid. Match on the process, never with `pkill -f <pattern>` — `-f` matches every command line including the shell running your own kill command, so a self-matching pattern kills your own session.
 
+**The rule is wider than "avoid the channel id" — it is any substring that shows up in your
+own argv, whatever it is.** A harness that runs each command as a shell with the full command
+text in its own argv makes this easy to underestimate: a pattern with no `pp`, no channel id,
+and no obviously "dangerous" word in it still self-matches if any fragment of it — a port
+number, a filename, a word from a comment — happens to also appear in the very line invoking
+`pkill`. Measured three times on the same channel: the first kill used the obvious pattern
+(`pkill -f 'pp --listen pp-xxxxxx'`) and died; the third used a pattern naming *only a port
+number*, nothing about `pp` or the channel id, and it self-matched too, because the port also
+appeared in its own command line. The turn exits **144** mid-cleanup, with the work half done.
+Reading the narrow lesson ("watch out for the id") and trusting a different string is not
+protection — the mechanism does not care what the string means, only whether it appears twice.
+
+The same self-match inflates a headcount, not just a kill: `pgrep -c -f <pattern>` (or piping
+`pgrep -af` to `wc -l`) counts the shell running the `pgrep` itself as one of the matches,
+overcounting live watchers by exactly one.
+
+Two mitigations, both safe regardless of what the pattern contains:
+
+- Split the literal in the source so the full string never appears verbatim in your own argv:
+  `pkill -f 'pp-''xxxxxx'` (shell concatenation defeats the match without changing what runs).
+- Get the pid from `pgrep`, filter out your own `$$` (and its parent shell, if the harness runs
+  each command through one), and kill that pid explicitly — never by pattern.
+
 ### An orphaned listener outlives the session that started it
 
 **Fixed at the source in 0.3.0** — a listener now dies with its session, measured at roughly two seconds. What follows is why it used to happen, because the same trap catches anything else that blocks on a remote host, and because a listener started by an older build still behaves the old way.

@@ -274,6 +274,13 @@ loops (one of them 9d22h old). So:
   orphans** — the ones whose owning session cannot come back, so there is no judgement
   call to get wrong.
 
+**Killing a parked loop by hand: never `pkill -f <pattern>`, whatever the pattern names.**
+`-f` matches the full command line, including the shell that is running your own `pkill` —
+so any substring the pattern shares with the harness's own invocation line (the channel id,
+but just as easily a bare port number or any other fragment) self-matches and kills your own
+session mid-cleanup, exit 144. Kill the orphan loop by pid instead. Full detail, including
+why the narrow "avoid the id" reading is not safe: [reference/troubleshooting.md](reference/troubleshooting.md#releasing-a-listener-that-is-stuck-on-a-dead-channel).
+
 **Quiet-but-owned channels are still never closed automatically, and that is deliberate.**
 A channel is a conversation, and "no listener right now" is a *normal* state between turns.
 A rule that deleted on that heuristic would be right most times and wrong once, and the
@@ -536,6 +543,7 @@ Operations are flags; the bare argument is always the channel id. Full CLI, conf
 | Parking that same relaunch loop OUTSIDE any session instead (`setsid nohup sh -c 'while true; do pp --listen … --retry; done'`) | The opposite failure, and worse: the loop has no owner at all, so it outlives every session and re-registers the `listening-*` marker within a second of the listener exiting. The channel looks permanently healthy — a live listener suppresses `LOOKS ABANDONED` in `--list` and pulls the whole channel out of `--gc`'s report — even though the session that opened it is long dead | A bare `nohup` loop is not a cheap substitute for a supervisor. Only `systemd --user` with `Restart=always` gives the loop an owner that can be listed, stopped and reasoned about; see [reference/standing-listener.md](reference/standing-listener.md#a-loop-parked-outside-every-session-is-not-a-cheap-supervisor) |
 | Opening a firewall port so the peer can reach your inbox | Tailscale's own chain already accepts the mesh interface *before* the firewall's chains — you widened your exposure for nothing | Read the live ruleset first. The mesh needs no port opened |
 | Trusting `pp --gc` to clear a `listening-*` marker whose reader already died, because the refusal message told you to | `--gc` reaps whole stale channels, not an individual dead listener record — it reports 0 dropped and the marker stays | `pp --info <id>` for the pid + side, confirm it's dead **and yours**, then remove only that marker on the bus by hand — see [reference/troubleshooting.md](reference/troubleshooting.md) |
+| Killing a stuck listener or a parked loop with `pkill -f '<any pattern>'`, trusting that avoiding the channel id makes it safe | `-f` matches the FULL command line, including the shell running your own `pkill` — any shared substring self-matches, not just the id (measured: a pattern naming only a port number self-matched too). The turn dies at exit 144 mid-cleanup, and `pgrep -c -f`/`pgrep -af \| wc -l` overcounts live watchers by the same mechanism | Get the pid from `pgrep`, filter out your own `$$`, and kill that pid explicitly — never by pattern. See [reference/troubleshooting.md](reference/troubleshooting.md) |
 
 **A marker is evidence, not proof.** A listener whose session already ended can stay blocked on the bus for hours, marker and all. The send then *succeeds* and the message is lost into a reader nobody is watching. If a peer goes quiet right after a delivery that looked clean, suspect an orphaned listener — [reference/troubleshooting.md](reference/troubleshooting.md).
 
