@@ -559,6 +559,40 @@ pp --listen <id> --retry
 
 ---
 
+## `--keep` and `--info` on a DIRECT channel say "does not exist on the bus"
+
+Both resolve against the configured bus (`bus:<alias>`) without checking whether the channel
+is direct first — so on a channel opened with `--open --direct`, they fail with a message that
+names the wrong cause:
+
+```
+pp --keep pp-xxxxxx
+# -> pp: channel pp-xxxxxx does not exist on the bus (ssh:<alias>).
+#    Check the id, or the bus rebooted - channels live in /tmp/ping-pong...
+
+pp --info pp-xxxxxx
+# -> same error
+```
+
+The channel is fine — direct mode simply has no bus for either command to find anything on.
+The error text is actively misleading here: it reads like the bus rebooted or the id is wrong,
+neither of which is true.
+
+**Consequence for the turn contract:** SKILL.md's default path is `--keep` once, then
+`--await` per turn. Direct mode cannot follow that — the only available path today is a
+`--listen` relaunched every turn in the background, which is the fragile mode the skill itself
+warns about. `--open --direct`'s own printed output already says this correctly ("Then keep
+your listener running IN THE BACKGROUND: `pp --listen <id>`") — so the CLI's own two pieces of
+output disagree with each other depending on which command you read.
+
+**What to do today:** in direct mode, skip `--keep`/`--info` and relaunch `--listen` (ideally
+with `--retry`, since between iterations the inbox port is released and re-bound and a bare
+`--listen` does not recover from that race — see the next entry). Don't read a bus error from
+either command as evidence the channel died.
+
+The design gap and the proposed fix are tracked in `CLAUDE.md`'s known-gap section — **do not
+document `--keep`/`--info` as working in direct mode until they actually branch on it.**
+
 ## `--keep` / `--await` failure shapes
 
 ### How far behind you are is a byte count — never `mtime`

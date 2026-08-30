@@ -335,6 +335,56 @@ The shape a fix would take, in order of preference:
 implements it** — the version-chain drift this repo has already been bitten by applies here
 too: a flag documented before it ships teaches an agent to run something that does not exist.
 
+## Known gap: `--keep` and `--info` don't branch on `is_direct()`
+
+**Not built.** `cmd_keep` and `cmd_info` both call `require_channel`, which unconditionally
+runs `bus "test -p ..."` — there is no `is_direct "$id"` check at the top of either, unlike
+`cmd_close` and `cmd_listen`, which already dispatch to a `_direct` variant first. On a direct
+channel this makes both fail with "does not exist on the bus," a message that names the wrong
+cause and contradicts what `--open --direct`'s own output tells the agent to do next. Measured
+behavior and the interim workaround are documented in
+[reference/troubleshooting.md](skills/ping-pong/reference/troubleshooting.md#--keep-and---info-on-a-direct-channel-say-does-not-exist-on-the-bus).
+
+The shape a fix would take, in order of preference:
+
+- `cmd_info`: branch on `is_direct()` and print what the local machine actually knows for a
+  direct channel — peer, port, side, topic, owner, and a TCP presence check against the
+  peer's port if one is easy to add — instead of the bus query.
+- `cmd_keep`: either learn direct mode for real (a keeper equivalent that holds `nc -l` output
+  in a spool the same way the bus keeper does), or fail immediately with a message that names
+  direct mode and points at `--listen` instead of the bus's "does not exist" text.
+- Either way, `require_channel` should not be the first thing either command calls when the id
+  is direct — the dispatch has to happen before that, the same place `cmd_close` and
+  `cmd_listen` already do it.
+
+**Do not document `--keep`/`--info` as working in direct mode until one of these actually
+ships** — direct mode currently means `--listen --retry` relaunched per turn, full stop.
+
+## Known gap: direct mode has no keeper, so the event-driven watcher design has nothing to watch
+
+**Not built.** [reference/inotify-wake.md](skills/ping-pong/reference/inotify-wake.md)'s design
+starts from "the keeper writes the spool, inotify fires on the write." In direct mode there is
+no keeper (see the gap above) and therefore no spool — `<id>.direct` / `.owner` / `.side` exist
+on disk, but never `.inbox` / `.cursor`. Arming a watch on a spool that will never be created
+leaves it silent forever, which is indistinguishable from a quiet peer — the exact failure mode
+the design document warns about for a different cause.
+
+The shape a fix would take, if `--keep` is not extended to direct mode (see the gap above): a
+user-built loop that plays the keeper's role without any change to `bin/pp` — repeatedly runs
+`pp --listen <id> --retry`, appends whatever it returns to a local spool file, and emits only
+the ring (channel, sender, line count, spool path) on stdout, the same contract
+`inotify-wake.md` already asks of any watcher. Run under a harness's persistent Monitor (not a
+bare background loop — see the standing-listener gap already on file for why that matters), it
+is leashed to the session's own lifetime and never becomes the immortal loop the SKILL.md
+prohibits, and inotify becomes unnecessary because the loop already knows the instant mail
+lands. All of `inotify-wake.md`'s correctness rules still apply verbatim to this variant:
+nanosecond-named captures, drain-before-arm, notify only on non-empty, and emit on failure too
+(a non-zero `--listen` exit, or three empty 0-exit reads in a row — the signature of a second
+reader stealing delivery).
+
+**Do not document this loop as a shipped `--keep`-equivalent** — it is a pattern to build per
+session, not a flag `bin/pp` has.
+
 ## Updating this skill
 
 After any session that discovers a new failure shape. Keep entries generic — patterns and causes, never machine or client data. The git log of this repo is the diary.
