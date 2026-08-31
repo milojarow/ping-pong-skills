@@ -52,6 +52,18 @@ Each of these is backed by a measured failure, not a hypothetical one:
   glob.** That directory is typically shared by every channel/project on the same
   machine — a glob picks up traffic that belongs to a completely different, unrelated
   conversation on the same box.
+- **The watcher's own log, stderr, and capture files must live OUTSIDE the directory
+  being watched.** A watcher whose output lands inside the watched directory observes
+  itself: each line it writes is a write in that directory, which fires another event,
+  which it writes another line for. Measured: over a megabyte of self-generated event
+  lines in one second, no error anywhere, and the measurement reads as "successful" —
+  a single delivery appearing to fire thousands of events, burying the real defect
+  under the noise the instrument produced. Applies equally to a one-off measurement
+  harness and to a production watcher: if the arnés redirects `inotifywait`'s output to
+  a file, verify that file does not fall inside the spool's directory. The readiness
+  line below is the same trap in miniature — `inotifywait` without `-q` prints
+  `Watches established.` on **stderr**, and waiting for that line while stderr is
+  redirected into the watched directory makes the wait itself the cause of the loop.
 
 ## This design does not apply to a DIRECT channel as-is — there is no keeper, so no spool
 
@@ -158,6 +170,86 @@ reader advances as it drains, not in a tally of kernel wake-ups. The design that
 for free: the inotify event only WAKES the reader; the actual read drains everything past
 a stored cursor in one call and advances it — so a burst of coalesced writes still ends up
 fully delivered on the next drain.
+
+## The inverse also bites: one delivery can fire two events
+
+Coalescing is not the only surprise in the event count — the opposite direction matters
+too, and it is not written up anywhere else. If the watch subscribes to more than one
+event type (`-e close_write -e modify`), a **single** delivery fires **both**:
+
+```
+printf 'una entrega\n' >> x.inbox
+-> MODIFY x.inbox
+-> CLOSE_WRITE,CLOSE x.inbox
+   CLOSE_WRITE: 1   MODIFY: 1
+```
+
+Measured on inotify-tools 4.23.9 / ext4, with the event log kept outside the watched
+directory (see the correctness bullet above — logging inside it would make this
+indistinguishable from self-observation). Two independent sessions hit this same shape
+the same day.
+
+**Consequence:** because "is there unread mail" is checked by STATE (`size` vs cursor),
+not by counting events, no mail is actually lost — the second event just re-examines the
+same already-unread range. What it costs is a wasted wake-up: a whole turn spent going to
+read nothing, which is exactly the cost the watcher exists to avoid.
+
+**The fix needs both halves, and one of them carries almost all the weight:**
+
+1. **Subscribe only to `close_write`.** This removes the *source* of this particular
+   duplicate. It is the frailer half, and the reason has to travel with the
+   recommendation: `close_write` only fires when the writer **closes the fd**. Verified
+   against this skill's own keeper (`cmd_keep_run` does `printf '%s\n' "$out" >>
+   "$spool"`, which opens and closes per message) — but the day a writer holds the fd
+   open across multiple messages, `close_write` stops firing for it and the watcher goes
+   silent, with no error, falling back only to the poll backstop. Whoever subscribes to
+   `close_write` alone is coupling their latency to the producer's write pattern.
+2. **A pending-mail guard that also suppresses a duplicate for the same unread range** —
+   announce only if `size > max(cursor, last_announced)`. This is the half that actually
+   carries the weight: between the moment the watcher fires and the moment the agent
+   drains the spool, the cursor has not moved, so *any* second event in that window
+   re-announces the same bytes — whether it came from a second subscription or from any
+   other write nearby. Removing the duplicate subscription (1) narrows how often this
+   fires; only (2) closes it.
+
+## A dedupe guard built on "last announced size" has its own truncation hole
+
+The guard above needs a second piece of state — `last_announced` — distinct from the
+read cursor, and it inherits the exact same failure the cursor already has a documented
+fix for (see [Reopening a channel…](#reopening-a-channel-under-the-same-id-can-leave-the-cursor-pointing-past-the-new-spools-end)
+below): if the spool is truncated or replaced (`--close`, a reboot, a temp-dir purge)
+while `last_announced` still holds a value from before, a NEW delivery of the SAME size
+as the old one is silently swallowed:
+
+```
+last_announced = 11        (a prior 11-byte delivery was already announced)
+spool truncated to 0, cursor reset to 0
+new mail arrives, also 11 bytes
+size(11) > cursor(0)        -> there is unread mail
+size(11) == last_announced  -> STAYS SILENT. The message exists; nobody is told.
+```
+
+The tempting broader guard, `size > max(cursor, last_announced)`, does not close this —
+the stale `last_announced` value survives the spool reset and keeps suppressing.
+
+**Fix, one line, applied before the comparison:**
+
+```bash
+[ "$size" -lt "$last_announced" ] && last_announced=-1
+```
+
+Same reasoning `cmd_await` already applies to the cursor ("a truncated spool must not
+leave the cursor pointing past its own end") — the notify guard is a *second* piece of
+state tracking the same fact, and that half of the fix is not written anywhere the guard
+itself can find it. Any hand-rolled watcher that adds a dedupe guard on top of the
+cursor has to copy this reset for both pieces of state, not just one.
+
+**The discriminating test case:** truncate the spool, then send new mail of the SAME
+size as what was already announced. Run it against the un-patched guard and the patched
+one — silent once (wrong) vs. announced twice (right). A control built on "mail of a
+different size" is not a control at all: it passes identically whether the reset line is
+present or not, because a different size never collides with the stale value in the
+first place.
 
 ## The blind window at startup
 
