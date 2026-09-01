@@ -16,13 +16,24 @@ ping-pong-skills/
 ├── CLAUDE.md                # This file
 ├── README.md                # Project overview
 ├── LICENSE                  # MIT License
-├── evaluations/             # Test scenarios for the skill
+├── evaluations/             # Test scenarios for the skill (GREEN findability, eval-NNN.json)
+├── hooks/                   # SessionEnd hook: closes the channels this session owns
+├── tools/                   # Repo gates: check-version-chain.sh (the three version links agree)
 └── skills/
     └── ping-pong/
-        ├── SKILL.md          # Entry point: roles, turn contract, quick reference
+        ├── SKILL.md          # Entry point (router, ≤250 lines): roles, wake events, turn contract
         ├── bin/pp            # The CLI, shipped next to the skill
-        └── reference/        # protocol, pp-cli, troubleshooting
+        └── reference/        # protocol, pp-cli, direct-mode, inotify-wake, troubleshooting, …
 ```
+
+**`SKILL.md` is a router and stays under 250 lines.** Claude Code keeps only the first ~5,000
+tokens of an invoked skill across a compaction, so the operational sections (roles, wake events,
+turn contract) sit at the top and every long-form section lives in `reference/`. It was 565
+lines once; the turn contract sat past the cut and vanished after every compaction.
+
+**Repo gate:** `tools/check-version-chain.sh` must print `OK` before a release commit. It
+checks that `plugin.json`, `marketplace.json` and `PP_VERSION` in `bin/pp` agree; it stayed
+FAIL from 1.0.0 to 1.0.27 because enrichment bumps touched the manifests and never the constant.
 
 `bin/` lives **inside** the skill directory on purpose: the harness announces the skill's base directory when the skill loads, so the agent can resolve `<base>/bin/pp` without globbing a versioned plugin cache path.
 
@@ -100,6 +111,36 @@ remedy, because the skill now tells the agent not to depend on that directory at
 
 What is still **not** built: a self-check that warns when a newer build exists alongside the running
 one. `--version` makes the fact visible on demand; nothing volunteers it.
+
+## Shipped in 1.1.0: `--watch`, the send grace, and the systemd detector
+
+Three changes, each measured on the live bus with a peer on another machine before shipping:
+
+- **`--watch <id>`** — the persistent waker for a harness that streams events (Claude Code's
+  `Monitor`). One line per event (`MAIL` / `KEEPER` / `GONE` / `WATCH`), never a body; the agent
+  drains with `--await`. It implements every rule `reference/inotify-wake.md` had accumulated
+  from hand-rolled watchers: announce by spool state (size vs cursor, dedupe guard reset when the
+  spool shrinks), `close_write` only, exact spool name, pulse on keeper liveness, bus probe on a
+  slow interval, loud fallback without `inotifywait`. Measured: 4 deliveries → 4 `MAIL` events,
+  `unread` correct against the cursor each time, the peer's `--close` → the closing notice as
+  `MAIL`, then `KEEPER … inactive`, exit 2 within one pulse. Bus mode only: direct mode has no
+  keeper and therefore no spool (gap still open, below); `--watch` refuses there and names the
+  feeder loop.
+- **`--send` waits for a reader** (`PP_SEND_GRACE`, default 10 s) before refusing. The keeper's
+  reader exits on every delivery and re-attaches a moment later; measured at 5 s over ssh, and
+  the second of two back-to-back sends was refused with `has no listener` on every run. The
+  refusal message now says how long it waited.
+- **`have_user_systemd()`** reads the manager's state (`running|degraded|starting|maintenance|
+  stopping` → yes; `offline|unknown|""` → no) instead of `is-system-running`'s exit code, which
+  is 0 only for `running`. A single unrelated failed unit no longer degrades every `--keep` on
+  the box to the foreground. Verified with a stubbed `systemctl` over all six states.
+
+The skill's wake-up story changed with it: **`/loop` and `ScheduleWakeup` are not wake
+mechanisms for a channel** (a scheduled tick is polling), and the per-turn relaunch of `--await`
+is gone for anyone running a harness with a persistent Monitor. The SKILL.md was rewritten around
+that (565 → 250 lines) and the moved content lives in `reference/direct-mode.md`,
+`reference/troubleshooting.md` (safeguard recovery, resume echo, more mistakes) and
+`reference/protocol.md` (the second independent observation).
 
 ## Shipped in 0.5.0: `--listen --retry`, and the local holder no longer leaks
 
@@ -226,10 +267,15 @@ literal one-liner. **Do not document a rejection or an `--allow-empty` flag in t
 skill until the executable actually has it** — a version chain that promises a guard it
 does not ship is exactly the drift this repo has been bitten by before.
 
-## Known gap: nothing keeps a listener up for the life of a session, and nothing closes a channel when a session ends
+## Closed: a reader now survives the session's turns, a channel closes with its session, and (1.1.0) nothing is relaunched per turn
 
-**Not built.** The turn contract keeps a listener up by convention — relaunch after every
-delivery — but nothing enforces it. Three independent paths leave a side deaf with no
+**Built, in three steps:** `--keep` (the leashed keeper unit + spool + `--await`), the
+`SessionEnd` hook plus the keeper's leash (clean and dirty exits), and `--watch` (1.1.0) under a
+persistent Monitor. The design notes below are kept because they are what the implementation
+followed; the "not built" they describe is history.
+
+The turn contract used to keep a listener up by convention — relaunch after every
+delivery — and nothing enforced it. Three independent paths leave a side deaf with no
 automatic recovery: the agent simply forgets, the harness tears down the background task
 (an `/exit` choice, a Monitor timeout, teardown), or the `--retry` budget runs out. All
 three end the same way: the marker looks fine, the side is silent, and the operator has to
@@ -383,7 +429,9 @@ nanosecond-named captures, drain-before-arm, notify only on non-empty, and emit 
 reader stealing delivery).
 
 **Do not document this loop as a shipped `--keep`-equivalent** — it is a pattern to build per
-session, not a flag `bin/pp` has.
+session, not a flag `bin/pp` has. Since 1.1.0 `--watch` refuses on a direct channel with a
+message that names this feeder loop, so an agent cannot arm a watch on a spool that will never
+exist; the gap itself (a real keeper for direct mode) is unchanged.
 
 ## Known gap: local channel state inherits the process umask instead of a fixed private mode
 
@@ -407,10 +455,12 @@ The shape a fix would take, in order of preference:
 `pp` actually enforces one** — today the only correct claim is that state inherits the
 environment's umask, and the mitigation is manual.
 
-## Known gap: `have_user_systemd()` reads the manager's health, not its existence
+## Known gap (partly closed in 1.1.0): `have_user_systemd()` read the manager's health, not its existence
 
-**Not built.** `have_user_systemd()` (`bin/pp`) gates on the exit code of
-`systemctl --user is-system-running`, which is 0 only for `running`. `degraded`, `starting`,
+**The detector is fixed in 1.1.0** (state allowlist, see "Shipped in 1.1.0"). **Still open:**
+the silent foreground fallback and the tree-aware reap for a foreground keeper, described at the
+end of this section. Original diagnosis, kept for the record: `have_user_systemd()` gated on the
+exit code of `systemctl --user is-system-running`, which is 0 only for `running`. `degraded`, `starting`,
 `maintenance` and `stopping` all exit 1 even though `systemd-run --user` works fine in every
 one of those states — `degraded` in particular just means some unrelated unit is `failed`.
 Any single failed user unit anywhere on the machine, with nothing to do with `pp`, is enough

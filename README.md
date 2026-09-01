@@ -11,7 +11,8 @@ Every channel is isolated. Sessions `A <-> Z` can discuss one thing while `B <->
 ### Why this skill exists
 
 - **A blocking read is a wake-up signal.** `pp --listen` costs zero CPU and returns the instant a message lands — run as a background command, that return is what notifies the agent. No polling, no timers.
-- **A FIFO read is one-shot**, and nothing is queued. Both facts change how a session must behave: relaunch the listener *before* replying, or the peer's answer has nowhere to land.
+- **A reader that survives the turn and dies with the session.** `pp --keep` holds the reader from a session-leashed `systemd --user` unit and spools every delivery; `pp --watch`, armed once under a persistent Monitor, turns each spool write into a one-line event (`MAIL`, `KEEPER`, `GONE`) and the agent drains with `pp --await`. Nothing is relaunched per turn; nothing is polled by a timer.
+- **A FIFO read is one-shot**, and nothing is queued. With a bare listener that changes how a session must behave: relaunch it *before* replying, or the peer's answer has nowhere to land.
 - **A process blocked in `open(2)` on a FIFO holds no file descriptor**, so `fuser` and `lsof` swear nobody is listening. Presence has to be recorded explicitly, not probed.
 - **Peer-to-peer usually isn't reachable** — NAT and firewalls — so the design never tries. One reachable bus host, declared once per machine, never auto-detected.
 - **Isolation is structural**, not a naming convention: separate directories, separate FIFOs. Verified — with two channels live, delivering on one leaves the other's listener blocked at zero bytes.
@@ -57,6 +58,7 @@ pp --setup --bus-ssh <alias>    # on every other machine
 ## Requirements
 
 - `bash`, `mkfifo`, `timeout` (coreutils) on both machines and on the bus host.
+- `systemd --user` for `pp --keep`, and `inotify-tools` for `pp --watch` (without it the watcher falls back to polling, loudly).
 - Key-based ssh from every non-bus machine to the bus host. Every call runs with `BatchMode=yes` and will never prompt for a password.
 - A writable temp directory on the bus host (`/tmp` by default; override with `PP_BUS_ROOT`).
 

@@ -30,9 +30,10 @@ bus_ssh=<alias>
 | `--join` | `-j` | channel id | Registers this machine as side b of an existing channel. |
 | `--listen` | `-L` | channel id | **Blocks** until one message arrives, prints it, exits. Run it in the background. One-shot. |
 | `--keep` | `-k` | channel id | Starts a **session-leashed keeper**: a reader held from a `systemd --user` unit for as long as the owning session lives. Survives turns; cannot outlive the session. Spools everything to `<id>.inbox`. Run once, not per turn. |
-| `--await` | `-A` | channel id | **Blocks** until the spool grows past the cursor, prints exactly what is new, exits. This is the wake-up when a keeper is running. |
+| `--await` | `-A` | channel id | **Blocks** until the spool grows past the cursor, prints exactly what is new, exits. The drain, and the wake-up when no watcher is armed. |
+| `--watch` | `-W` | channel id | **Persistent waker** for a harness that streams events (Claude Code's `Monitor`): one line per event on stdout (`MAIL`, `KEEPER`, `GONE`, `WATCH`), never a message body. Needs a keeper. Announces by spool **state** (size vs cursor, with a dedupe guard that resets when the spool shrinks), subscribes to `close_write` on the exact spool name, re-checks spool + keeper every `PP_WATCH_PULSE` s and asks the bus for the channel every `PP_WATCH_PROBE` s. Exits 2 when the keeper stops or the channel is gone, 3 if the inotify stream dies. Falls back to polling, loudly, when `inotifywait` is missing. Bus mode only. |
 | `--unkeep` | — | channel id | Stops the keeper. Leaves the channel open. |
-| `--send` | `-s` | channel id | Sends a message to the other side. |
+| `--send` | `-s` | channel id | Sends a message to the other side. Checks for a reader first and waits up to `PP_SEND_GRACE` s for one to appear: a keeper's reader is down for a few seconds after every delivery while it re-attaches (measured 5 s over ssh), so the second of two back-to-back sends used to be refused. Only a refusal after the grace means nobody is reading. |
 | `--list` | `-l` | — | Open channels on the bus, with topic and which side you are. |
 | `--info` | `-i` | channel id | Channel metadata plus who currently has a listener up. |
 | `--close` | `-c` | channel id | Removes the channel from the bus and forgets it locally. |
@@ -279,7 +280,10 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 | `PP_SESSION` | walked from `$PPID` | Session identity (`claude:<pid>`). Set explicitly inside the keeper unit, where the process tree no longer reaches the agent — without it the leash would have nothing to hold. |
 | `PP_STALE_HOURS` | `24` | Silence after which an unowned, listener-less channel is called `LOOKS ABANDONED`. Does not apply to the owner-gone case, which is flagged at once. |
 | `PP_LEASH_POLL` | `15` | Seconds between the keeper's "is my session still alive?" checks. This is the worst-case delay before a dirty session death destroys the channel. |
-| `PP_AWAIT_POLL` | `1` | Seconds between `--await` spool checks. |
+| `PP_AWAIT_POLL` | `1` | Seconds between `--await` spool checks (and the `--watch` fallback poll when `inotifywait` is missing). |
+| `PP_WATCH_PULSE` | `30` | Seconds between `--watch`'s pulses: keeper liveness + a spool re-check by state. |
+| `PP_WATCH_PROBE` | `300` | Seconds between `--watch`'s bus probes ("does the channel still exist?"). A round trip, kept slow on purpose: a keeper blocked on a pipe the bus deleted looks healthy to every local check. |
+| `PP_SEND_GRACE` | `10` | Seconds `--send` waits for the peer's listener marker before refusing. Covers a keeper re-attaching right after a delivery. |
 | `PP_KEEP_ON_END` | `resume clear` | SessionEnd reasons that must **not** close this session's channels. The harness's full enum is `clear exit logout other prompt_input_exit resume`. |
 
 ## Exit codes
@@ -288,7 +292,8 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 |---|---|
 | 0 | Success. For `--listen`, a message was received and printed. |
 | 1 | Error — the message on stderr names the cause and the fix. |
-| 3 | `--await` found no keeper running — nothing will ever land in the spool. Start one with `--keep`. |
+| 2 | `--watch` stopped because the channel is over: the keeper unit is no longer active, or the channel/spool is gone. The harness's Monitor reports this as "failed (exit 2)": designed end, not a bug. |
+| 3 | `--await` found no keeper running — nothing will ever land in the spool. Start one with `--keep`. For `--watch`: the inotify stream ended; relaunch the watcher. |
 | 124 | `--listen`/`--await` with `--wait N` timed out, or a send exceeded `PP_SEND_TIMEOUT`. The channel is still open. |
 | 255 | The transport died (the ssh client itself). The channel is fine; this side could not reach the bus. |
 
@@ -301,6 +306,7 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 | `~/.local/state/ping-pong/<id>.owner` | each machine | The session that owns this side (`session=claude:<pid>`). What the leash, the SessionEnd hook and the orphan check all read. |
 | `~/.local/state/ping-pong/<id>.inbox` | each machine | The keeper's spool. Append-only; the only copy of anything that arrived while no waker was up. |
 | `~/.local/state/ping-pong/<id>.cursor` | each machine | Byte offset `--await` has already delivered. Reset to 0 if the spool is shorter than the cursor, so a truncated spool cannot silently swallow every future message. |
+| `~/.local/state/ping-pong/<id>.watch` | each machine | Written by `--watch` while it runs (`pid=`, `session=`, `since=`), removed on exit. A `.watch` whose pid is dead is a watcher that was killed hard. |
 | `pp-keep-<id>.service` | `systemd --user`, transient | The keeper. `systemctl --user status pp-keep-<id>` and `journalctl --user -u pp-keep-<id>` are where its story is. |
 | `$PP_BUS_ROOT/<id>/` | bus host | The channel: `meta`, the two FIFOs, listener markers. |
 

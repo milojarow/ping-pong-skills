@@ -1,0 +1,22 @@
+{
+  "id": "ping-pong-006",
+  "skills": [
+    "ping-pong"
+  ],
+  "query": "El Monitor me dice que 'pp --watch pp-k7m2qx' fallo con exit 2, justo despues de un evento KEEPER inactive. La otra sesion ya habia dicho que cerraba. Tengo que relanzar el watcher?",
+  "expected_behavior": [
+    "activate the ping-pong skill",
+    "explain that exit 2 after a KEEPER or GONE event is the watcher's designed end, not a crash: the peer closed the channel (or the keeper stopped)",
+    "advise NOT relaunching the watcher on a channel that is over; run pp --info if the cause is unclear; open a fresh id if the collaboration continues",
+    "distinguish exit 3 (the inotify stream died: relaunch on the same channel)"
+  ],
+  "expected_content": [
+    "exit 2",
+    "KEEPER",
+    "--info",
+    "exit 3",
+    "troubleshooting.md"
+  ],
+  "priority": "medium",
+  "notes": "The Monitor labels the designed end as 'failed'; the agent must read the last event line instead of the label."
+}

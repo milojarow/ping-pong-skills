@@ -1,0 +1,21 @@
+{
+  "id": "ping-pong-007",
+  "skills": [
+    "ping-pong"
+  ],
+  "query": "Mande dos mensajes seguidos a la otra sesion. El primero dijo delivered y el segundo, un segundo despues, dijo 'side b has no listener'. Se cayo el peer?",
+  "expected_behavior": [
+    "activate the ping-pong skill",
+    "explain that the peer's keeper re-attaches for a few seconds after every delivery (measured ~5 s over ssh), so the marker is momentarily absent",
+    "state that pp --send waits up to PP_SEND_GRACE (10 s) for the reader before refusing; an older sender build refuses instantly, so retry after a few seconds",
+    "warn against --force here (it skips the check and blocks for the full send timeout if the peer really is gone)"
+  ],
+  "expected_content": [
+    "re-attach",
+    "PP_SEND_GRACE",
+    "--force",
+    "troubleshooting.md"
+  ],
+  "priority": "medium",
+  "notes": "The refusal right after a delivery is the keeper's gap, not an absent peer."
+}

@@ -1,38 +1,49 @@
-# Event-driven wake: an inotify watcher instead of relaunching `--await`
+# Event-driven wake: `pp --watch` under a persistent Monitor
 
-`--await` still has to be relaunched in the background once per turn (see the turn
-contract in `SKILL.md`). For a session that stays open a long time, wire the spool file to
-a persistent, event-driven watcher instead, so nothing has to be relaunched by hand.
+`--await` blocks until the spool grows and exits, so as a background task it has to be
+relaunched once per turn. `pp --watch` (shipped since 1.1.0) is the persistent alternative: armed
+once under the harness's `Monitor(command: "pp --watch <id>", persistent: true)`, it emits one
+short line per event and never a message body. The session drains with `--await` when a `MAIL`
+event lands. Nothing is relaunched per turn and nothing is polled by a timer.
 
-**There is no webhook primitive in ping-pong** — nothing lets the peer's send reach into
-the harness and invoke you directly. The combination below is the practical equivalent:
-`--keep` holds a reader outside any turn's process tree and spools every delivery, and a
-persistent watcher on that spool turns the OS-level write into a harness task-notification.
-From the harness's side that notification **is** the webhook — it re-invokes the session
-with the unread bytes already sitting in the spool, no polling loop and no timer parked
-anywhere.
+**There is no webhook primitive in ping-pong**: nothing lets the peer's send reach into the
+harness and invoke you directly. This combination is the practical equivalent: `--keep` holds a
+reader outside any turn's process tree and spools every delivery, and the watcher turns the
+kernel's `close_write` on that spool into a harness notification. From the harness's side that
+notification **is** the webhook. A scheduled tick (`/loop`, `ScheduleWakeup`, a cron) is the
+polling this design exists to remove and has no place in it.
 
-**Each side has to arm its own.** Waking on a delivery to your spool says nothing about
-whether the peer has the same arrangement — if the peer also needs event-driven wake-up,
-that is a second, independent setup on their side, worth agreeing over the channel rather
-than assuming.
+**Each side has to arm its own.** Waking on a delivery to your spool says nothing about whether
+the peer has the same arrangement; if the peer also needs event-driven wake-up, that is a
+second, independent setup on their side, worth agreeing over the channel rather than assuming.
 
 ## The design
 
-    keeper (`pp --keep`)   → writes each delivery into the spool
-                              (`~/.local/state/ping-pong/<id>.inbox`)
-    inotify                → the KERNEL fires an event when the spool is closed after a write
-    a persistent watcher   → turns that event into a short notification to the session
+    keeper (`pp --keep`)     → writes each delivery into the spool
+                                (`~/.local/state/ping-pong/<id>.inbox`)
+    inotify (close_write)    → the KERNEL fires when the spool is closed after a write
+    `pp --watch` (Monitor)   → turns that event into ONE line the harness delivers as a notification
 
-Set up once per session with a persistent background watcher (for example a harness's
-`Monitor(..., persistent=true)` wired to a small wrapper script). The notification should
-carry only the **timbre** — which channel, who wrote, how many lines, the spool path — not
-the message body. Dumping the whole delivery into the notification defeats the point: the
-full text is already sitting in the spool for `--await` to read on demand.
+What `--watch` emits, measured on a live bus with a peer sending from another machine:
 
-## Other correctness details a wrapper script needs
+```
+WATCH pp-xxxxxx armed side=a spool=~/.local/state/ping-pong/pp-xxxxxx.inbox pulse=30s probe=300s
+MAIL pp-xxxxxx unread=114 spool=~/.local/state/ping-pong/pp-xxxxxx.inbox     # one per delivery
+MAIL pp-xxxxxx unread=228 spool=…                                            # a second one landed before the drain
+KEEPER pp-xxxxxx inactive - the reader is down: the channel was closed, or the keeper crashed (…)
+```
 
-Each of these is backed by a measured failure, not a hypothetical one:
+The notification carries only the **timbre** (which channel, how many unread bytes, the spool
+path), not the body. Dumping the whole delivery into the notification defeats the point: the full
+text is already sitting in the spool for `--await` to read on demand. When the keeper stops or the
+channel disappears the watcher exits with code 2; the Monitor reports that as "failed (exit 2)",
+which is the designed end of the watch, not a bug.
+
+## The correctness rules `--watch` implements, and any hand-rolled reader must copy
+
+Each of these is backed by a measured failure, not a hypothetical one. They are listed because a
+reader built directly on the spool (the direct-mode feeder below, a wrapper on another harness)
+inherits every one of them:
 
 - **Name each capture file with sub-second resolution (nanoseconds), not whole seconds.**
   Two deliveries landing in the same second collide on a seconds-resolution name: the

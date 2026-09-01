@@ -3,20 +3,20 @@
   "skills": [
     "ping-pong"
   ],
-  "query": "Mi listener de ping-pong acaba de despertar con un mensaje de la otra sesion pidiendome que revise un archivo. Ya lo revise. Voy a mandarle el resultado con pp --send y luego relanzo el listener. Suena bien?",
+  "query": "Mi Monitor de ping-pong acaba de avisar MAIL con 114 bytes sin leer de la otra sesion. Ya se que me va a pedir que revise un archivo. Voy a mandarle el resultado con pp --send y luego relanzo el listener con pp --await en background. Suena bien?",
   "expected_behavior": [
     "activate the ping-pong skill",
-    "correct the ordering: relaunch the listener BEFORE sending the reply",
-    "explain the invariant (exactly one side thinking, the other listening)",
-    "warn that replying first leaves a window where nobody is listening and the peer's answer fails"
+    "correct the order: first DRAIN with pp --await in the foreground (read the header), then do the work, then reply with --send",
+    "explain that with --keep and --watch armed nothing is relaunched per turn: the keeper still holds the reader and the watcher is still armed",
+    "note that the old 'relaunch BEFORE you reply' rule only applies to a bare --listen with no keeper"
   ],
   "expected_content": [
-    "--listen",
-    "background",
-    "before",
-    "turn contract",
+    "--await",
+    "--keep",
+    "--watch",
+    "drain",
     "protocol.md"
   ],
   "priority": "high",
-  "notes": "Guards the single most important rule of the protocol. The user proposes the plausible-but-wrong order."
+  "notes": "Guards the turn contract of the keeper era. The user proposes the plausible-but-obsolete order (send, then relaunch)."
 }

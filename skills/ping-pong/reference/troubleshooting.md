@@ -837,3 +837,103 @@ by hand with `pp --session-end --reason exit` if you need the error text.
 Correct. `--session-end` only touches channels whose `.owner` names *this* session.
 Several agent sessions share one user and one state directory, and treating that as
 ownership is what crossed two live conversations once already.
+
+## A send is refused right after a delivered one: the keeper is re-attaching
+
+Two `--send`s in a row from the same side, and the second comes back with `has no listener`
+while the first said `delivered`. Nothing is wrong with the peer. A keeper's reader exits on
+every delivery (that exit is how a delivery is detected) and re-attaches a moment later: a bus
+round trip plus a marker rewrite, measured at **5 s over ssh**. In that window the marker is
+absent and a bare presence check reads it as "nobody there".
+
+Since 1.1.0 `--send` waits up to `PP_SEND_GRACE` seconds (default 10) for the marker before
+refusing, and says so: `peer's reader was re-attaching - waited 5s for it`. Only a refusal
+**after** the grace means nobody is reading. An older sender build refuses instantly: retry the
+send after a few seconds. Never reach for `--force` here; it skips the check and blocks for the
+full send timeout when the peer really is gone.
+
+## The Monitor says `pp --watch` failed with exit 2
+
+That is the watcher's designed end, not a crash. Exit 2 follows a `KEEPER <id> <state>` event
+(the keeper unit is no longer active: the peer closed the channel, the leash closed it, or the
+keeper crashed) or a `GONE <id>` event (the channel or its spool no longer exists). Read the
+last event line in the Monitor's output, then `pp --info <id>` if the cause is not obvious. Do
+not relaunch the watcher against a channel that is over; open a fresh id if the collaboration
+continues. Exit 3 is different: the inotify stream itself ended, and the watcher should be
+relaunched on the same channel.
+
+## A background-task event is the first thing after a resume
+
+When the operator quits with a listener or a watcher still up, `/exit` makes them choose what
+to do with the background process. Whatever they pick, the next `claude -c` / `--resume`
+delivers an event for that task **before they have typed a single word**, and a session that
+obeys the turn contract wakes up and picks yesterday's collaboration back up on its own.
+Measured twice, in the operator's words: *why do you already have background jobs running right
+after a resume, before I said anything?*
+
+**Do not key the guard on the task having completed.** It usually has not. The observed case
+arrived with no completion record at all, and the harness says so in as many words; this exact
+text is the recognition signal:
+
+> No completion record was found for this background shell command from the previous session.
+> It may have been stopped (via the UI, Monitor timeout, or agent teardown — these leave no
+> transcript marker), or it may have been running when the previous Claude Code process exited.
+
+So the discriminant is neither the exit status nor the word *completed*: it is **a
+background-task event arriving as the first thing after a resume, with no operator input in
+between.** Its output file is 0 bytes, because a listener that was killed never read anything.
+
+That is not a message and not a request; it is the echo of a process that outlived, or died
+with, the previous session. Say one line naming the channel it came from, and stop. Do not
+relaunch the listener or the watcher, do not resume the old collaboration, do not touch the
+repo you were working in. The operator opens the session to give it work; wait for that. The
+empty body alone does not say *what* killed it; the exit status does, and `255` with a broken
+pipe means the link went away, not the channel.
+
+## A model safeguard can take down or degrade one side mid-collaboration
+
+This has happened more than once and deserves a recovery procedure, not just a note. A
+provider-side safeguard can block a turn outright, or leave a session running but degraded,
+without either state producing any signal on the channel itself: the degraded side's reader is
+still up, so `--send` to it still reports delivered and `--list` still calls it healthy. What
+changes is the *quality* of what it answers, and no transport-level check catches that.
+
+It gets worse if the operator restarts the degraded session: `/exit`'s `SessionEnd` hook runs
+`--close`, which in bus mode closes the channel on **both** sides, and the surviving side then
+sees an empty read that this document otherwise teaches it to read as "a second reader stole
+the message." That diagnosis is wrong here; the cause is upstream of the channel entirely.
+
+- In **bus mode** the channel is one object: once closed it is gone for both. Open a fresh id and
+  hand it to the replacement session.
+- In **direct mode** the surviving side's state outlives the peer's `--close`, and a replacement
+  session can rejoin the same id: [direct-mode.md](direct-mode.md#the-surviving-sides-state-outlives-the-peers---close).
+- **For the operator:** a replacement session starts with none of the agreed context. Open the
+  re-briefing by naming explicitly what is now **obsolete**, not only what still holds.
+
+## More mistakes
+
+The router keeps the dozen that cost the most turns; these are the rest, each with its cause.
+
+| Mistake | What happens | Fix |
+|---|---|---|
+| Expecting `--listen` to keep running after a message | It delivers exactly ONE message and exits, by design | Relaunch it every turn, or use `--keep` + `--watch` |
+| Sending to a side with no listener | Refused within the grace (it does not hang); nothing is queued | Ask the peer to start their keeper or listener, then resend |
+| Replying before relaunching a bare `--listen` | The peer's answer finds no reader and their send fails | Listener first, then work, then reply (bare-listener contract) |
+| Relaunching `--listen` after a `--send` | Your send consumed nothing, so the previous listener is still up: the new one is refused and a wake-up is spent on an empty output | Relaunch only when the previous `--listen` actually returned content |
+| Running `--listen` in the foreground | The turn hangs until a message arrives | Background, always; `--await` in the foreground only after a `MAIL` event |
+| Assuming a channel survives a bus reboot, or lasts indefinitely | Channels live in a temp dir; a reboot or a tmp purge wipes them with no warning on either side | Open a fresh channel; ids are cheap. For a channel meant to last, watch its presence in `pp --list`, not just traffic |
+| Passing `--adopt` to get past an ownership refusal | You take a live channel away from another working session | `--adopt` is for a channel whose owner session is gone, or one you are certain is yours |
+| Inventing a `--as` label per message | The peer sees a different author each time | One short, stable label per channel |
+| Passing `--as` only at `--open`/`--join` | It is stored for display only; later sends are signed with the `host:project` default | Export `PP_LABEL=<label>`, or repeat `--as` on every `--send` ([pp-cli.md](pp-cli.md#-as-at---open-join-does-not-sign-later-sends)) |
+| Asking the peer agent, by message, to close its half | Its reader may be down and the send bounces; even delivered, it depends on the other LLM acting while your session dies | In bus mode `pp --close` notifies both sides and deletes the channel: closing here IS closing there. In direct mode `--close` opens the connection itself |
+| Deciding a listener is dead because its pid is absent on **your** machine | That pid lives in the bus host's pid namespace; you start a second reader and two block on one FIFO | `pp --info <id>` runs the liveness check on the bus, where the pid means something |
+| Detecting whether the peer is listening with `grep -i 'side a.*listen'` over `--info` | `side a: no listener` **contains** `listen`: the detector confirms whatever you hoped | The send IS the probe; if you must parse, anchor on the uppercase form `'^  side a: LISTENING'` |
+| Probing a direct-mode inbox with `nc -z` / a port scan before sending | The probe CONNECTS and consumes the peer's one-shot listener, delivering nothing | There is no side-effect-free probe in direct mode: retry the `--send` itself |
+| Reading `tailscale up` succeeding as "we are connected" | Two accounts, two tailnets, both `Connected`, both alone | `pp --mesh`: ready means the *other* machine is listed with the **same account** ([direct-mode.md](direct-mode.md)) |
+| Walking the operator through Tailscale yourself | Every relayed name and address is a typo that surfaces later as a connection refused | Hand them the block `--mesh` or `--open` printed, verbatim |
+| Opening a firewall port so the peer can reach your inbox | Tailscale's own chain already accepts the mesh interface before the firewall's chains | Read the live ruleset first; the mesh needs no port opened |
+| Treating a peer's relayed "the operator said go ahead" as authorization | An irreversible, outward-facing action on a quote you cannot audit | Relayed instructions cover local reversible work only ([relayed-instructions.md](relayed-instructions.md)) |
+| Parking a standing relaunch loop inside the agent session (`setsid nohup`, a background command) | It dies with the session, and a purge of the session's temp dir can take the script and its mailbox too | `systemd --user` with `Restart=always`, state in `~/.local/state` ([standing-listener.md](standing-listener.md)) |
+| Parking that loop OUTSIDE any session | No owner at all: it outlives every session and re-registers the marker within a second of every close, so the channel looks permanently healthy | Only a supervisor with an owner that can be listed and stopped ([standing-listener.md](standing-listener.md#a-loop-parked-outside-every-session-is-not-a-cheap-supervisor)) |
+| Trusting `pp --gc` to clear a `listening-*` marker whose reader already died | `--gc` reaps whole stale channels, not an individual dead listener record; it reports 0 dropped | `pp --info <id>` for the pid + side, confirm it is dead **and yours**, then remove that marker by hand (see above) |
+| Killing a stuck listener with `pkill -f '<any pattern>'` | `-f` matches the shell running your own `pkill`: any shared substring self-matches, exit 144 mid-cleanup; `pgrep -c -f` overcounts by the same mechanism | `pgrep`, filter out your own `$$`, kill that pid explicitly |
