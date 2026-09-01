@@ -49,7 +49,9 @@ other. Everything else is yours.
 - A channel misbehaves: a send is refused, no event ever fires, ids to list or close.
 
 **Not for:** subagents you spawned (the Agent tool), sessions the harness already lists as
-reachable peers (see below), or shipping files (`scp` / a CDN; ping-pong carries text).
+reachable peers (see below), or shipping files (`scp` / a CDN; ping-pong carries text). If
+the task is two sessions co-editing the SAME file, use the channel to coordinate but let
+git carry the content: [reference/shared-file-coedit.md](reference/shared-file-coedit.md).
 
 ## Before you open a channel: check the native path
 
