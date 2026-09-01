@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="1.0.0"
+PP_VERSION="1.1.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -40,6 +40,13 @@ PP_LEASH_POLL="${PP_LEASH_POLL:-15}"
 # primitive that also EXITS on new data, and 1s of latency is invisible next to
 # a turn.
 PP_AWAIT_POLL="${PP_AWAIT_POLL:-1}"
+# --watch: keeper liveness + spool re-check every PULSE seconds; channel presence
+# asked on the BUS every PROBE seconds (a round trip - slow on purpose).
+PP_WATCH_PULSE="${PP_WATCH_PULSE:-30}"
+PP_WATCH_PROBE="${PP_WATCH_PROBE:-300}"
+# --send: seconds to wait for the peer's listener marker before refusing - covers
+# the moment a keeper's reader is re-attaching right after a delivery.
+PP_SEND_GRACE="${PP_SEND_GRACE:-10}"
 # SessionEnd reasons that must NOT close this session's channels. Measured enum
 # in the harness: clear, exit, logout, other, prompt_input_exit, resume.
 #   resume - the session is coming back and must find its channels.
@@ -254,9 +261,16 @@ keeper_unit()   { printf 'pp-keep-%s-%s' "$1" "${2:-x}"; }
 # cmd_keep_run is what supplies the second half. Absent it, --keep still works,
 # but only for the length of one turn; say so rather than pretending.
 have_user_systemd() {
-  command -v systemd-run >/dev/null 2>&1 &&
-  command -v systemctl >/dev/null 2>&1 &&
-  systemctl --user is-system-running >/dev/null 2>&1
+  command -v systemd-run >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1 || return 1
+  # `is-system-running` answers HEALTH, not existence: it exits 0 only for
+  # `running`, and `degraded` (one unrelated failed unit anywhere) exits 1 while
+  # `systemd-run --user` works fine. Gating on the exit code made a single failed
+  # unit degrade every --keep on the box to the foreground, silently. Only the
+  # states that mean "no user manager here" are a no.
+  case "$(systemctl --user is-system-running 2>/dev/null | tr -d '[:space:]')" in
+    running|degraded|starting|maintenance|stopping) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 keeper_state() {
@@ -1312,6 +1326,133 @@ cmd_await() {
   done
 }
 
+# ---------------------------------------------------------------------- watch
+#
+# --await still has to be relaunched every turn: it exits on delivery, and a
+# background task is reaped when the turn closes. --watch is the persistent
+# waker for a harness that can stream EVENTS from a long-running process (Claude
+# Code's Monitor tool). It never prints a message body: it emits one short line
+# per event on stdout, and the agent drains the spool with --await when it wakes.
+#
+#   MAIL   <id> unread=<bytes> spool=<path>   new bytes past the read cursor
+#   KEEPER <id> <state>                       the keeper unit is no longer active
+#   GONE   <id> ...                           the channel/spool no longer exists
+#   WATCH  <id> armed|stopped ...             lifecycle, for the operator's log
+#
+# Each rule below was paid for by a measured failure (reference/inotify-wake.md):
+#   - unread bytes at arm time are announced at once (the blind window)
+#   - subscribe to close_write only, filtered by the EXACT spool name - the state
+#     dir is shared by every channel on the machine
+#   - announce only when size > max(cursor, last_announced); the cursor is re-read
+#     from disk on every event because --await advances it; both are reset when
+#     the spool shrinks (truncated or recreated)
+#   - diagnostics go to stderr, never to a file inside the watched directory
+#   - the event source is a wake-up, not the truth: a pulse re-checks the spool by
+#     STATE and the keeper's liveness every PP_WATCH_PULSE seconds, and asks the
+#     bus whether the channel still exists every PP_WATCH_PROBE seconds (that one
+#     costs a round trip - keep it slow)
+#   - no inotifywait: say so loudly, then poll on PP_AWAIT_POLL rather than sit
+#     silently armed on nothing
+cmd_watch() {
+  local id="$1"
+  is_direct "$id" && die "--watch needs a keeper's spool, and DIRECT mode has no keeper.
+    Run the feeder loop from the skill's reference/inotify-wake.md under the
+    harness's persistent Monitor instead (pp --listen $id --retry, appended to a
+    spool, one line per delivery)."
+  need_config
+  valid_id "$id" || die "invalid id: '$id'"
+  local side; side=$(my_side "$id")
+  require_channel "$id"
+
+  case "$(keeper_state "$id")" in
+    active|activating) : ;;
+    unsupported) die "no user systemd here, so no keeper unit to watch. Use --await per turn." ;;
+    *) die "no keeper is running for $id - nothing will ever land in the spool.
+    Start it first, then watch:  pp --keep $id && pp --watch $id" ;;
+  esac
+
+  local spool cursor; spool=$(spool_file "$id"); cursor=$(cursor_file "$id")
+  local sname; sname=$(basename "$spool")
+  mkdir -p "$STATE_DIR"; touch "$spool"
+
+  local wf="$STATE_DIR/$id.watch"
+  printf 'pid=%s\nsession=%s\nsince=%s\n' "$$" "$(session_id)" "$(date -u +%FT%TZ)" > "$wf"
+
+  local last=-1 inw=""
+  cleanup_watch() {
+    [ -n "$inw" ] && kill "$inw" 2>/dev/null
+    rm -f "$wf"
+  }
+  trap 'cleanup_watch' EXIT INT TERM HUP
+
+  # By STATE, never by event count: inotify coalesces bursts and a subscription
+  # can fire twice for one delivery, so the decision is always size vs cursor.
+  announce() {
+    local size cur
+    size=$(stat -c %s "$spool" 2>/dev/null) || { say "GONE $id spool removed ($spool) - the channel was closed"; return 2; }
+    cur=$(tr -dc '0-9' < "$cursor" 2>/dev/null); [ -n "$cur" ] || cur=0
+    [ "$size" -lt "$cur" ] && cur=0          # truncated/recreated spool: cursor is stale
+    [ "$size" -lt "$last" ] && last=-1       # same for the dedupe guard - both, not one
+    if [ "$size" -gt "$cur" ] && [ "$size" -gt "$last" ]; then
+      say "MAIL $id unread=$((size - cur)) spool=$spool"
+      last=$size
+    fi
+    return 0
+  }
+
+  local probe_every=$(( PP_WATCH_PROBE / PP_WATCH_PULSE )); [ "$probe_every" -ge 1 ] || probe_every=1
+  local pulses=0
+  pulse() {
+    local st; st=$(keeper_state "$id")
+    case "$st" in
+      active|activating) : ;;
+      *) say "KEEPER $id $st - the reader is down: the channel was closed, or the keeper crashed (journalctl --user -u $(keeper_unit "$id" "$side"))"; return 2 ;;
+    esac
+    pulses=$((pulses + 1))
+    if [ $((pulses % probe_every)) -eq 0 ]; then
+      if [ "$(bus "[ -d '$BUS_ROOT/$id' ] && echo yes || echo no" 2>/dev/null | tr -d '[:space:]')" = "no" ]; then
+        say "GONE $id - the channel is no longer on the bus ($(bus_label)); the keeper may still look active for a while"
+        return 2
+      fi
+    fi
+    announce
+  }
+
+  say "WATCH $id armed side=$side spool=$spool pulse=${PP_WATCH_PULSE}s probe=${PP_WATCH_PROBE}s"
+  announce || exit 2
+
+  local rc f
+  if command -v inotifywait >/dev/null 2>&1; then
+    exec 3< <(inotifywait -m -q -e close_write --format '%f' "$STATE_DIR" 2>&1)
+    inw=$!
+    while :; do
+      if read -t "$PP_WATCH_PULSE" -r -u 3 f; then
+        [ "$f" = "$sname" ] || continue
+        announce || exit 2
+      else
+        rc=$?
+        if [ "$rc" -le 128 ]; then
+          say "WATCH $id stopped - the inotify stream ended (rc=$rc): relaunch the watcher"
+          exit 3
+        fi
+        pulse || exit 2
+      fi
+    done
+  else
+    note "inotifywait not found - falling back to polling the spool every ${PP_AWAIT_POLL}s"
+    local waited=0
+    while :; do
+      sleep "$PP_AWAIT_POLL"
+      announce || exit 2
+      waited=$((waited + PP_AWAIT_POLL))
+      if [ "$waited" -ge "$PP_WATCH_PULSE" ]; then
+        waited=0
+        pulse || exit 2
+      fi
+    done
+  fi
+}
+
 cmd_send() {
   local id="$1" body="$2" label="$3" force="$4" adopt="$5"
   is_direct "$id" && { cmd_send_direct "$id" "$body" "$label" "$adopt"; return $?; }
@@ -1324,13 +1465,24 @@ cmd_send() {
 
   if [ "$force" != "1" ]; then
     local peer; peer=$(bus_listener_state "$id" "$out")
+    # A keeper's reader is down for a moment after every delivery: --listen exits
+    # on the message and the keeper re-attaches (a bus round trip, a marker
+    # rewrite). Two sends in a row therefore landed one delivered, one REFUSED -
+    # measured. "No listener" right after a delivery is that gap, not an absent
+    # peer, so wait a bounded grace for the marker before refusing.
+    local grace=0
+    while [ "$peer" = "none" ] && [ "$grace" -lt "$PP_SEND_GRACE" ]; do
+      sleep 1; grace=$((grace + 1))
+      peer=$(bus_listener_state "$id" "$out")
+    done
+    [ "$grace" -gt 0 ] && [ "$peer" = "live" ] && note "peer's reader was re-attaching - waited ${grace}s for it"
     [ "$peer" = "stale" ] && die "side $out of channel $id has a STALE marker: it claims a listener, but that process is dead.
     Its session was killed hard, so the cleanup trap never ran. Delivering into it
     would look like success and lose the message.
     Clear it and try again:  pp --gc"
-    [ "$peer" = "live" ] || die "side $out of channel $id has no listener.
+    [ "$peer" = "live" ] || die "side $out of channel $id has no listener (waited ${grace}s for one to appear).
     A send with no reader blocks until the timeout, so it was not attempted.
-    Ask the other session to run:  pp --listen $id
+    Ask the other session to run:  pp --listen $id   (or pp --keep $id)
     If you know it IS listening without pp (a raw cat leaves no marker), retry with:
       pp --send $id --force -m ...
     Note: --force blocks up to ${SEND_TIMEOUT}s and exits 124 if nobody reads."
@@ -1804,6 +1956,8 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   STAYING UP FOR A WHOLE SESSION (what --listen alone cannot do):
 
   pp --keep <id>                  hold a reader for as long as THIS session lives
+  pp --watch <id>                 persistent waker: one line per EVENT, never a body
+                                  (run it under the harness's Monitor; needs --keep)
   pp --await <id>                 BLOCK until new mail is in the spool, print, exit
   pp --unkeep <id>                stop the keeper, leave the channel open
 
@@ -1815,6 +1969,10 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   a parked `while true` loop does. Everything it receives lands in a spool, and
   --await is what wakes the agent from there. Forgetting to relaunch --await
   costs a notification, not a message.
+
+  --watch removes the relaunching too: armed ONCE under a persistent Monitor, it
+  emits MAIL / KEEPER / GONE lines as events and the agent drains with --await.
+  Nothing has to be relaunched per turn and nothing is ever polled by a timer.
 
   DIRECT MODE (no bus, no shell): both devices on a private mesh talk peer to
   peer over TCP. Your inbox is a port on YOUR machine, bound to the mesh
@@ -1849,9 +2007,11 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   Env: PP_BUS_ROOT (default /tmp/ping-pong), PP_SEND_TIMEOUT (60),
        PP_LABEL, PP_SIDE (force side a|b), PP_SESSION (override session identity),
        PP_STALE_HOURS (24), PP_LEASH_POLL (15), PP_AWAIT_POLL (1),
+       PP_WATCH_PULSE (30), PP_WATCH_PROBE (300), PP_SEND_GRACE (10),
        PP_KEEP_ON_END (SessionEnd reasons that do NOT close: "resume clear").
 
-  GOLDEN RULE: after receiving a message, relaunch --listen BEFORE you reply.
+  GOLDEN RULE: after being woken, DRAIN with --await, do the work, then reply.
+  With a bare --listen (no keeper) relaunch it BEFORE you reply instead.
   A channel belongs to the SESSION that opened or joined it, not to the machine.
 EOF
 }
@@ -1876,6 +2036,7 @@ while [ $# -gt 0 ]; do
     --keep-run) op="keep-run" ;;
     --unkeep) op="unkeep" ;;
     -A|--await) op="await" ;;
+    -W|--watch) op="watch" ;;
     --close-abandoned) close_abandoned=1; [ -z "$op" ] && op="gc" ;;
     --session-end) op="session-end" ;;
     --reason) shift; reason="${1:-}" ;;
@@ -1930,6 +2091,10 @@ case "$op" in
   await)
     [ -n "$id" ] || die "--await needs the channel id"
     cmd_await "$id" "$wait_for"
+    ;;
+  watch)
+    [ -n "$id" ] || die "--watch needs the channel id"
+    cmd_watch "$id"
     ;;
   adopt) [ -n "$id" ] || die "--adopt needs the channel id"; cmd_adopt "$id" "$label" ;;
   open)
