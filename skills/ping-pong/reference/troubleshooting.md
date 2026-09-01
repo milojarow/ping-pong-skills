@@ -658,6 +658,44 @@ case above), the manager stays `degraded` on that machine and `--keep` has no pa
 background mode until the CLI itself stops trusting the exit code — see the known-gap entry in
 `CLAUDE.md` for the fix that has not shipped.
 
+**Why the fallback is worse than it looks once it's already foreground:**
+
+- The `no user systemd here - running the keeper in the FOREGROUND` note goes to stdout. A
+  harness that runs `--keep` in the background and doesn't read that stream never sees it — the
+  operator just sees a `--keep` call that appears to hang for minutes.
+- The foreground keeper still opens a real reader on the bus, so `pp --info` reports
+  `LISTENING` — which reads as health and hides that the background mode was never installed.
+- Sending `TERM` to the foreground keeper's own pid does not clean it up. The main loop is
+  blocked inside a command substitution (`out=$(cmd_listen ...)`) waiting on a child `ssh`;
+  a shell does not act on a trap until the command it's substituting returns, so the `TERM`
+  is deferred indefinitely while that child blocks. The keeper's relaunch loop then starts a
+  new reader on top of the one still shutting down, and the old `ssh` can end up orphaned and
+  reparented to init — still holding the `listening-<side>` marker. The next `pp --keep` on
+  that channel sees a live listener and refuses to install anything, which looks like the same
+  bug recurring but is actually leftover state from the failed kill.
+
+**Reaping a foreground keeper that won't die to `TERM`** — by process tree, never `pkill -f`
+with the channel id (see [pkill -f self-match](#releasing-a-listener-that-is-stuck-on-a-dead-channel)
+for why that can kill your own shell instead):
+
+```bash
+pgrep -P <keeper-pid>              # direct children of the foreground keeper
+pgrep -P <child-pid>                # and their children, if any — walk the tree
+kill -9 <grandchildren> <children> <keeper-pid>   # by pid, leaves first
+
+# then hunt for an ssh orphaned by the failed TERM, holding the marker:
+pgrep -f 'ping-pong/<id>' | while read -r p; do
+  read -r cmd < "/proc/$p/cmdline" 2>/dev/null
+  case "$cmd" in ssh*) echo "$p" ;;   # confirm via /proc before killing — pgrep -f alone
+esac; done                            # can list unrelated matches too
+kill -9 <confirmed-ssh-pid>
+```
+
+Only retry `pp --keep <id>` once the tree and the marker are both gone. **Control that catches
+a regression here:** `systemctl --user reset-failed <unit> && pp --keep <id>` must install a
+real unit and exit 0; with the unrelated unit left in `failed`, `pp --keep` must exit non-zero
+with a diagnosis pointing at `systemctl --user --failed` — it must never sit there looking hung.
+
 ### How far behind you are is a byte count — never `mtime`
 
 Two ways to get this wrong, both measured on the same channel back to back:

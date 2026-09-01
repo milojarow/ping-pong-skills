@@ -429,10 +429,23 @@ The shape a fix would take:
   the same ask-vs-attempt distinction already applied elsewhere in this file's troubleshooting
   entries (see the `--info` substring-match gap in
   [reference/troubleshooting.md](skills/ping-pong/reference/troubleshooting.md#the-probe-is-the-cheap-attempt-not-a-parse-of---infos-status--and-no-listener-contains-listen)).
+- `--keep` should never fall back to foreground silently. Today a false negative from
+  `have_user_systemd()` degrades to foreground with only a stdout note — invisible to any
+  harness that backgrounds the call — and the foreground reader still satisfies `--info`, so
+  the fallback reads as health instead of failure. The fix is to make foreground an explicit
+  opt-in (a `--keep --foreground` flag) and have the silent-fallback path exit non-zero with
+  the `systemctl --user --failed` diagnosis instead of just proceeding.
+- Neither `--unkeep` nor `--gc` currently knows how to reap a *foreground* keeper by its
+  process tree — only the systemd-unit path is torn down automatically. A foreground keeper
+  killed by `TERM` alone can leave a relaunched reader and an orphaned `ssh` behind (measured
+  and documented as a manual recipe in
+  [reference/troubleshooting.md](skills/ping-pong/reference/troubleshooting.md#--keep-falls-back-to-foreground-even-though-systemctl---user-list-units-shows-plenty-running)).
+  A tree-aware reap belongs in `--unkeep`/`--gc` itself, not left as a manual `pgrep -P` walk.
 
-**Do not document `--keep` as tolerating a `degraded` user manager until `have_user_systemd()`
-actually accepts that state** — today a single unrelated failed unit can degrade `--keep` on
-that machine permanently.
+**Do not document `--keep` as tolerating a `degraded` user manager, a `--keep --foreground`
+flag, or a tree-aware `--unkeep`/`--gc` until each actually ships** — today a single unrelated
+failed unit can degrade `--keep` on that machine permanently, the fallback is silent, and
+cleaning up a stuck foreground keeper is a manual process-tree walk.
 
 ## Updating this skill
 
