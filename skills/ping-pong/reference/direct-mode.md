@@ -68,8 +68,8 @@ Exactly one tailnet must own both devices. Two ways to get there, both fine:
 
 - **Pre-auth key** (fewer moving parts): the host mints one at
   `login.tailscale.com/admin/settings/keys` and sends it; the partner runs
-  `sudo tailscale up --auth-key=<key>`. One command, no URL relay. It is a secret: single-use,
-  short expiry. There is **no CLI subcommand and no MCP** that mints a key, so do not go looking
+  `sudo tailscale up --auth-key=<key>`. One command, no URL relay. Treat the key as a secret
+  (single-use, short expiry). There is **no CLI subcommand and no MCP** that mints a key, so do not go looking
   for one: it is the console or the REST API, and for a one-off hand-over the console is strictly
   cheaper. Contract and body nesting in [pp-cli.md](pp-cli.md).
 - **URL relay**: the partner runs `sudo tailscale up` and sends the printed URL to the **host**,
@@ -113,8 +113,8 @@ connection will be dropped. It is wrong. Tailscale installs its own `ts-input` c
 kernel's input hook jumps to **before** the firewall's chains, containing an unconditional accept
 for the mesh interface; verified in a live ruleset, with matching packet counters. Read the
 ruleset before opening a port you did not need to open. The corollary is worth stating to the
-operator: everything already listening on `0.0.0.0` is reachable from the mesh, so `ss -tln` is
-the honest disclosure to make to a partner before they join.
+operator: everything already listening on all interfaces (the wildcard address in `ss -tln`) is
+reachable from the mesh, so that listing is the honest disclosure to make to a partner before they join.
 
 ## The surviving side's state outlives the peer's `--close`
 
