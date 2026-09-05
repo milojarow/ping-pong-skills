@@ -405,7 +405,7 @@ pp --send pp-k7m2qx < /path/to/message.txt
 
 ## The whole turn hangs
 
-`--listen` was run in the **foreground**. It is supposed to block; that is the wake-up mechanism. It must run as a background command so the session stays responsive and the harness notifies you on arrival.
+`--listen` was run in the **foreground**. It is supposed to block; that is the wake-up mechanism. In Claude Code it must run as a background command so the session stays responsive and the harness notifies you on arrival; a harness with no persistent Monitor (Codex, Grok) runs it in the foreground with `--wait N`, bounded, only when told to wait.
 
 ## A background listener died with no `pp`-level error to read
 
