@@ -28,7 +28,7 @@ bus_ssh=<alias>
 |---|---|---|---|
 | `--open` | `-o` | — | Creates a channel, prints the id and the line to hand over. You become side a. |
 | `--join` | `-j` | channel id | Registers this machine as side b of an existing channel. |
-| `--listen` | `-L` | channel id | **Blocks** until one message arrives, prints it, exits. Run it in the background. One-shot. |
+| `--listen` | `-L` | channel id | **Blocks** until one message arrives, prints it, exits. Run it in the background (Claude Code). A harness with no persistent Monitor (Codex, Grok) runs it in the foreground with `--wait N` instead, only when told to wait. One-shot. |
 | `--keep` | `-k` | channel id | Starts a **session-leashed keeper**: a reader held from a `systemd --user` unit for as long as the owning session lives. Survives turns; cannot outlive the session. Spools everything to `<id>.inbox`. Run once, not per turn. |
 | `--await` | `-A` | channel id | **Blocks** until the spool grows past the cursor, prints exactly what is new, exits. The drain, and the wake-up when no watcher is armed. |
 | `--watch` | `-W` | channel id | **Persistent waker** for a harness that streams events (Claude Code's `Monitor`): one line per event on stdout (`MAIL`, `KEEPER`, `GONE`, `WATCH`), never a message body. Needs a keeper. Announces by spool **state** (size vs cursor, with a dedupe guard that resets when the spool shrinks), subscribes to `close_write` on the exact spool name, re-checks spool + keeper every `PP_WATCH_PULSE` s and asks the bus for the channel every `PP_WATCH_PROBE` s. Exits 2 when the keeper stops or the channel is gone, 3 if the inotify stream dies. Falls back to polling, loudly, when `inotifywait` is missing. Bus mode only. |

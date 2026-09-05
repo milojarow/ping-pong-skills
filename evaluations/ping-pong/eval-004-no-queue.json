@@ -7,7 +7,7 @@
   "expected_behavior": [
     "activate the ping-pong skill",
     "state clearly that there is NO queue: a message sent with nobody listening is not stored",
-    "explain that --send refuses up front (in about two seconds) instead of hanging",
+    "explain that --send waits up to PP_SEND_GRACE (10 seconds by default) for a reader, then refuses without storing the message",
     "give the correct sequence: peer starts their listener first, then send"
   ],
   "expected_content": [

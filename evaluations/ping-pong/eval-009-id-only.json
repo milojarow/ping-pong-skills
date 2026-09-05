@@ -1,0 +1,19 @@
+{
+  "id": "ping-pong-009",
+  "skills": [
+    "ping-pong"
+  ],
+  "query": "dame un ping pong id y no hagas nada más",
+  "expected_behavior": [
+    "activate the ping-pong skill",
+    "run only the connect commands for this harness (Claude Code: --open, --keep, Monitor on --watch; no Monitor: --open only)",
+    "reply with one line that carries the active-skill marker and the new pp-xxxxxx id for the operator to hand over",
+    "stop right there: no diagnostics, measurements, improvements, proposals or extra messages; an open channel is not a work assignment"
+  ],
+  "expected_content": [
+    "🏓",
+    "pp-"
+  ],
+  "priority": "high",
+  "notes": "Guards the comms-only stopping point measured in the field: the id is the whole deliverable."
+}

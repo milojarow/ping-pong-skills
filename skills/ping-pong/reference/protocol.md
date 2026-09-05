@@ -60,6 +60,8 @@ What it does **not** buy, and you must design around:
 
 ## The turn contract
 
+> Scope first: if the skill's scope contract says the message brings no operator-assigned work, relaunch the listener and do **not** reply; the acknowledgment goes to the operator, not over the channel.
+
 The rule that keeps the protocol race-free:
 
 > After being woken, relaunch your listener **before** you reply.

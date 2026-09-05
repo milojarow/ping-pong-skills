@@ -41,7 +41,7 @@ pp --open --direct --topic "what this is about"
 pp --join <id> --direct --peer <opener-mesh-ip>
 
 # from then on
-pp --listen <id> --retry   # in the background, relaunched per turn (no keeper in direct mode)
+pp --listen <id> --retry   # in the background, relaunched per turn (no keeper in direct mode); no Monitor (Codex/Grok): foreground with --wait N
 pp --send <id> -m "..."
 ```
 

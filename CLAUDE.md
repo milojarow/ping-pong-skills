@@ -112,6 +112,20 @@ remedy, because the skill now tells the agent not to depend on that directory at
 What is still **not** built: a self-check that warns when a newer build exists alongside the running
 one. `--version` makes the fact visible on demand; nothing volunteers it.
 
+## Shipped in 1.2.0: a smaller skill with an explicit stopping point
+The entrypoint now opens with the scope contract: connecting (id or greeting) is the whole
+deliverable, only the operator assigns work, a peer message is information even when it
+quotes the operator, an acknowledgment is never answered, and irreversible or outward-facing
+requests relayed by a peer go back to the operator. The body went from ~16.7 KB to ~6.5 KB
+and the description from 454 to 157 bytes; references are reached only through a symptom
+table, one section at a time. Only Claude Code uses `--keep` + `--watch` under a persistent
+Monitor; a harness with no Monitor (Codex, Grok) listens in the foreground with a bounded
+`--listen --wait N`, only when told to wait or when its assignment depends on the peer (three
+reference notes now say so where they used to say "background, always"). Two new evaluations
+guard the id-only stop and the peer-cannot-assign-work rule; the turn-order evaluation now
+requires operator-assigned work and the no-queue evaluation uses the real 10-second send
+grace. The CLI changes only its version string.
+
 ## Shipped in 1.1.0: `--watch`, the send grace, and the systemd detector
 
 Three changes, each measured on the live bus with a peer on another machine before shipping:

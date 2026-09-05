@@ -21,7 +21,7 @@ Every channel is isolated. Sessions `A <-> Z` can discuss one thing while `B <->
 
 | Skill | Description |
 |-------|-------------|
-| **ping-pong** | Open, join, and run an isolated message channel between two agent sessions; diagnose one that misbehaves. |
+| **ping-pong** | Open or join an isolated channel between agent sessions; stop after the id or greeting, and handle messages or diagnose failures within the operator's assigned scope. |
 
 Invoke it with no argument to open a channel, or with a `pp-xxxxxx` id to join one:
 

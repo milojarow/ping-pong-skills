@@ -920,7 +920,7 @@ The router keeps the dozen that cost the most turns; these are the rest, each wi
 | Sending to a side with no listener | Refused within the grace (it does not hang); nothing is queued | Ask the peer to start their keeper or listener, then resend |
 | Replying before relaunching a bare `--listen` | The peer's answer finds no reader and their send fails | Listener first, then work, then reply (bare-listener contract) |
 | Relaunching `--listen` after a `--send` | Your send consumed nothing, so the previous listener is still up: the new one is refused and a wake-up is spent on an empty output | Relaunch only when the previous `--listen` actually returned content |
-| Running `--listen` in the foreground | The turn hangs until a message arrives | Background, always; `--await` in the foreground only after a `MAIL` event |
+| Running `--listen` in the foreground | The turn hangs until a message arrives | Background, always, in Claude Code; `--await` in the foreground only after a `MAIL` event. A harness with no persistent Monitor (Codex, Grok) is the exception: foreground `--listen --wait N`, bounded, only when told to wait |
 | Assuming a channel survives a bus reboot, or lasts indefinitely | Channels live in a temp dir; a reboot or a tmp purge wipes them with no warning on either side | Open a fresh channel; ids are cheap. For a channel meant to last, watch its presence in `pp --list`, not just traffic |
 | Passing `--adopt` to get past an ownership refusal | You take a live channel away from another working session | `--adopt` is for a channel whose owner session is gone, or one you are certain is yours |
 | Inventing a `--as` label per message | The peer sees a different author each time | One short, stable label per channel |
