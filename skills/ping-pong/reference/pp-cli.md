@@ -233,6 +233,8 @@ with.
 
 ### When `--wait` is right
 
+> A harness with no persistent Monitor (Codex, Grok) always bounds `--listen` with `--wait N` and runs it in the foreground; the advice below is for Claude Code.
+
 Default to a bare `--listen` with no timeout. A conversation has no deadline, the wait costs nothing, and an untimed listener is the wake-up mechanism the whole design rests on.
 
 Reach for `--wait N` only when you need the session to regain control if the peer never answers — a handoff you must report on, or a channel you suspect is dead. Exit 124 means "nothing arrived"; the channel is still open, and you can listen again.
