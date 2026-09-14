@@ -1250,7 +1250,24 @@ cmd_keep_run() {
   # The flag, not a filesystem test: $BUS_ROOT is a path on the BUS, and under
   # bus_mode=ssh it does not exist locally at all - a local `[ -d ]` would call
   # every live channel gone and delete a spool with unread mail in it.
-  [ "$closed" = "1" ] && rm -f "$spool" "$(cursor_file "$id")"
+  #
+  # UNREAD MAIL IS NOT DROPPED. The spool is the only copy of what arrived, and the
+  # close is the PEER's call - it can land seconds after a MAIL event, before the
+  # agent has drained. Deleting here turned "I did not drain in time" into "there is
+  # nothing left to read", with no trace anywhere. Whatever is past the cursor is
+  # kept under <id>.inbox.unread so it can still be read after the fact.
+  if [ "$closed" = "1" ]; then
+    local _drained=0 _size=0
+    [ -r "$(cursor_file "$id")" ] && _drained=$(tr -dc '0-9' < "$(cursor_file "$id")")
+    [ -n "$_drained" ] || _drained=0
+    _size=$(stat -c %s "$spool" 2>/dev/null || echo 0)
+    if [ "$_size" -gt "$_drained" ]; then
+      tail -c "+$((_drained + 1))" "$spool" > "$spool.unread" 2>/dev/null || true
+      note "channel $id closed with $((_size - _drained)) bytes of UNREAD mail
+    kept at: $spool.unread"
+    fi
+    rm -f "$spool" "$(cursor_file "$id")"
+  fi
   return 0
 }
 
