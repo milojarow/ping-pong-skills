@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="1.2.0"
+PP_VERSION="1.2.1"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -1435,25 +1435,33 @@ cmd_watch() {
     announce
   }
 
-  say "WATCH $id armed side=$side spool=$spool pulse=${PP_WATCH_PULSE}s probe=${PP_WATCH_PROBE}s"
+  # Lifecycle stays on stderr. MAIL/KEEPER/GONE on stdout are the only harness wakes.
+  note "WATCH $id armed side=$side spool=$spool pulse=${PP_WATCH_PULSE}s probe=${PP_WATCH_PROBE}s"
   announce || exit 2
 
   local rc f
   if command -v inotifywait >/dev/null 2>&1; then
-    exec 3< <(inotifywait -m -q -e close_write --format '%f' "$STATE_DIR" 2>&1)
-    inw=$!
     while :; do
-      if read -t "$PP_WATCH_PULSE" -r -u 3 f; then
-        [ "$f" = "$sname" ] || continue
-        announce || exit 2
-      else
-        rc=$?
-        if [ "$rc" -le 128 ]; then
-          say "WATCH $id stopped - the inotify stream ended (rc=$rc): relaunch the watcher"
-          exit 3
+      exec 3< <(inotifywait -m -q -e close_write --format '%f' "$STATE_DIR" 2>/dev/null)
+      inw=$!
+      while :; do
+        if read -t "$PP_WATCH_PULSE" -r -u 3 f; then
+          [ "$f" = "$sname" ] || continue
+          announce || exit 2
+        else
+          rc=$?
+          if [ "$rc" -gt 128 ]; then
+            pulse || exit 2
+          else
+            # EOF: inotifywait died. Restart it here — exiting would notify the harness.
+            note "WATCH $id inotify ended (rc=$rc): restarting"
+            kill "$inw" 2>/dev/null
+            inw=""
+            exec 3<&-
+            break
+          fi
         fi
-        pulse || exit 2
-      fi
+      done
     done
   else
     note "inotifywait not found - falling back to polling the spool every ${PP_AWAIT_POLL}s"
