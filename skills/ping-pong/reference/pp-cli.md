@@ -60,7 +60,7 @@ bus_ssh=<alias>
 | `--close-abandoned` | — | `--gc` | Also **close** the channels whose owner session is gone. Never touches a channel whose owner is still alive. |
 | `--reason R` | — | `--session-end` | The SessionEnd reason, when not supplied on stdin. |
 | `--force` | `-f` | `--send` | Skip the listener check and write anyway. |
-| `--adopt` | — | open/join/listen/send/close/keep/await/wake/unkeep/unwake | Override an ownership refusal and claim the channel for this session. |
+| `--adopt` | — | open/join/listen/send/close/keep/await/watch/wake/unkeep/unwake | Override an ownership refusal and claim the channel for this session. |
 | `--direct` | — | `--open` / `--join` | Create or join a **direct** channel: no bus, peer-to-peer over a private mesh. |
 | `--peer <addr>` | — | `--open --direct` / `--join --direct` | The peer's mesh address. **Optional** when exactly one other machine is on the mesh — there is nothing to choose, and a relayed address is only an opportunity for a typo. Required once there are two or more. |
 
@@ -146,7 +146,7 @@ Environment: `PP_MESH_IP` sets the bind address explicitly — use it when the m
 
 ### Ownership, and how a session is identified
 
-`--open` and `--join` record the calling **session** as the channel's owner. Operations that consume or change the endpoint (`--await`, `--listen`, `--send`, `--keep`, `--unkeep`, `--wake`, `--unwake`, `--close`) refuse when a different, still-live session owns it, including calls from `nosession`. `--info`, `--list` and `--whoami` remain readable. The session is resolved by walking up the process tree to the agent process — its pid is stable for that session's lifetime and unique on the machine. `PP_SESSION` supplies an identity only without an agent ancestor, as in supervised units. With an agent ancestor it must match that process identity; a mismatch fails. A declared pid must be live with the matching comm, and `PP_SESSION_BIRTH`, when supplied, must match its incarnation.
+`--open` and `--join` record the calling **session** as the channel's owner. Operations that consume or change the endpoint (`--await`, `--listen`, `--watch`, `--send`, `--keep`, `--unkeep`, `--wake`, `--unwake`, `--close`) refuse when a different, still-live session owns it, including calls from `nosession`. `--info`, `--list` and `--whoami` remain readable. The session is resolved by walking up the process tree to the agent process — its pid is stable for that session's lifetime and unique on the machine. `PP_SESSION` supplies an identity only without an agent ancestor, as in supervised units. With an agent ancestor it must match that process identity; a mismatch fails. A declared pid must be live with the matching comm, and every nonempty `PP_SESSION` requires `PP_SESSION_BIRTH` matching its incarnation. Unset both variables for natural ancestor detection; a plain shell then remains `nosession`.
 
 Ownership outcomes:
 
@@ -283,7 +283,8 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 | `PP_SEND_TIMEOUT` | `60` | Seconds `--send` waits for the write to complete before giving up. |
 | `PP_LABEL` | `host:project` (host only in home/root) | Default `--as` label; sanitized to `[A-Za-z0-9._:-]`, max 40 characters. |
 | `PP_SIDE` | — | Forces the side (`a` or `b`), overriding local state. Needed when owner selection is ambiguous, including human recovery with both ends local. |
-| `PP_SESSION` | walked from `$PPID` | Session identity (`claude:<pid>`, `codex:<pid>` or `grok:<pid>`). Accepted without an agent ancestor after checking pid/comm and optional `PP_SESSION_BIRTH`; with an ancestor it must match. Used by keeper and wake units. |
+| `PP_SESSION` | walked from `$PPID` | Session identity (`claude:<pid>`, `codex:<pid>` or `grok:<pid>`). Accepted without an agent ancestor after checking pid/comm and required `PP_SESSION_BIRTH`; with an ancestor it must match. Used by keeper and wake units. |
+| `PP_SESSION_BIRTH` | — | Required whenever `PP_SESSION` is nonempty; boot id plus process start ticks, matching the declared live process. |
 | `CODEX_THREAD_ID` | TUI environment | Session UUID captured by `--wake`; never inferred from another session. |
 | `PP_WAKE_RETRY_DELAY` | `2` | Seconds between failed queue attempts, up to three attempts per cursor. |
 | `PP_WAKE_TIMEOUT` | `10` | Seconds allowed per queue call before termination. |

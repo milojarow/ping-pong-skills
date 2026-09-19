@@ -207,6 +207,9 @@ session_id() {
   if [ -n "${PP_SESSION:-}" ] && [ "$detected" != nosession ] && [ "$PP_SESSION" != "$detected" ]; then
     die "declared session $PP_SESSION does not match process session $detected"
   fi
+  if [ -n "${PP_SESSION:-}" ] && [ -z "${PP_SESSION_BIRTH:-}" ]; then
+    die "PP_SESSION requires PP_SESSION_BIRTH; unset both to detect the process identity"
+  fi
   identity=${PP_SESSION:-$detected}
   if [ "$identity" != nosession ]; then
     birth=$(session_birth "$identity") || die "declared session $identity is not a live process with the matching harness"
@@ -1277,7 +1280,7 @@ cmd_keep_run() {
         note "owner session $owner is gone - closing channel $id and stopping the keeper"
         if [ "$(sed -n 's/^session=//p' "$(owner_file "$id")")" = "$owner" ] &&
            [ "$(sed -n 's/^birth=//p' "$(owner_file "$id")")" = "$birth" ]; then
-          PP_SESSION=nosession PP_SESSION_BIRTH= PP_SIDE="$PP_SIDE" \
+          env -u PP_SESSION -u PP_SESSION_BIRTH PP_SIDE="$PP_SIDE" \
             "$(self_path)" --close "$id" --as "$label" >&2 || true
         fi
         if have_user_systemd; then
@@ -2382,8 +2385,8 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   -V, --version   version
 
   Env: PP_BUS_ROOT (default /tmp/ping-pong), PP_SEND_TIMEOUT (60),
-       PP_LABEL, PP_SIDE (select side a|b), PP_SESSION (override session identity),
-       PP_SESSION_BIRTH (internal boot-id:start-time leash fingerprint),
+       PP_LABEL, PP_SIDE (select side a|b), PP_SESSION (declared live identity),
+       PP_SESSION_BIRTH (required with PP_SESSION: boot-id:start-time fingerprint),
        PP_STALE_HOURS (24), PP_LEASH_POLL (15), PP_AWAIT_POLL (1),
        PP_WATCH_PULSE (30), PP_WATCH_PROBE (300), PP_SEND_GRACE (10),
        PP_KEEP_ON_END (SessionEnd reasons that do NOT close: "resume clear").
