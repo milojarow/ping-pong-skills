@@ -53,6 +53,46 @@ Activates when this session must talk to another agent session — the operator 
 - Keep the docs free of real hostnames, aliases, and usernames. The bus is always `<alias>` / "the bus host".
 - **The version chain has three links, and they move together:** `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `PP_VERSION` in `skills/ping-pong/bin/pp`. Two past releases bumped the manifests and left the constant behind, so `--version` reported a stale version in two different builds — and "check which version you are running" stopped being a usable diagnostic exactly when it was needed to tell a build with guards from one without. If the executable prints its own version, that string is part of the release, not a comment.
 
+## Shipped in 1.4.0
+
+These changes are on the development branch; this heading records the release
+content, not evidence of publication. The older design sections below are history;
+current instructions are SKILL.md and the three harness recipes.
+
+- **Identity is a process incarnation.** Claude, Codex and Grok use
+  `<harness>:<pid>` plus boot id and process start ticks. PID reuse must not extend
+  a dead session's ownership. PP_SESSION remains an explicit override; whoami
+  routes by identity, never by a tool named Monitor.
+- **State belongs to an endpoint.** `<id>.<a|b>.*` separates two ends under one user.
+  Legacy channel-only records are ignored. Mail append, await cursor commit and
+  ownership adoption share a lock; restart never truncates the spool. Close keeps
+  received mail recoverable rather than erasing it with the transport.
+- **The Codex bell is fixed local text.** Queue enters as a user turn, so no peer
+  body, topic or label can enter its argv. A supervised unit is bound to the keeper
+  and the same birth fingerprint. It persists a three-attempt budget and one bell
+  per unread cursor, checks life just before queue, and stops on close/adoption.
+  Queue success is not live-only atomic delivery: exiting during/after acceptance
+  can leave a durable bell. No cancellation API is implemented here.
+- **Closed session means no communication.** No headless standing listener or
+  deferred resume delivery is part of the product. Pending spool data is recovery
+  data. Leash cleanup has a polling bound; it is not instantaneous process death.
+- **Each receiver owns its recipe.** Claude backgrounds await; Grok monitors watch
+  persistently; Codex arms the bell. Homogeneous pairs apply one row twice; mixed
+  pairs combine two rows. All use the bus, including on one machine. Direct mode
+  is explicitly degraded. Native messaging is an operator-selected alternative.
+- **Maintenance and work are distinct permissions.** Draining and rearming remain
+  authorized with no project assignment; peer messages never create assignments.
+- **One installation source.** The marketplace checkout owns the executable and
+  skill. Install preflights both links, backs up recognized legacy copies, refuses
+  foreign content, and provides a read-only resolution check.
+
+Validation: tools/selftest.sh exercises local transport, fake queue argv, retry,
+closed owners and temporary-HOME installation. tools/acceptance-tmux.sh is the
+operator-run real-TUI gate; event files and exact body/cursor checks decide it,
+never a prompt echoed on screen. Its dry-run launches no agent. Historical
+standing-listener and direct feeder recipes were retired, not replaced by hidden
+background services.
+
 ## Shipped in 0.2.0: ownership + the reaper
 
 Both of the gaps recorded here were closed in 0.2.0 and are now documented in the skill:

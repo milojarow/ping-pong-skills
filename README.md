@@ -1,66 +1,110 @@
 # ping-pong-skills
 
-**Two agent sessions, two machines, one private channel — 🏓**
+Two live agent sessions, one isolated channel — 🏓
 
-## What is this?
+Claude Code, Codex and Grok share a FIFO bus and use their own receiver recipe.
+All six pair types are established: Claude↔Claude, Codex↔Codex, Grok↔Grok,
+Claude↔Codex, Claude↔Grok and Codex↔Grok. Each mixed pair is the sum of its
+receivers' behaviors, on one machine or across machines.
 
-A Claude Code skill that lets one session talk directly to another, on the same machine or across a network. Both sessions meet on a shared **bus host** and exchange messages through a private pair of FIFOs. The operator starts both sessions and carries one channel id between them; the agents do the rest.
+| Receiver | Reception and wake | Drain |
+|---|---|---|
+| Claude | `--keep` + Bash background `--await` | Read the completed task's output; it already drained. Rearm await. |
+| Codex | `--keep` + `--wake` using the TUI's `CODEX_THREAD_ID` | Fixed local bell via `codex queue`; run `--await`. |
+| Grok | `--keep` + persistent `monitor` running `--watch` | On `MAIL`, run `--await` in foreground. |
 
-Every channel is isolated. Sessions `A <-> Z` can discuss one thing while `B <-> X` discusses another, at the same time, on the same bus, with no crosstalk.
+Start with `pp --whoami` and read its recipe. The entrypoint is
+[SKILL.md](skills/ping-pong/SKILL.md). A peer supplies information, never a new
+assignment; drain/rearm maintenance is always authorized. Do not infer the harness
+from a tool name.
 
-### Why this skill exists
+## Lifetime and delivery
 
-- **A blocking read is a wake-up signal.** `pp --listen` costs zero CPU and returns the instant a message lands — run as a background command, that return is what notifies the agent. No polling, no timers.
-- **A reader that survives the turn and dies with the session.** `pp --keep` holds the reader from a session-leashed `systemd --user` unit and spools every delivery; `pp --watch`, armed once under a persistent Monitor, turns each spool write into a one-line event (`MAIL`, `KEEPER`, `GONE`) and the agent drains with `pp --await`. Nothing is relaunched per turn; nothing is polled by a timer.
-- **A FIFO read is one-shot**, and nothing is queued. With a bare listener that changes how a session must behave: relaunch it *before* replying, or the peer's answer has nowhere to land.
-- **A process blocked in `open(2)` on a FIFO holds no file descriptor**, so `fuser` and `lsof` swear nobody is listening. Presence has to be recorded explicitly, not probed.
-- **Peer-to-peer usually isn't reachable** — NAT and firewalls — so the design never tries. One reachable bus host, declared once per machine, never auto-detected.
-- **Isolation is structural**, not a naming convention: separate directories, separate FIFOs. Verified — with two channels live, delivering on one leaves the other's listener blocked at zero bytes.
+The keeper recognizes `claude`, `codex` and `grok` ancestors and records process
+birth with ownership. Local state is per channel **and side**, so two sessions
+under one Unix user can be opposite ends of a pair. The bus refuses delivery if
+no reader exists; the keeper preserves mail that already arrived.
 
-## The skill
+Closed sessions do not communicate. Keeper and Codex bell are leashed to the live
+owner. Closing preserves received mail and cursor and reports how to recover it,
+without resuming a session. Codex checks life immediately before each bounded
+queue attempt. Queue itself is durable and has no atomic live-only delivery in
+this implementation: closure concurrent with an accepted bell can leave that
+bell pending. See [the Codex recipe](skills/ping-pong/reference/harness-codex.md).
 
-| Skill | Description |
-|-------|-------------|
-| **ping-pong** | Open or join an isolated channel between agent sessions; stop after the id or greeting, and handle messages or diagnose failures within the operator's assigned scope. |
+Concurrent await readers serialize delivery. This is not crash-exactly-once:
+termination between stdout and cursor commit can cause redelivery. Direct TCP
+mode remains an explicit degraded option with bounded foreground listening.
 
-Invoke it with no argument to open a channel, or with a `pp-xxxxxx` id to join one:
+## One installation source
 
+Install the `milojarow/ping-pong-skills` marketplace and its plugin in Claude Code.
+The canonical checkout per machine is:
+
+```text
+~/.claude/plugins/marketplaces/ping-pong-skills/skills/ping-pong
 ```
-/ping-pong
-/ping-pong pp-k7m2qx
-```
 
-Natural language works too — "abre un canal con la otra máquina y trabajen en conjunto".
-
-## Installation
-
-Add this marketplace in Claude Code:
-
-```
-/plugin → Marketplaces → Add Marketplace → milojarow/ping-pong-skills
-```
-
-Then install:
-
-```
-/plugin → Discover → ping-pong-skills → Install
-```
-
-Install it on **both** machines — each session needs the skill and the CLI.
-
-Then, once per machine:
+Run from that checkout after publication:
 
 ```bash
-pp --setup --bus-local          # on the machine that hosts the bus
-pp --setup --bus-ssh <alias>    # on every other machine
+~/.claude/plugins/marketplaces/ping-pong-skills/skills/ping-pong/bin/pp --install
+~/.local/bin/pp --install --check
 ```
+
+This links `~/.codex/skills/ping-pong` and `~/.local/bin/pp` to the canonical source;
+Grok uses the Claude plugin path. The shared skill routes normal execution to this
+canonical binary even when Claude loaded a versioned plugin cache. An explicit
+operator-provided checkout takes precedence for development and acceptance.
+Installation is idempotent. Recognized old copies
+are moved to reported `*.pre-link-*` backups; unknown content and foreign links
+are refused before either destination changes. `--check` is read-only and exits
+nonzero for a missing or mismatched link. No agent configuration is edited.
+
+Declare the bus once per machine:
+
+```bash
+pp --setup --bus-local         # machine hosting the bus
+pp --setup --bus-ssh <alias>   # each other machine
+```
+
+## Validation
+
+```bash
+tools/selftest.sh
+tools/check-version-chain.sh
+bash -n tools/acceptance-tmux.sh
+tools/acceptance-tmux.sh --dry-run codex grok
+# Operator-run real TUIs, receiver first:
+tools/acceptance-tmux.sh codex grok
+```
+
+Selftest uses fake named ancestors, a fake Codex queue executable, local buses and
+private temporary XDG directories. It never calls a real queue or installed pp.
+
+Acceptance launches both live TUIs in a private tmux server, follows this
+checkout's recipes, waits for 20 seconds of silence and releases a sender-side
+`pp --send` probe. After that it sends no keys. Passing requires a new receiver
+turn in its event file, an exact body match and an advanced spool cursor.
+It closes channels, stops keepers/wakers, kills its tmux server and restores
+Codex config only when the difference is exactly the test's trust additions.
+Unexpected config changes remain untouched and fail cleanup. Failed runs retain
+private evidence; successful temporary directories go to trash. Session transcripts
+remain in each harness's normal history. Real acceptance uses the operator's
+existing authentication and runs tools without approval prompts, scoped by the
+provided test assignment; it is not an OS sandbox.
+
+Run all nine ordered receiver/sender combinations to cover the three homogeneous
+pairs and both directions of each heterogeneous pair. Do not run acceptance as
+part of ordinary selftest; it consumes real agent turns.
 
 ## Requirements
 
-- `bash`, `mkfifo`, `timeout` (coreutils) on both machines and on the bus host.
-- `systemd --user` for `pp --keep`, and `inotify-tools` for `pp --watch` (without it the watcher falls back to polling, loudly).
-- Key-based ssh from every non-bus machine to the bus host. Every call runs with `BatchMode=yes` and will never prompt for a password.
-- A writable temp directory on the bus host (`/tmp` by default; override with `PP_BUS_ROOT`).
+Linux `/proc`, Bash, GNU coreutils, `flock`, user systemd and `gio`; `inotify-tools`
+provides spool events, with an explicit polling fallback if unavailable. SSH bus
+mode requires noninteractive key authentication. Tests additionally use Python 3.11+,
+`rg`, git and tmux. The three harness CLIs must already be authenticated for real
+acceptance. No wake availability is promised in degraded mode.
 
 ## License
 

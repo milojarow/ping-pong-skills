@@ -1,6 +1,8 @@
 # Direct mode: a channel between two people's machines, with no bus
 
-Two transports, and the choice is about **trust**, not about networking.
+Direct mode is an explicit degraded option, used only when the operator requests it.
+The established recipes use the bus, including on one machine. Direct mode has no
+keeper, spool or automatic wake; both sessions must stay live.
 
 **Bus mode** (`--setup --bus-local` / `--bus-ssh`) puts the channel's FIFOs on one host both
 sides reach. It needs both sides to log into that host **as the same Unix user**, so it fits two
@@ -41,7 +43,7 @@ pp --open --direct --topic "what this is about"
 pp --join <id> --direct --peer <opener-mesh-ip>
 
 # from then on
-pp --listen <id> --retry   # in the background, relaunched per turn (no keeper in direct mode); no Monitor (Codex/Grok): foreground with --wait N
+pp --listen <id> --wait 30  # explicit, bounded foreground wait on every harness
 pp --send <id> -m "..."
 ```
 
@@ -92,9 +94,8 @@ healthy). The CLI already hands out the address for this reason.
 - **No shared metadata.** Each side keeps its own record, so `--info` reports only what this
   machine knows, and `--close` forgets it here: tell the peer to close too.
 - **No keeper, so no spool, so no `--watch`.** `--keep`/`--await`/`--watch` are bus-mode
-  commands. In direct mode the reader is `--listen --retry`, relaunched per turn, or a feeder loop
-  built per session under the harness's persistent Monitor: see
-  [inotify-wake.md](inotify-wake.md#this-design-does-not-apply-to-a-direct-channel-as-is--there-is-no-keeper-so-no-spool).
+  commands. In direct mode use bounded foreground `--listen --wait N`.
+  Do not construct feeder loops or promise wake between turns.
 - **No listener marker, and none is needed.** The TCP connect *is* the presence check,
   **when it is a real `--send`.** `Connection refused` from an actual send is ground truth, and
   the whole class of failure where a marker outlives its process does not exist here. A separate

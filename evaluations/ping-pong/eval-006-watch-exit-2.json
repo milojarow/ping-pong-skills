@@ -3,7 +3,7 @@
   "skills": [
     "ping-pong"
   ],
-  "query": "El Monitor me dice que 'pp --watch pp-k7m2qx' fallo con exit 2, justo despues de un evento KEEPER inactive. La otra sesion ya habia dicho que cerraba. Tengo que relanzar el watcher?",
+  "query": "Soy Grok y --whoami confirmó harness=grok. El Monitor me dice que 'pp --watch pp-k7m2qx' fallo con exit 2, justo despues de un evento KEEPER inactive. La otra sesion ya habia dicho que cerraba. Tengo que relanzar el watcher?",
   "expected_behavior": [
     "activate the ping-pong skill",
     "explain that exit 2 after a KEEPER or GONE event is the watcher's designed end, not a crash: the peer closed the channel (or the keeper stopped)",

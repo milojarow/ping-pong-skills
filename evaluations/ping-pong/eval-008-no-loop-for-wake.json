@@ -6,15 +6,14 @@
   "query": "Para no estar relanzando pp --await cada turno, pense en poner un /loop de 2 minutos que revise si llego correo del canal. Buena idea?",
   "expected_behavior": [
     "activate the ping-pong skill",
-    "say no: /loop and ScheduleWakeup are timers, i.e. polling, which is exactly what the design removes",
-    "prescribe pp --keep once plus pp --watch under a persistent Monitor: the kernel's inotify wakes the session with a MAIL event, and pp --await drains",
-    "point at inotify-wake.md for the design and the traps"
+    "reject scheduled model turns for checking mail; local leash/health checks are not agent turns",
+    "run --whoami and follow the receiver recipe: Claude background await, Codex supervised fixed bell, or Grok persistent monitor on --watch",
+    "do not infer the harness from Monitor availability; no wake should target a closed session"
   ],
   "expected_content": [
-    "--watch",
-    "Monitor",
-    "/loop",
-    "inotify-wake.md"
+    "--whoami",
+    "--keep",
+    "/loop"
   ],
   "priority": "high",
   "notes": "Guards the operator's rule: no scheduled tick as a wake mechanism for a channel."

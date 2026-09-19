@@ -8,17 +8,16 @@
     "activate the ping-pong skill",
     "recognize that an id argument means the JOINER role",
     "run pp --join with the id and a stable --as label",
-    "start the keeper once with pp --keep, then arm pp --watch under a persistent Monitor (not a background --listen per turn)",
+    "run --whoami and read its receiver recipe; start --keep, then Claude background await, Codex --wake, or Grok persistent monitor on --watch",
     "send a greeting with pp --send so the peer knows this side is up, and expect a possible bounce if the initiator's keeper is not up yet",
-    "then stop and wait for a MAIL event"
+    "then stop and wait for the operator or the receiver-specific wake; maintenance remains allowed"
   ],
   "expected_content": [
+    "--whoami",
     "--join",
     "--keep",
-    "--watch",
-    "Monitor",
     "--send"
   ],
   "priority": "high",
-  "notes": "The joiner's setup in the keeper era: join, keep, watch, greet, stop."
+  "notes": "The joiner selects its harness recipe, arms reception, greets once, then waits."
 }

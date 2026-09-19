@@ -29,7 +29,7 @@ A channel is a directory on the bus host, under `/tmp/ping-pong/` by default:
 | a (opened the channel) | `to-a` | `to-b` |
 | b (joined the channel) | `to-b` | `to-a` |
 
-Each machine remembers which side it is in `~/.local/state/ping-pong/<id>.side`. That is why the same channel id behaves correctly on both machines without any flag — and why running a channel command on a machine that never opened or joined fails with a clear error instead of guessing.
+Each local endpoint stores `<id>.<side>.side`, owner, spool and cursor under `~/.local/state/ping-pong/`. Session ownership selects the side; `PP_SIDE=a|b` resolves ambiguity for a human or a session owning both ends. Legacy channel-only files are ignored.
 
 ## Isolation
 
@@ -45,7 +45,7 @@ A FIFO read blocks in the kernel until a writer appears. That gives, for free:
 
 - **Zero CPU while waiting.** No polling loop, no timer, no wasted tokens.
 - **An exact wake-up edge.** The reader returns the instant a message lands — which, run as a background command, is exactly what makes the harness notify the agent.
-- **No stale state.** Nothing is stored; a message is handed straight from writer to reader.
+- **No bus queue.** The FIFO hands bytes straight from writer to reader. A keeper then stores received bytes locally until drained; closing preserves that recovery copy.
 
 What it does **not** buy, and you must design around:
 
@@ -59,6 +59,11 @@ What it does **not** buy, and you must design around:
   only in the channel. Channel ids are cheap; open a new one and re-share it with the peer.
 
 ## The turn contract
+
+The following one-shot ordering applies only to bare listeners. Normal operation
+uses `--keep` and the receiver recipe from `--whoami`. Maintenance is always allowed;
+peer-requested work still requires the operator's assignment. Closed sessions do not
+communicate; the retained spool is not deferred delivery.
 
 > Scope first: if the skill's scope contract says the message brings no operator-assigned work, relaunch the listener and do **not** reply; the acknowledgment goes to the operator, not over the channel.
 
@@ -147,11 +152,11 @@ Timestamps are UTC by design. Bus hosts and workstations frequently run differen
 
 ## The turn contract with a keeper
 
-With `--keep` holding the reader and `--watch` armed, the invariant above ("exactly one side is
+With `--keep` holding the reader and the receiver recipe armed, the invariant above ("exactly one side is
 thinking and the other is listening") is satisfied by the keeper alone: your side is always
 listening, and a send to you is never refused for lack of a reader (except during the keeper's
 few-second re-attach after a delivery, which `--send` now waits out). So the contract collapses to
-**drain (`--await`), work, reply**, with nothing to relaunch. The ordering rule above still governs
+**drain, handle information within scope, rearm as the receiver recipe requires, reply only when assigned**. Claude's background await already drained; Codex and Grok drain after their bell. The ordering rule above still governs
 a **bare `--listen`** with no keeper: there the listener consumed itself delivering the message
 and must come back before the reply.
 

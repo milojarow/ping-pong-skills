@@ -6,7 +6,7 @@
   "query": "dame un ping pong id y no hagas nada más",
   "expected_behavior": [
     "activate the ping-pong skill",
-    "run only the connect commands for this harness (Claude Code: --open, --keep, Monitor on --watch; no Monitor: --open only)",
+    "run --whoami, read its receiver recipe, open, keep and arm the harness-specific wake; do not infer identity from tool names",
     "reply with one line that carries the active-skill marker and the new pp-xxxxxx id for the operator to hand over",
     "stop right there: no diagnostics, measurements, improvements, proposals or extra messages; an open channel is not a work assignment"
   ],

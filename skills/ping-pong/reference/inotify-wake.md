@@ -1,12 +1,12 @@
-# Event-driven wake: `pp --watch` under a persistent Monitor
+# Event-driven wake: `pp --watch` under Grok monitor
 
 `--await` blocks until the spool grows and exits, so as a background task it has to be
 relaunched once per turn. `pp --watch` (shipped since 1.1.0) is the persistent alternative: armed
-once under the harness's `Monitor(command: "pp --watch <id>", persistent: true)`, it emits one
+once under Grok's `monitor(command: "pp --watch <id>", persistent: true)`, it emits one
 short line per event and never a message body. The session drains with `--await` when a `MAIL`
-event lands. Nothing is relaunched per turn and nothing is polled by a timer.
+event lands. Nothing is relaunched per turn. Local health checks still run on the configured pulse; they do not wake the model without an event.
 
-**There is no webhook primitive in ping-pong**: nothing lets the peer's send reach into the
+**The Grok path uses no webhook**: nothing lets the peer's send reach into the
 harness and invoke you directly. This combination is the practical equivalent: `--keep` holds a
 reader outside any turn's process tree and spools every delivery, and the watcher turns the
 kernel's `close_write` on that spool into a harness notification. From the harness's side that
@@ -20,7 +20,7 @@ second, independent setup on their side, worth agreeing over the channel rather 
 ## The design
 
     keeper (`pp --keep`)     → writes each delivery into the spool
-                                (`~/.local/state/ping-pong/<id>.inbox`)
+                                (`~/.local/state/ping-pong/<id>.<side>.inbox`)
     inotify (close_write)    → the KERNEL fires when the spool is closed after a write
     `pp --watch` (Monitor)   → turns that event into ONE line the harness delivers as a notification
 
@@ -87,43 +87,10 @@ created is not a broken watcher, it is a correctly-armed watch on nothing: it st
 forever, and that silence is indistinguishable from a quiet peer, which is exactly the failure
 mode this whole document exists to design around.
 
-**The fix does not need a bus.** Direct mode already has what a feeder needs — a blocking
-read (`pp --listen <id> --retry`) — it is just not wired to a spool. A loop that supplies the
-missing half, entirely outside `bin/pp`:
+Direct mode stays degraded in 1.4.0: bounded foreground `--listen --wait N`.
+The old feeder-loop suggestion is retired; it bypassed the live-session contract.
+Do not build a per-session replacement keeper.
 
-```bash
-# direct-mode feeder: plays the keeper's role for one channel, no bus involved
-while :; do
-  body=$(pp --listen "$id" --retry 2>>"$err")
-  rc=$?
-  [ $rc -eq 0 ] && [ -n "$body" ] || continue        # empty/refused: nothing to spool
-  printf '%s\n' "$body" >> "$spool"
-  n=$(printf '%s\n' "$body" | wc -l)
-  echo "MAIL $id from:$(printf '%s' "$body" | sed -n 's/.*from: \([^ ]*\).*/\1/p') lines:$n spool:$spool"
-done
-```
-
-Run under the harness's persistent Monitor (never a bare background loop — see
-[standing-listener.md](standing-listener.md#a-loop-parked-outside-every-session-is-not-a-cheap-supervisor)
-for why that distinction matters), it is leashed to the session's own lifetime, so it cannot
-become the immortal loop SKILL.md prohibits — and inotify becomes unnecessary, because the
-loop already knows the instant mail lands; it does not need the kernel to tell it.
-
-Every correctness rule already on this page still applies to that spool once it exists:
-nanosecond-resolution capture names, notify only when the capture actually has bytes, drain
-before arming, and the guard-plus-drain pairing for the cursor covered later in this document
-— any hand-rolled reader over this spool must copy it, not just the "pending mail" half.
-
-**One more detail specific to the direct-mode loop above:** run `--listen --retry`, never a
-bare `--listen`. Between one iteration and the next the inbox port is released and re-bound,
-and that gap is a race — a send that lands during it is a transport failure, not a real
-absence of mail. A bare `--listen` has no recovery from that and the feeder loop dies silently;
-`--retry` re-attaches on exactly that class of failure and keeps surfacing on a real refusal or
-a closed channel, so no genuine failure gets swallowed by the retry.
-
-The proposal to make this a real `--keep` for direct mode — instead of a loop built per
-session — is tracked as a known gap in `CLAUDE.md`; nothing here should be read as saying that
-exists today.
 
 ## Two different silences: the keeper is down vs. the bus is gone
 
@@ -304,10 +271,8 @@ off=$(cat "$STATE/$ID.cursor" 2>/dev/null || echo 0)
 size=$(wc -c < "$SPOOL")
 [ "$size" -gt "$off" ] && echo "PENDING $ID | $((size-off)) bytes undrained"
 
-# drain, run when the watcher wakes the session
-off=$(cat "$CUR" 2>/dev/null || echo 0); size=$(wc -c < "$SPOOL")
-[ "$size" -le "$off" ] && { echo "(nothing new)"; exit 0; }
-tail -c +$((off+1)) "$SPOOL"; printf '%s' "$size" > "$CUR"
+# Drain through the CLI: it serializes concurrent readers and adoption.
+pp --await "$ID"
 ```
 
 **Put the drain in a script, not a command typed by hand.** As long as advancing the cursor
@@ -316,7 +281,7 @@ agent's memory, not in the cursor on disk — the opposite of what a cursor is f
 
 ## Reopening a channel under the same id can leave the cursor pointing past the new spool's end
 
-A cursor file survives a clean channel close even though the spool it was tracking does not.
+**Historical failure, corrected in 1.4.0:** close formerly deleted the spool but retained its cursor. Current close preserves both for recovery.
 Rejoin the same id later and the read cursor can be far ahead of a spool that was just
 recreated from empty — and from there, messages vanish with **no signal at all**: no error, no
 log line, nothing in `--list`.
@@ -330,7 +295,7 @@ raise PENDING. Both sides end up believing the channel is quiet.
 
     size=$(stat -c %s "$spool"); [ "$size" -lt "$cur" ] && cur=0
 
-Any hand-rolled reader built directly on the spool — which is exactly what the event-driven
+Any historical hand-rolled reader built directly on the spool — which is exactly what the event-driven
 design on this page invites — has to copy this line itself; nothing enforces it from outside
 `cmd_await`. Add it to both the watcher's guard and the drain:
 
@@ -346,7 +311,7 @@ the fix, a drainer facing a cursor far past the spool's size reports something l
 `(nothing new: cursor=999999 spool=3166)` — the two numbers it prints in the same breath already
 contradict the claim, but nothing reads them before affirming "nothing new."
 
-**Confirmed against a live reopen, not only synthetically:** the same asymmetric cleanup that
+**Historical evidence before 1.4.0, confirmed against a live reopen:** the same asymmetric cleanup that
 clears `.direct`/`.owner`/`.side`/`.inbox` on close but leaves the separately-written `.cursor`
 behind reproduced this on the very first ordinary reopen after the fix landed — a larger
 backlog than the case that motivated the fix in the first place, because the cursor had

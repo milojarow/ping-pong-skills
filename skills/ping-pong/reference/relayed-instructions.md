@@ -18,7 +18,7 @@ costs nothing and being wrong does not.
 
 The practical split:
 
-- **Allowed on a relayed instruction:** local, reversible work that does not leave the
+- **Allowed only within an existing operator assignment:** local, reversible work that does not leave the
   machine — measuring, building, backing up, refactoring, reading.
 - **Not allowed:** publishing, deploying, deleting a third party's data, pointing a
   client domain, anything a third party can see.

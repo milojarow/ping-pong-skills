@@ -2,7 +2,7 @@
 
 Operations are **flags**. The bare argument is **always the channel id**, so it never collides with a subcommand name. Every command prints feedback, including when the result is empty.
 
-The script ships at `<skill base dir>/bin/pp`. For interactive use, `pp --install` copies it to `~/.local/bin/pp` — re-run it after a plugin update, since it is a copy, not a symlink.
+The script ships at `<skill base dir>/bin/pp`. For interactive use, `pp --install` links `~/.local/bin/pp` and `~/.codex/skills/ping-pong` to the canonical marketplace checkout. `--install --check` verifies the links without writing. Recognized legacy copies are backed up; unknown files and foreign links are refused before either destination changes.
 
 ## Setup
 
@@ -28,21 +28,24 @@ bus_ssh=<alias>
 |---|---|---|---|
 | `--open` | `-o` | — | Creates a channel, prints the id and the line to hand over. You become side a. |
 | `--join` | `-j` | channel id | Registers this machine as side b of an existing channel. |
-| `--listen` | `-L` | channel id | **Blocks** until one message arrives, prints it, exits. Run it in the background (Claude Code). A harness with no persistent Monitor (Codex, Grok) runs it in the foreground with `--wait N` instead, only when told to wait. One-shot. |
-| `--keep` | `-k` | channel id | Starts a **session-leashed keeper**: a reader held from a `systemd --user` unit for as long as the owning session lives. Survives turns; cannot outlive the session. Spools everything to `<id>.inbox`. Run once, not per turn. |
+| `--listen` | `-L` | channel id | **Blocks** until one message arrives, prints it, exits. One-shot; in degraded mode use a bounded foreground wait. Normal bus reception uses a keeper and the recipe selected by `--whoami`. |
+| `--keep` | `-k` | channel id | Starts a **session-leashed keeper**: a reader held from a `systemd --user` unit for as long as the owning session lives. Survives turns; cannot outlive the session. Spools everything to `<id>.<side>.inbox`. Run once, not per turn. |
 | `--await` | `-A` | channel id | **Blocks** until the spool grows past the cursor, prints exactly what is new, exits. The drain, and the wake-up when no watcher is armed. |
-| `--watch` | `-W` | channel id | **Persistent waker** for a harness that streams events (Claude Code's `Monitor`): one line per event on stdout (`MAIL`, `KEEPER`, `GONE`, `WATCH`), never a message body. Needs a keeper. Announces by spool **state** (size vs cursor, with a dedupe guard that resets when the spool shrinks), subscribes to `close_write` on the exact spool name, re-checks spool + keeper every `PP_WATCH_PULSE` s and asks the bus for the channel every `PP_WATCH_PROBE` s. Exits 2 when the keeper stops or the channel is gone, 3 if the inotify stream dies. Falls back to polling, loudly, when `inotifywait` is missing. Bus mode only. |
-| `--unkeep` | — | channel id | Stops the keeper. Leaves the channel open. |
+| `--watch` | `-W` | channel id | **Persistent waker** for a harness that streams events (Grok's persistent `monitor`): one line per event on stdout (`MAIL`, `KEEPER`, `GONE`, `WATCH`), never a message body. Needs a keeper. Announces by spool **state** (size vs cursor, with a dedupe guard that resets when the spool shrinks), subscribes to `close_write` on the exact spool name, re-checks spool + keeper every `PP_WATCH_PULSE` s and asks the bus for the channel every `PP_WATCH_PROBE` s. Exits 2 when the keeper stops or the channel is gone; restarts a failed inotify stream internally. Falls back to polling, loudly, when `inotifywait` is missing. Bus mode only. |
+| `--unkeep` | — | channel id | Stops this side's wake and keeper. Leaves the channel open and mail intact. |
 | `--send` | `-s` | channel id | Sends a message to the other side. Checks for a reader first and waits up to `PP_SEND_GRACE` s for one to appear: a keeper's reader is down for a few seconds after every delivery while it re-attaches (measured 5 s over ssh), so the second of two back-to-back sends used to be refused. Only a refusal after the grace means nobody is reading. |
 | `--list` | `-l` | — | Open channels on the bus, with topic and which side you are. |
 | `--info` | `-i` | channel id | Channel metadata plus who currently has a listener up. |
-| `--close` | `-c` | channel id | Removes the channel from the bus and forgets it locally. |
-| `--gc` | `-g` | — | Reaps orphaned readers, clears dead listener markers, drops stale local records (spools included). Reports leftovers in two groups: owner-session-gone, and quiet-but-owned. |
+| `--close` | `-c` | channel id | Removes the channel from the bus, stops wake/keeper and preserves received mail and cursor for recovery; reports unread bytes. |
+| `--gc` | `-g` | — | Reaps orphaned readers, clears dead listener markers, preserves closed endpoint records and their spools. Reports leftovers in two groups: owner-session-gone, and quiet-but-owned. |
 | `--session-end` | — | — | Closes every channel **this session** owns. What the `SessionEnd` hook calls; reads the hook payload from stdin for the reason. |
 | `--adopt` | — | channel id | Transfers ownership of the channel to this session. |
 | `--mesh` | — | — | Direct mode's first command: reports whether this machine **and the peer** are on one mesh, and prints the block to hand over when they are not. Exit 0 = ready. |
 | `--setup` | — | — | Writes the bus configuration (above). |
-| `--install` | — | — | Copies the script to `~/.local/bin/pp`. |
+| `--install` | — | — | Creates the two canonical symlinks; `--check` validates them read-only. |
+| `--whoami` | — | — | Prints harness, session id and absolute receiver recipe path; no tool-name inference. |
+| `--wake` | — | channel id | Arms the supervised Codex bell using CODEX_THREAD_ID. Three attempts per unread cursor, fixed local text only. |
+| `--unwake` | — | channel id | Stops this side's bell, leaving keeper and spool. |
 | `--help` | `-h` | — | Usage. |
 | `--version` | `-V` | — | Version. |
 
@@ -233,11 +236,12 @@ with.
 
 ### When `--wait` is right
 
-> A harness with no persistent Monitor (Codex, Grok) always bounds `--listen` with `--wait N` and runs it in the foreground; the advice below is for Claude Code.
+Normal bus mode follows the receiver recipe: Claude backgrounds await, Grok watches,
+and Codex arms its supervised bell. Degraded listening uses `--listen --wait N` in
+foreground on every harness; there is no automatic wake between turns.
 
-Default to a bare `--listen` with no timeout. A conversation has no deadline, the wait costs nothing, and an untimed listener is the wake-up mechanism the whole design rests on.
-
-Reach for `--wait N` only when you need the session to regain control if the peer never answers — a handoff you must report on, or a channel you suspect is dead. Exit 124 means "nothing arrived"; the channel is still open, and you can listen again.
+Use `--await --wait N` for an explicit bounded wait or a possibly stale bell.
+Exit 124 means no unread mail arrived before the deadline, not a closed channel.
 
 ### What `--force` actually does
 
@@ -278,8 +282,11 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 | `PP_BUS_ROOT` | `/tmp/ping-pong` | Channel root on the bus host. Must match on both sides. |
 | `PP_SEND_TIMEOUT` | `60` | Seconds `--send` waits for the write to complete before giving up. |
 | `PP_LABEL` | short hostname | Default `--as` label. |
-| `PP_SIDE` | — | Forces the side (`a` or `b`), overriding local state. Only needed to drive both ends from one machine while testing. |
-| `PP_SESSION` | walked from `$PPID` | Session identity (`claude:<pid>`). Set explicitly inside the keeper unit, where the process tree no longer reaches the agent — without it the leash would have nothing to hold. |
+| `PP_SIDE` | — | Forces the side (`a` or `b`), overriding local state. Needed when owner selection is ambiguous, including human recovery with both ends local. |
+| `PP_SESSION` | walked from `$PPID` | Session identity (`claude:<pid>`, `codex:<pid>` or `grok:<pid>`). Set explicitly inside the keeper unit, where the process tree no longer reaches the agent — without it the leash would have nothing to hold. |
+| `CODEX_THREAD_ID` | TUI environment | Session UUID captured by `--wake`; never inferred from another session. |
+| `PP_WAKE_RETRY_DELAY` | `2` | Seconds between failed queue attempts, up to three attempts per cursor. |
+| `PP_WAKE_TIMEOUT` | `10` | Seconds allowed per queue call before termination. |
 | `PP_STALE_HOURS` | `24` | Silence after which an unowned, listener-less channel is called `LOOKS ABANDONED`. Does not apply to the owner-gone case, which is flagged at once. |
 | `PP_LEASH_POLL` | `15` | Seconds between the keeper's "is my session still alive?" checks. This is the worst-case delay before a dirty session death destroys the channel. |
 | `PP_AWAIT_POLL` | `1` | Seconds between `--await` spool checks (and the `--watch` fallback poll when `inotifywait` is missing). |
@@ -295,7 +302,7 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 | 0 | Success. For `--listen`, a message was received and printed. |
 | 1 | Error — the message on stderr names the cause and the fix. |
 | 2 | `--watch` stopped because the channel is over: the keeper unit is no longer active, or the channel/spool is gone. The harness's Monitor reports this as "failed (exit 2)": designed end, not a bug. |
-| 3 | `--await` found no keeper running — nothing will ever land in the spool. Start one with `--keep`. For `--watch`: the inotify stream ended; relaunch the watcher. |
+| 3 | `--await` found no keeper running — nothing will ever land in the spool. On a live channel start one with `--keep`; on a closed, drained channel stop. Inotify restarts internally in `--watch`. |
 | 124 | `--listen`/`--await` with `--wait N` timed out, or a send exceeded `PP_SEND_TIMEOUT`. The channel is still open. |
 | 255 | The transport died (the ssh client itself). The channel is fine; this side could not reach the bus. |
 
@@ -304,19 +311,21 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 | Path | Where | Contents |
 |---|---|---|
 | `~/.config/ping-pong/config` | each machine | Bus mode and ssh alias. |
-| `~/.local/state/ping-pong/<id>.side` | each machine | Which side this machine is on that channel. |
-| `~/.local/state/ping-pong/<id>.owner` | each machine | The session that owns this side (`session=claude:<pid>`). What the leash, the SessionEnd hook and the orphan check all read. |
-| `~/.local/state/ping-pong/<id>.inbox` | each machine | The keeper's spool. Append-only; the only copy of anything that arrived while no waker was up. |
-| `~/.local/state/ping-pong/<id>.cursor` | each machine | Byte offset `--await` has already delivered. Reset to 0 if the spool is shorter than the cursor, so a truncated spool cannot silently swallow every future message. |
-| `~/.local/state/ping-pong/<id>.watch` | each machine | Written by `--watch` while it runs (`pid=`, `session=`, `since=`), removed on exit. A `.watch` whose pid is dead is a watcher that was killed hard. |
-| `pp-keep-<id>.service` | `systemd --user`, transient | The keeper. `systemctl --user status pp-keep-<id>` and `journalctl --user -u pp-keep-<id>` are where its story is. |
+| `~/.local/state/ping-pong/<id>.<side>.side` | each machine | Which side this machine is on that channel. |
+| `~/.local/state/ping-pong/<id>.<side>.owner` | each machine | The session that owns this side (`session=<harness>:<pid>`, plus `harness` and `birth`). What the leash, the SessionEnd hook and the orphan check all read. |
+| `~/.local/state/ping-pong/<id>.<side>.inbox` | each machine | The keeper's spool. Append-only; the only copy of anything that arrived while no waker was up. |
+| `~/.local/state/ping-pong/<id>.<side>.cursor` | each machine | Byte offset `--await` has already delivered. Reset to 0 if the spool is shorter than the cursor, so a truncated spool cannot silently swallow every future message. |
+| `~/.local/state/ping-pong/<id>.<side>.watch` | each machine | Written by `--watch` while it runs (`pid=`, `session=`, `since=`), removed on exit. A `.watch` whose pid is dead is a watcher that was killed hard. |
+| `pp-keep-<id>-<side>.service` | `systemd --user`, transient | The keeper. `systemctl --user status pp-keep-<id>-<side>` and `journalctl --user -u pp-keep-<id>-<side>` are where its story is. |
+| `pp-wake-<id>-<side>.service` | user systemd, transient | Codex bell, bound to the keeper. Journal records bounded failures. |
+| `<id>.<side>.wake-state` | local state | Birth/thread/cursor binding, attempts and delivered flag; retained across rearm. |
 | `$PP_BUS_ROOT/<id>/` | bus host | The channel: `meta`, the two FIFOs, listener markers. |
 
 ### State on disk inherits the process umask — a private channel is not private by default
 
 `pp` creates its own local state with whatever umask the calling shell has, never a fixed one
-of its own. Every file a channel writes locally — `<id>.side`, `<id>.owner`, `<id>.direct`
-(peer + port, direct mode) and, once a keeper is running, the spool `<id>.inbox` (the full text
+of its own. Every file a channel writes locally — `<id>.<side>.side`, `<id>.<side>.owner`, `<id>.<side>.direct`
+(peer + port, direct mode) and, once a keeper is running, the spool `<id>.<side>.inbox` (the full text
 of everything that crossed the channel) — inherits that umask instead of a private mode.
 
 Measured independently on two machines with two different default umasks:
