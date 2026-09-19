@@ -25,6 +25,8 @@ El id es validado y generado por el bus. No contiene cuerpo, tema ni firma del p
 
 No relances el disparador por mensaje. Registra el cursor avisado y su presupuesto en `<id>.<lado>.wake-state`: nuevos bytes sin avance del cursor no causan otro timbre, incluso tras rearmar. Avanzar el cursor permite avisar del lote siguiente.
 
+Queue corre fuera de `mail-lock`: el keeper puede seguir escribiendo y await puede drenar mientras la llamada espera. El resultado se registra contra la reserva original, sin marcar como avisado un cursor nuevo.
+
 Queue tiene hasta tres intentos por cursor, cada uno con timeout; agotarlos conserva el correo y registra el fallo en el journal. Rearmar no reinicia ese presupuesto: drena manualmente y revisa el error antes de esperar nuevos avisos. `--unwake <id>` desarma solo el timbre.
 
 ## Cierre y propiedad

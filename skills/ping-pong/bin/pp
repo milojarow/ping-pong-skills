@@ -1455,6 +1455,7 @@ cmd_wake_run() (
   }
   wake_live || return 0
   local inw="" event savedKey="" savedCursor=-1 attempts=0 delivered=0 cur size temporary rc
+  local attemptCursor attemptCount resultKey resultCursor resultAttempts resultDelivered
   # Watch cursor renames too. A write can arrive during a drain, with no later
   # inbox event; the new cursor must release the next batch's bell.
   if command -v inotifywait >/dev/null 2>&1; then
@@ -1488,23 +1489,37 @@ cmd_wake_run() (
       temporary=$(mktemp "$ledger.XXXXXXXX") || return 1
       printf '%s\t%s\t%s\t0\n' "$key" "$cur" "$attempts" > "$temporary"
       mv -f -- "$temporary" "$ledger" || return 1
+      attemptCursor=$cur; attemptCount=$attempts
+      # External queue latency must not block the keeper's append or an await.
+      # Only the snapshot and budget update belong in the mailbox transaction.
+      flock -u 8
       # Last check immediately before queue. No peer data reaches this command.
       wake_live || return 0
       timeout --kill-after=1 "${PP_WAKE_TIMEOUT:-10}" "$binary" queue --thread "$thread" \
         --message "Ping-pong: drain channel $id with pp --await $id." >/dev/null 2>&1
       rc=$?
+      flock -x 8 || return 1
+      wake_live || return 0
+      IFS=$'\t' read -r resultKey resultCursor resultAttempts resultDelivered < "$ledger" || return 1
       if [ "$rc" = 0 ]; then
-        temporary=$(mktemp "$ledger.XXXXXXXX") || return 1
-        printf '%s\t%s\t%s\t1\n' "$key" "$cur" "$attempts" > "$temporary"
-        mv -f -- "$temporary" "$ledger" || return 1
-      else
-        note "wake $id: queue failed (exit $rc, attempt $attempts/3); mail remains in spool"
-        flock -u 8
-        if [ "$attempts" -lt 3 ]; then
-          sleep "${PP_WAKE_RETRY_DELAY:-2}"
-          continue
+        # The cursor/owner may have changed while queue ran. Never record an
+        # old completion against a newer reservation or a different session.
+        if [ "$resultKey" = "$key" ] && [ "$resultCursor" = "$attemptCursor" ] &&
+            [ "$resultAttempts" = "$attemptCount" ] && [ "$resultDelivered" = 0 ]; then
+          temporary=$(mktemp "$ledger.XXXXXXXX") || return 1
+          printf '%s\t%s\t%s\t1\n' "$key" "$attemptCursor" "$attemptCount" > "$temporary"
+          mv -f -- "$temporary" "$ledger" || return 1
         fi
+      else
+        note "wake $id: queue failed (exit $rc, attempt $attemptCount/3); mail remains in spool"
       fi
+      flock -u 8
+      if [ "$rc" != 0 ] && [ "$attemptCount" -lt 3 ]; then
+        sleep "${PP_WAKE_RETRY_DELAY:-2}"
+      fi
+      # Recheck now: await may have advanced the cursor during queue, even if
+      # inotify coalesced events or the polling fallback is in use.
+      continue
     fi
     flock -u 8
     # Readiness is not an event. Only spool/cursor/closure changes matter;
