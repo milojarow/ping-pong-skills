@@ -77,7 +77,12 @@ open_actor() {
 }
 
 active() { systemctl --user is-active --quiet "pp-keep-$channel-$1.service"; }
-inactive() { ! active "$1"; }
+inactive() {
+  local unit="pp-keep-$channel-$1.service" state pid
+  state=$(systemctl --user show "$unit" -p ActiveState --value)
+  pid=$(systemctl --user show "$unit" -p MainPID --value)
+  [ "$state" = inactive ] && [ "$pid" = 0 ]
+}
 has_mail() { rg -l --fixed-strings "$1" "$XDG_STATE_HOME/ping-pong" >/dev/null; }
 assert_absent() {
   if rg -q "$1" "$2"; then return 1; else [ "$?" = 1 ]; fi
@@ -150,6 +155,9 @@ same_machine() {
   request first "$pp" --await "$channel" --wait 3
   rg -q '^only-to-a$' "$lastRequest.out"
   assert_absent '^only-to-a$' "$XDG_STATE_HOME/ping-pong/$channel.b.inbox"
+  request first "$pp" --close "$channel"
+  wait_until inactive a
+  wait_until inactive b
 }
 
 mail_restart() {
@@ -233,23 +241,83 @@ stale_await() {
   rg -q '^belongs-to-replacement$' "$lastRequest.out"
 }
 
+adopt_during_drain() {
+  setup_receiver
+  start_actor claude replacement
+  local owner="claude:$(cat "$caseRoot/receiver/pid")" drainer adopter
+  { printf 'held-drain\n'; head -c 262144 /dev/zero | tr '\0' x; printf '\n'; } > "$caseRoot/large-message"
+  env XDG_STATE_HOME="$caseRoot/sender" PP_SESSION=nosession \
+    "$pp" --send "$channel" < "$caseRoot/large-message"
+  wait_until has_mail held-drain
+  # Real stdout backpressure holds dd inside the drain transaction.
+  (
+    env PP_SESSION="$owner" "$pp" --await "$channel" --wait 3 |
+      { IFS= read -r header; printf '%s\n' "$header" > "$caseRoot/drain-started"
+        wait_until test -f "$caseRoot/release-drain"
+        cat > "$caseRoot/drained-body"; }
+  ) &
+  drainer=$!; actorPids+=("$drainer")
+  wait_until test -s "$caseRoot/drain-started"
+  ( request replacement "$pp" --adopt "$channel" ) &
+  adopter=$!; actorPids+=("$adopter")
+  wait_until inactive a
+  kill -0 "$adopter"
+  rg -qx "session=$owner" "$XDG_STATE_HOME/ping-pong/$channel.a.owner"
+  touch "$caseRoot/release-drain"
+  wait "$drainer"
+  wait "$adopter"
+  cmp "$caseRoot/large-message" "$caseRoot/drained-body"
+  rg -qx "session=claude:$(cat "$caseRoot/replacement/pid")" "$XDG_STATE_HOME/ping-pong/$channel.a.owner"
+}
+
+protected_unkeep() {
+  setup_receiver
+  start_actor claude outsider
+  if request outsider "$pp" --unkeep "$channel"; then return 1; fi
+  active a
+}
+
+leash_mail() {
+  local journalSince; journalSince=$(date --iso-8601=seconds)
+  setup_receiver
+  send_mail survives-owner-death
+  kill -TERM "$(cat "$caseRoot/receiver/pid")"
+  wait_until inactive a
+  test ! -d "$PP_BUS_ROOT/$channel"
+  test -f "$XDG_STATE_HOME/ping-pong/$channel.a.closed"
+  has_mail survives-owner-death
+  # A short-lived child can log before journald resolves its user-unit field.
+  # Match the unique channel and executable, not only _SYSTEMD_USER_UNIT.
+  journal_has_pending() {
+    journalctl --user --since "$journalSince" -t pp --grep="$channel" \
+      --no-pager -o cat > "$caseRoot/keeper-journal"
+    rg -q "^pp: channel $channel side a .*UNREAD" "$caseRoot/keeper-journal"
+  }
+  wait_until journal_has_pending
+  env PP_SESSION=nosession "$pp" --await "$channel" --wait 2 > "$caseRoot/recovered"
+  rg -q '^survives-owner-death$' "$caseRoot/recovered"
+}
+
 version() { bash "$repo/tools/check-version-chain.sh"; }
 
 cleanup_case() {
-  local dir id side pid
-  for dir in "$PP_BUS_ROOT"/pp-*; do
-    [ -d "$dir" ] || continue
-    id=${dir##*/}
+  local side pid status=0
+  # The channel may already have been deleted by a successful close/leash.
+  # Its recorded id still names both units; a missing bus directory is not proof
+  # that either cgroup has finished shutting down.
+  if [ -n "$channel" ]; then
     for side in a b; do
-      systemctl --user stop "pp-keep-$id-$side.service" >/dev/null 2>&1 || true
-      systemctl --user reset-failed "pp-keep-$id-$side.service" >/dev/null 2>&1 || true
+      systemctl --user stop "pp-keep-$channel-$side.service" >/dev/null 2>&1 || true
+      systemctl --user reset-failed "pp-keep-$channel-$side.service" >/dev/null 2>&1 || true
+      wait_until inactive "$side" || status=1
     done
-  done
+  fi
   for pid in "${actorPids[@]}"; do
     kill -CONT "$pid" 2>/dev/null || true
     kill -TERM "$pid" 2>/dev/null || true
   done
   wait 2>/dev/null || true
+  return "$status"
 }
 
 if [ "${1:-}" = --case ]; then
@@ -260,7 +328,7 @@ if [ "${1:-}" = --case ]; then
     mkdir -p "$XDG_CONFIG_HOME/ping-pong" "$XDG_STATE_HOME" "$PP_BUS_ROOT"
     printf 'bus_mode=local\nbus_ssh=\n' > "$XDG_CONFIG_HOME/ping-pong/config"
     actorPids=() requestCount=0 lastRequest= channel=
-    trap cleanup_case EXIT
+    trap 'caseStatus=$?; cleanup_case || caseStatus=1; exit "$caseStatus"' EXIT
     trap 'exit 124' TERM INT HUP
     trap 'printf "failed: %s\n" "$BASH_COMMAND" >&2' ERR
     "$caseName"
@@ -269,7 +337,8 @@ fi
 
 failures=0
 for caseName in identity_claude identity_codex identity_grok identity_human \
-  keeper_codex keeper_grok same_machine mail_restart mail_concurrent mail_close pid_reuse stale_await version; do
+  keeper_codex keeper_grok same_machine mail_restart mail_concurrent mail_close pid_reuse \
+  stale_await adopt_during_drain protected_unkeep leash_mail version; do
   timeout --kill-after=10 60 "$repo/tools/selftest.sh" --case "$caseName" "$testRoot" > "$testRoot/$caseName.log" 2>&1 &
   casePid=$!
   if wait "$casePid"; then

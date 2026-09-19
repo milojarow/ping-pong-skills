@@ -2191,6 +2191,7 @@ case "$op" in
     ;;
   unkeep)
     [ -n "$id" ] || die "--unkeep needs the channel id"
+    assert_owner "$id" "$label" 0 || exit 1
     cmd_unkeep "$id"
     ;;
   await)
