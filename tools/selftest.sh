@@ -8,7 +8,7 @@ if [ "${PP_SELFTEST_ISOLATED:-0}" != 1 ]; then
     --unit="pp-selftest-$(date +%s)-$$" \
     --setenv=PP_SELFTEST_ISOLATED=1 \
     --setenv=PP_SELFTEST_LOG_DIR="${PP_SELFTEST_LOG_DIR:-}" \
-    -- "$repo/tools/selftest.sh"
+    -- "$repo/tools/selftest.sh" "$@"
 fi
 
 unset PP_SESSION PP_SIDE PP_SESSION_BIRTH
@@ -325,12 +325,13 @@ whoami() {
   done
   "$pp" --whoami > "$caseRoot/human"
   rg -qx 'session=nosession' "$caseRoot/human"
-  env PP_SESSION=grok:123 "$pp" --whoami > "$caseRoot/override"
-  rg -qx 'session=grok:123' "$caseRoot/override"
+  local declared="grok:$(cat "$caseRoot/grok/pid")"
+  env PP_SESSION="$declared" "$pp" --whoami > "$caseRoot/override"
+  rg -qx "session=$declared" "$caseRoot/override"
 }
 
 setup_wake() {
-  start_actor codex receiver
+  start_actor "${1:-codex}" receiver
   open_actor receiver
   request receiver "$pp" --keep "$channel"
   mkdir -p "$caseRoot/fake-bin" "$caseRoot/sender"
@@ -347,7 +348,7 @@ FAKE
 arm_wake() {
   request receiver env PATH="$caseRoot/fake-bin:$PATH" \
     CODEX_THREAD_ID=11111111-2222-3333-4444-555555555555 \
-    PP_WAKE_RETRY_DELAY=1 PP_WAKE_TIMEOUT=2 PP_LEASH_POLL=1 \
+    PP_WAKE_RETRY_DELAY=1 PP_WAKE_TIMEOUT="${testWakeTimeout:-2}" PP_LEASH_POLL=1 \
     "$pp" --wake "$channel"
 }
 queue_count() {
@@ -415,12 +416,158 @@ wake_reject() {
   setup_wake
   if request receiver env -u CODEX_THREAD_ID "$pp" --wake "$channel"; then return 1; fi
   if request receiver env CODEX_THREAD_ID=not-a-uuid "$pp" --wake "$channel"; then return 1; fi
-  start_actor grok outsider
-  if request outsider env CODEX_THREAD_ID=11111111-2222-3333-4444-555555555555 "$pp" --wake "$channel"; then return 1; fi
   queue_count 0
   arm_wake
   systemctl --user is-active --quiet "pp-wake-$channel-a.service"
 }
+
+# Launch a genuinely independent process under the user manager. The manager
+# does not inherit the actor's ancestry; strip any manager identity overrides.
+no_agent() {
+  systemd-run --user --quiet --wait --pipe --collect \
+    --unit="pp-selftest-outsider-$$-$((++requestCount))" \
+    --setenv=XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+    --setenv=XDG_STATE_HOME="$XDG_STATE_HOME" \
+    --setenv=PP_BUS_ROOT="$PP_BUS_ROOT" \
+    --setenv=PP_SEND_GRACE=2 --setenv=PP_LEASH_POLL=1 \
+    -- /usr/bin/env -u PP_SESSION -u PP_SESSION_BIRTH -u PP_SIDE "$@"
+}
+
+nosession_live() {
+  setup_receiver
+  send_mail private-live-mail
+  local owner="claude:$(cat "$caseRoot/receiver/pid")" operation
+  no_agent "$pp" --whoami > "$caseRoot/outsider-identity"
+  rg -qx 'session=nosession' "$caseRoot/outsider-identity"
+  for operation in --await --listen --send --keep --unkeep --wake --unwake --close; do
+    local args=("$operation" "$channel")
+    case "$operation" in
+      --await|--listen) args+=(--wait 1) ;;
+      --send) args+=(-m forbidden-sender) ;;
+    esac
+    if no_agent "$pp" "${args[@]}" > "$caseRoot/refusal" 2>&1; then
+      echo "unexpected success: nosession $operation" >&2
+      return 1
+    fi
+    rg -q 'LIVE session' "$caseRoot/refusal"
+    rg -q --fixed-strings "$owner" "$caseRoot/refusal"
+    active a
+  done
+  no_agent "$pp" --info "$channel" > "$caseRoot/info"
+  no_agent "$pp" --list > "$caseRoot/list"
+  request receiver "$pp" --await "$channel" --wait 2
+  rg -q '^private-live-mail$' "$lastRequest.out"
+  send_mail explicit-adoption
+  no_agent "$pp" --await "$channel" --adopt --wait 2 > "$caseRoot/adopted"
+  rg -q '^explicit-adoption$' "$caseRoot/adopted"
+  no_agent "$pp" --close "$channel"
+}
+
+identity_spoof() {
+  setup_receiver
+  send_mail cannot-steal
+  start_actor grok attacker
+  local owner="claude:$(cat "$caseRoot/receiver/pid")" operation
+  for operation in --whoami --await; do
+    local args=("$operation")
+    [ "$operation" = --whoami ] || args+=("$channel" --wait 1)
+    if request attacker env PP_SESSION="$owner" "$pp" "${args[@]}"; then return 1; fi
+    rg -q 'declared session.*does not match.*process session' "$lastRequest.out"
+  done
+  if request attacker env PP_SESSION=nosession "$pp" --whoami; then return 1; fi
+  rg -q 'declared session.*does not match.*process session' "$lastRequest.out"
+  request attacker "$pp" --whoami
+  rg -qx 'harness=grok' "$lastRequest.out"
+  request receiver "$pp" --await "$channel" --wait 2
+  rg -q '^cannot-steal$' "$lastRequest.out"
+}
+
+identity_override() {
+  setup_receiver
+  local owner="claude:$(cat "$caseRoot/receiver/pid")" birth
+  birth=$(sed -n 's/^birth=//p' "$XDG_STATE_HOME/ping-pong/$channel.a.owner")
+  no_agent env PP_SESSION="$owner" PP_SESSION_BIRTH="$birth" "$pp" --whoami > "$caseRoot/valid-override"
+  rg -qx "session=$owner" "$caseRoot/valid-override"
+  for declared in "grok:$(cat "$caseRoot/receiver/pid")" "claude:$$" invalid; do
+    if no_agent env PP_SESSION="$declared" "$pp" --whoami > "$caseRoot/invalid" 2>&1; then return 1; fi
+  done
+  if no_agent env PP_SESSION="$owner" PP_SESSION_BIRTH=wrong "$pp" --whoami > "$caseRoot/birth" 2>&1; then return 1; fi
+  rg -q 'birth|incarnation' "$caseRoot/birth"
+}
+
+wake_nonblocking() {
+  setup_wake
+  # This fake deliberately holds queue open. The transport and drain must work
+  # BEFORE release, not just after a timeout quietly frees the mailbox lock.
+  python3 - "$caseRoot" <<'SLOW'
+from pathlib import Path
+import sys
+root=Path(sys.argv[1]); fake=root/'fake-bin/codex'
+fake.write_text("#!/usr/bin/python3\nimport json, pathlib, sys, time\nr=pathlib.Path("+repr(str(root))+" )\nwith (r/'queue.jsonl').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n(r/'queue-started').touch()\nend=time.monotonic()+25\nwhile not (r/'release-queue').exists():\n if time.monotonic()>end: sys.exit(124)\n time.sleep(0.05)\n(r/'queue-finished').touch()\n")
+fake.chmod(0o755)
+SLOW
+  local testWakeTimeout=30
+  arm_wake
+  send_mail first-during-queue
+  wait_until test -e "$caseRoot/queue-started"
+  for body in second-during-queue third-during-queue; do
+    env XDG_STATE_HOME="$caseRoot/sender" PP_SESSION=nosession PP_SEND_GRACE=2 \
+      "$pp" --send "$channel" --as sender -m "$body"
+  done
+  wait_until has_mail third-during-queue
+  request receiver "$pp" --await "$channel" --wait 2
+  for body in first-during-queue second-during-queue third-during-queue; do
+    rg -qx "$body" "$lastRequest.out"
+  done
+  test ! -e "$caseRoot/queue-finished"
+  # A new batch arriving after cursor advancement must get its own bell when
+  # the old queue completes; old success must not mark the new cursor delivered.
+  send_mail next-batch-during-queue
+  touch "$caseRoot/release-queue"
+  wait_until queue_count 2
+  quiet_queue 2
+  request receiver "$pp" --await "$channel" --wait 2
+  rg -qx next-batch-during-queue "$lastRequest.out"
+}
+
+mail_sigkill() {
+  setup_receiver
+  send_mail 'complete body after SIGKILL: ñ and $literal'
+  local owner="claude:$(cat "$caseRoot/receiver/pid")" drainer
+  mkdir -p "$caseRoot/cut-bin"
+  # Intercept only the cursor rename, after dd has completed its entire output.
+  # No production hook: PATH substitution makes this exact crash window repeatable.
+  python3 - "$caseRoot" <<'CUT'
+from pathlib import Path
+import sys
+root=Path(sys.argv[1]); fake=root/'cut-bin/mv'
+fake.write_text('#!/bin/bash\ncase "${!#}" in *.cursor)\n  touch '+repr(str(root/'before-cursor'))+'\n  while [ ! -e '+repr(str(root/'release-cursor'))+' ]; do sleep 0.1; done ;;\nesac\nexec /usr/bin/mv "$@"\n')
+fake.chmod(0o755)
+CUT
+  setsid env PP_SESSION="$owner" PATH="$caseRoot/cut-bin:$PATH" \
+    "$pp" --await "$channel" --wait 2 > "$caseRoot/first-delivery" &
+  drainer=$!; actorPids+=("$drainer"); testGroups+=("$drainer")
+  wait_until test -e "$caseRoot/before-cursor"
+  [ "$(ps -o pgid= -p "$drainer" | tr -d ' ')" = "$drainer" ]
+  cmp "$XDG_STATE_HOME/ping-pong/$channel.a.inbox" "$caseRoot/first-delivery"
+  [ "$(cat "$XDG_STATE_HOME/ping-pong/$channel.a.cursor" 2>/dev/null || echo 0)" = 0 ]
+  kill -KILL -- "-$drainer"
+  wait "$drainer" || [ "$?" = 137 ]
+  request receiver "$pp" --await "$channel" --wait 2
+  cmp "$caseRoot/first-delivery" "$lastRequest.out"
+  if request receiver "$pp" --await "$channel" --wait 1; then return 1; fi
+  [ "$(cat "$lastRequest.rc")" = 124 ]
+}
+
+wake_wrong_harness() {
+  setup_wake "$1"
+  if arm_wake; then echo "unexpected wake for owner $1" >&2; return 1; fi
+  rg -q --fixed-strings -- '--wake is for a live Codex receiver' "$lastRequest.out"
+  active a
+  queue_count 0
+}
+wake_reject_grok() { wake_wrong_harness grok; }
+wake_reject_claude() { wake_wrong_harness claude; }
 
 install_fixture() {
   installHome="$caseRoot/home"
@@ -485,6 +632,10 @@ cleanup_case() {
       wait_until inactive "$side" || status=1
     done
   fi
+  for pid in "${testGroups[@]}"; do
+    kill -CONT -- "-$pid" 2>/dev/null || true
+    kill -TERM -- "-$pid" 2>/dev/null || true
+  done
   for pid in "${actorPids[@]}"; do
     kill -CONT "$pid" 2>/dev/null || true
     kill -TERM "$pid" 2>/dev/null || true
@@ -500,7 +651,7 @@ if [ "${1:-}" = --case ]; then
     export XDG_CONFIG_HOME="$caseRoot/config" XDG_STATE_HOME="$caseRoot/state" PP_BUS_ROOT="$caseRoot/bus"
     mkdir -p "$XDG_CONFIG_HOME/ping-pong" "$XDG_STATE_HOME" "$PP_BUS_ROOT"
     printf 'bus_mode=local\nbus_ssh=\n' > "$XDG_CONFIG_HOME/ping-pong/config"
-    actorPids=() requestCount=0 lastRequest= channel=
+    actorPids=() testGroups=() requestCount=0 lastRequest= channel=
     trap 'caseStatus=$?; cleanup_case || caseStatus=1; exit "$caseStatus"' EXIT
     trap 'exit 124' TERM INT HUP
     trap 'printf "failed: %s\n" "$BASH_COMMAND" >&2' ERR
@@ -509,10 +660,20 @@ if [ "${1:-}" = --case ]; then
 fi
 
 failures=0
-for caseName in identity_claude identity_codex identity_grok identity_human \
+caseNames=(identity_claude identity_codex identity_grok identity_human \
   keeper_codex keeper_grok same_machine mail_restart mail_concurrent mail_close pid_reuse \
   stale_await adopt_during_drain protected_unkeep leash_mail version \
-  whoami wake_batch wake_retry wake_dead wake_reject install_links install_old install_refuse; do
+  whoami wake_batch wake_retry wake_dead wake_reject install_links install_old install_refuse \
+  nosession_live identity_spoof identity_override wake_nonblocking mail_sigkill wake_reject_grok wake_reject_claude)
+if [ "${1:-}" = --only ]; then
+  shift
+  [ "$#" -gt 0 ] || exit 2
+  for selected in "$@"; do
+    printf '%s\n' "${caseNames[@]}" | rg -qxF "$selected" || exit 2
+  done
+  caseNames=("$@")
+fi
+for caseName in "${caseNames[@]}"; do
   timeout --kill-after=10 60 "$repo/tools/selftest.sh" --case "$caseName" "$testRoot" > "$testRoot/$caseName.log" 2>&1 &
   casePid=$!
   if wait "$casePid"; then
