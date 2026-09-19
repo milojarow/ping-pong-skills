@@ -1655,12 +1655,14 @@ preserve_mail() (
 #   - no inotifywait: say so loudly, then poll on PP_AWAIT_POLL rather than sit
 #     silently armed on nothing
 cmd_watch() {
-  local id="$1"
-  is_direct "$id" && die "--watch needs a keeper's spool, and DIRECT mode has no keeper.
-    Direct mode is degraded: use an explicit foreground pp --listen $id --wait N."
+  local id="$1" adopt="${2:-0}" PP_SIDE="${PP_SIDE:-}"
   need_config
   valid_id "$id" || die "invalid id: '$id'"
-  local side; side=$(my_side "$id")
+  PP_SIDE=$(my_side "$id") || return 1
+  assert_owner "$id" "$(default_label)" "$adopt" || return 1
+  is_direct "$id" && die "--watch needs a keeper's spool, and DIRECT mode has no keeper.
+    Direct mode is degraded: use an explicit foreground pp --listen $id --wait N."
+  local side="$PP_SIDE"
   require_channel "$id"
 
   case "$(keeper_state "$id")" in
@@ -2490,7 +2492,7 @@ case "$op" in
     ;;
   watch)
     [ -n "$id" ] || die "--watch needs the channel id"
-    cmd_watch "$id"
+    cmd_watch "$id" "$adopt"
     ;;
   adopt) [ -n "$id" ] || die "--adopt needs the channel id"; cmd_adopt "$id" "$label" ;;
   open)
