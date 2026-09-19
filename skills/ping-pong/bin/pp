@@ -2204,11 +2204,54 @@ cmd_adopt() {
 }
 
 cmd_install() {
-  local dest="$HOME/.local/bin/pp"
-  mkdir -p "$HOME/.local/bin"
-  cp -f "${BASH_SOURCE[0]}" "$dest" && chmod +x "$dest" \
-    && say "pp: installed at $dest (v$PP_VERSION). Re-run after every plugin update." \
-    || die "could not copy to $dest"
+  local check="$1" canonical="$HOME/.claude/plugins/marketplaces/ping-pong-skills/skills/ping-pong"
+  local skill="$HOME/.codex/skills/ping-pong" binary="$HOME/.local/bin/pp" path target backup
+  [ -f "$canonical/SKILL.md" ] && [ -x "$canonical/bin/pp" ] ||
+    die "canonical checkout missing: $canonical"
+  local paths=("$skill" "$binary") targets=("$canonical" "$canonical/bin/pp") kinds=() index
+  legacy_pp() {
+    [ -f "$1" ] && [ ! -L "$1" ] &&
+      grep -q '^# pp - ping-pong: an isolated two-party message channel' "$1" &&
+      grep -q '^PP_VERSION="[0-9][0-9.]*"$' "$1"
+  }
+  # Preflight BOTH destinations before changing either. Unknown content and
+  # foreign links are never replaced. Recognized old copies are backed up.
+  for index in 0 1; do
+    path=${paths[index]}; target=${targets[index]}
+    if [ -L "$path" ] && [ "$path" -ef "$target" ]; then
+      kinds+=(linked)
+      say "pp: own link: $path -> $target"
+    elif [ "$check" = 1 ]; then
+      die "check failed: $path is not a link to $target"
+    elif [ -L "$path" ]; then
+      die "foreign link at $path -> $(readlink "$path"); left untouched"
+    elif [ ! -e "$path" ]; then
+      kinds+=(missing)
+      say "pp: missing: $path"
+    elif { [ "$index" = 0 ] && [ -d "$path" ] &&
+        grep -qx 'name: ping-pong' "$path/SKILL.md" 2>/dev/null && legacy_pp "$path/bin/pp"; } ||
+        { [ "$index" = 1 ] && legacy_pp "$path"; }; then
+      kinds+=(legacy)
+      say "pp: legacy ping-pong copy: $path (backup required)"
+    else
+      die "unrecognized content at $path; left untouched"
+    fi
+  done
+  if [ "$check" = 1 ]; then say "pp: install check OK: one canonical source"; return 0; fi
+  for index in 0 1; do
+    path=${paths[index]}; target=${targets[index]}
+    [ "${kinds[index]}" != linked ] || continue
+    mkdir -p "$(dirname "$path")" || return 1
+    if [ "${kinds[index]}" = legacy ]; then
+      backup="$path.pre-link-$(date +%s)-$$"
+      [ ! -e "$backup" ] && [ ! -L "$backup" ] || die "backup already exists: $backup"
+      mv -- "$path" "$backup" || return 1
+      say "pp: legacy backup: $backup"
+    fi
+    ln -s -- "$target" "$path" || return 1
+    say "pp: linked $path -> $target"
+  done
+  cmd_install 1
 }
 
 usage() {
@@ -2282,7 +2325,8 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   --whoami        print harness, session identity and receiver recipe path
   --wake <id>     arm Codex's supervised fixed bell (needs CODEX_THREAD_ID + --keep)
   --unwake <id>   stop this side's bell; keep receiving into its spool
-  --install       copy this script to ~/.local/bin/pp
+  --install       link Codex's skill and ~/.local/bin/pp to the canonical checkout
+  --install --check  verify both links resolve to that same source (read-only)
   -h, --help      this help
   -V, --version   version
 
@@ -2303,7 +2347,7 @@ EOF
 # ---------------------------------------------------------------------- parser
 
 op="" id="" topic="" body="" label="" wait_for=0 force=0 adopt=0 direct=0 peer="" retries=0
-close_abandoned=0 reason=""
+close_abandoned=0 reason="" install_check=0
 setup_args=()
 
 while [ $# -gt 0 ]; do
@@ -2327,6 +2371,7 @@ while [ $# -gt 0 ]; do
     --setup) op="setup" ;;
     --mesh) op="mesh" ;;
     --install) op="install" ;;
+    --check) install_check=1 ;;
     --whoami) op="whoami" ;;
     --wake) op="wake" ;;
     --wake-run) op="wake-run" ;;
@@ -2357,10 +2402,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$label" ] || label=$(default_label)
+[ "$install_check" = 0 ] || [ "$op" = install ] || die "--check only applies to --install"
 
 case "$op" in
   setup) cmd_setup "${setup_args[@]:-}" "${id:-}" ;;
-  install) cmd_install ;;
+  install) cmd_install "$install_check" ;;
   whoami) cmd_whoami ;;
   wake|wake-run|unwake)
     [ -n "$id" ] || die "--$op needs the channel id"
