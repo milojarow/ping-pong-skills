@@ -345,18 +345,20 @@ require_channel() {
 
 # ------------------------------------------------------------- ownership layer
 
-claim_channel() {
+claim_channel() (
   local id="$1" label="$2"
   local owner birth file temporary
   owner=$(session_id)
   birth=$(session_birth "$owner" || true)
   file=$(owner_file "$id") || return 1
   mkdir -p "$STATE_DIR"
+  exec 8>"$(state_file "$id" mail-lock)" || return 1
+  flock -x 8 || return 1
   temporary=$(mktemp "$STATE_DIR/.owner-XXXXXXXX") || return 1
   printf 'session=%s\nharness=%s\nbirth=%s\nlabel=%s\nclaimed=%s\n' \
     "$owner" "${owner%%:*}" "$birth" "$label" "$(date -u +%FT%TZ)" > "$temporary"
   mv -f -- "$temporary" "$file"
-}
+)
 
 # Refuse to operate on a channel that belongs to a DIFFERENT live session on this
 # machine. That is the guard against crossed wires: without it, any session here
@@ -1353,6 +1355,10 @@ cmd_await() (
   need_config
   PP_SIDE=$(my_side "$id") || return 1
   assert_owner "$id" "$(default_label)" 0 || return 1
+  local readerOwner readerBirth ownerPath
+  readerOwner=$(session_id)
+  ownerPath=$(owner_file "$id")
+  readerBirth=$(sed -n 's/^birth=//p' "$ownerPath")
   local spool cursor cur size temporary started=$SECONDS
   spool=$(spool_file "$id"); cursor=$(cursor_file "$id")
   touch "$spool" || return 1
@@ -1361,6 +1367,16 @@ cmd_await() (
     # Writers share this lock, so the snapshot ends at a complete append.
     # Release it while idle so each reader can honour its own timeout.
     flock -x 8 || return 1
+    # Adoption and draining share the same lock. An old waiter must not read
+    # mail after ownership has moved, even if its process survived the handoff.
+    if [ "$readerOwner" != nosession ]; then
+      if [ "$(sed -n 's/^session=//p' "$ownerPath")" != "$readerOwner" ] ||
+         [ "$(sed -n 's/^birth=//p' "$ownerPath")" != "$readerBirth" ] ||
+         ! session_alive "$readerOwner" "$readerBirth"; then
+        note "ownership changed or session ended for $id; this waiter stops"
+        return 1
+      fi
+    fi
     cur=$(cat "$cursor" 2>/dev/null || echo 0)
     [[ "$cur" =~ ^[0-9]+$ ]] || return 1
     size=$(stat -c %s "$spool") || return 1

@@ -14,10 +14,13 @@ fi
 unset PP_SESSION PP_SIDE PP_SESSION_BIRTH
 export PP_LEASH_POLL=1 PP_AWAIT_POLL=1 PP_SEND_GRACE=3 PP_SEND_TIMEOUT=5
 pp="$repo/skills/ping-pong/bin/pp"
-testRoot=$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/pp-selftest-XXXXXXXX")
-trap 'gio trash "$testRoot"' EXIT
-mkdir -p "$testRoot/bin"
-cat > "$testRoot/bin/actor" <<'ACTOR'
+if [ "${1:-}" = --case ]; then
+  testRoot=$3
+else
+  testRoot=$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/pp-selftest-XXXXXXXX")
+  trap 'gio trash "$testRoot"' EXIT
+  mkdir -p "$testRoot/bin"
+  cat > "$testRoot/bin/actor" <<'ACTOR'
 #!/bin/bash
 set -uo pipefail
 actorDir=$1
@@ -32,6 +35,7 @@ for harness in claude codex grok; do
   cp "$testRoot/bin/actor" "$testRoot/bin/$harness"
   chmod +x "$testRoot/bin/$harness"
 done
+fi
 
 wait_until() {
   local deadline=$((SECONDS + 15))
@@ -75,6 +79,9 @@ open_actor() {
 active() { systemctl --user is-active --quiet "pp-keep-$channel-$1.service"; }
 inactive() { ! active "$1"; }
 has_mail() { rg -l --fixed-strings "$1" "$XDG_STATE_HOME/ping-pong" >/dev/null; }
+assert_absent() {
+  if rg -q "$1" "$2"; then return 1; else [ "$?" = 1 ]; fi
+}
 
 setup_receiver() {
   start_actor claude receiver
@@ -138,11 +145,11 @@ same_machine() {
   request first "$pp" --send "$channel" -m only-to-b
   request second "$pp" --await "$channel" --wait 3
   rg -q '^only-to-b$' "$lastRequest.out"
-  ! rg -q '^only-to-b$' "$XDG_STATE_HOME/ping-pong/$channel.a.inbox"
+  assert_absent '^only-to-b$' "$XDG_STATE_HOME/ping-pong/$channel.a.inbox"
   request second "$pp" --send "$channel" -m only-to-a
   request first "$pp" --await "$channel" --wait 3
   rg -q '^only-to-a$' "$lastRequest.out"
-  ! rg -q '^only-to-a$' "$XDG_STATE_HOME/ping-pong/$channel.b.inbox"
+  assert_absent '^only-to-a$' "$XDG_STATE_HOME/ping-pong/$channel.b.inbox"
 }
 
 mail_restart() {
@@ -159,8 +166,10 @@ mail_concurrent() {
   local owner="claude:$(cat "$caseRoot/receiver/pid")" first second deadline count
   env PP_SESSION="$owner" "$pp" --await "$channel" --wait 4 > "$caseRoot/read-1" 2>&1 &
   first=$!
+  actorPids+=("$first")
   env PP_SESSION="$owner" "$pp" --await "$channel" --wait 4 > "$caseRoot/read-2" 2>&1 &
   second=$!
+  actorPids+=("$second")
   # Both readers must remain blocked before the positive probe.
   deadline=$((SECONDS + 2))
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -195,6 +204,35 @@ pid_reuse() {
   rg -q 'gone|stale' "$lastRequest.out"
 }
 
+stale_await() {
+  setup_receiver
+  local oldReader oldOwner="claude:$(cat "$caseRoot/receiver/pid")" deadline
+  env PP_SESSION="$oldOwner" "$pp" --await "$channel" --wait 10 > "$caseRoot/old-reader.out" 2>&1 &
+  oldReader=$!
+  actorPids+=("$oldReader")
+  deadline=$((SECONDS + 2))
+  while [ "$SECONDS" -lt "$deadline" ]; do kill -0 "$oldReader"; sleep 0.1; done
+  # Pause only outside the critical section, otherwise adoption would correctly
+  # wait for the suspended reader to release its lock.
+  deadline=$((SECONDS + 5))
+  while :; do
+    kill -STOP "$oldReader"
+    if flock -n "$XDG_STATE_HOME/ping-pong/$channel.a.mail-lock" true; then break; fi
+    kill -CONT "$oldReader"
+    [ "$SECONDS" -lt "$deadline" ]
+    sleep 0.1
+  done
+  start_actor claude replacement
+  request replacement "$pp" --adopt "$channel"
+  request replacement "$pp" --keep "$channel"
+  kill -CONT "$oldReader"
+  send_mail belongs-to-replacement
+  wait "$oldReader" || [ "$?" = 1 ]
+  assert_absent '^belongs-to-replacement$' "$caseRoot/old-reader.out"
+  request replacement "$pp" --await "$channel" --wait 2
+  rg -q '^belongs-to-replacement$' "$lastRequest.out"
+}
+
 version() { bash "$repo/tools/check-version-chain.sh"; }
 
 cleanup_case() {
@@ -207,24 +245,32 @@ cleanup_case() {
       systemctl --user reset-failed "pp-keep-$id-$side.service" >/dev/null 2>&1 || true
     done
   done
-  for pid in "${actorPids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+  for pid in "${actorPids[@]}"; do
+    kill -CONT "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+  done
   wait 2>/dev/null || true
 }
 
-failures=0
-for caseName in identity_claude identity_codex identity_grok identity_human \
-  keeper_codex keeper_grok same_machine mail_restart mail_concurrent mail_close pid_reuse version; do
-  (
+if [ "${1:-}" = --case ]; then
     set -eE
+    caseName=$2
     caseRoot="$testRoot/$caseName"
     export XDG_CONFIG_HOME="$caseRoot/config" XDG_STATE_HOME="$caseRoot/state" PP_BUS_ROOT="$caseRoot/bus"
     mkdir -p "$XDG_CONFIG_HOME/ping-pong" "$XDG_STATE_HOME" "$PP_BUS_ROOT"
     printf 'bus_mode=local\nbus_ssh=\n' > "$XDG_CONFIG_HOME/ping-pong/config"
     actorPids=() requestCount=0 lastRequest= channel=
     trap cleanup_case EXIT
+    trap 'exit 124' TERM INT HUP
     trap 'printf "failed: %s\n" "$BASH_COMMAND" >&2' ERR
     "$caseName"
-  ) > "$testRoot/$caseName.log" 2>&1 &
+    exit
+fi
+
+failures=0
+for caseName in identity_claude identity_codex identity_grok identity_human \
+  keeper_codex keeper_grok same_machine mail_restart mail_concurrent mail_close pid_reuse stale_await version; do
+  timeout --kill-after=10 60 "$repo/tools/selftest.sh" --case "$caseName" "$testRoot" > "$testRoot/$caseName.log" 2>&1 &
   casePid=$!
   if wait "$casePid"; then
     printf 'PASA %s\n' "$caseName"
