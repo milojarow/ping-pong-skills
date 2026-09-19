@@ -1,6 +1,12 @@
 ---
 name: ping-pong
 description: Open or join an isolated live channel between Claude, Codex or Grok sessions; handle peer information within the operator's assignment and diagnose delivery failures on request.
+when_to_use: Trigger phrases — "abre un canal", "comunícate con la otra terminal", "habla con <la otra máquina>", "ping-pong", "🏓", "trabajen en conjunto", "se cayó la shell", or the operator hands over a `pp-xxxxxx` channel id to join.
+argument-hint: "[pp-xxxxxx] [--direct --peer <mesh-ip>]"
+arguments: [channel]
+allowed-tools:
+  - Bash(pp *)
+  - Bash(${CLAUDE_PLUGIN_ROOT}/skills/ping-pong/bin/pp *)
 ---
 
 ## Contrato de alcance
