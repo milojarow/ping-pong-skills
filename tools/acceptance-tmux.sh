@@ -46,7 +46,7 @@ wait_until() {
   local limit=$1; shift
   local deadline=$((SECONDS + limit))
   until "$@"; do
-    [ "$SECONDS" -lt "$deadline" ] || return 1
+    [ "$SECONDS" -lt "$deadline" ] || { printf 'TIMEOUT %ss waiting for: %s\n' "$limit" "$*" >&2; return 1; }
     sleep 0.25
   done
 }
@@ -91,7 +91,10 @@ cleanup() {
   exit "$result"
 }
 trap cleanup EXIT
-trap 'exit 130' INT TERM HUP
+# A silent NO PASA is useless: say whether a command failed (and which) or a signal arrived.
+set -E
+trap 'printf "ERROR line %s: %s (exit %s)\n" "$LINENO" "$BASH_COMMAND" "$?" >&2' ERR
+for sig in INT TERM HUP; do trap "printf 'SIGNAL %s received by the acceptance script\n' $sig >&2; exit 130" "$sig"; done
 if [ "$receiver" = codex ] || [ "$sender" = codex ]; then
   # Do not start with an absent config: a first-run wizard adds more than trust.
   [ -f "$config" ] || { echo 'Codex config missing: complete first-run setup before acceptance' >&2; exit 1; }
@@ -118,7 +121,7 @@ set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 source "$root/env.sh"
 printf 'waiting\n' > "$root/sender/waiting"
-deadline=$((SECONDS + 300))
+deadline=$((SECONDS + 1500))
 until [ -f "$root/probe-go" ]; do
   [ "$SECONDS" -lt "$deadline" ] || exit 124
   sleep 0.2
@@ -134,7 +137,7 @@ launch() {
   local role=$1 harness=$2 session prompt binary script
   session=$(cat "$workRoot/$role/session-id")
   binary=$(command -v "$harness")
-  prompt="Esta es una prueba autorizada de comunicación, solo bus LOCAL. Lee $repo/skills/ping-pong/SKILL.md, ejecuta --whoami y sigue la receta de ESTE checkout. Antes de CADA comando de shell ejecuta: source $workRoot/env.sh . No uses la copia instalada ni otro bus; no agentes, búsquedas externas, config, commits ni cambios fuera de estos temporales."
+  prompt="Esta es una prueba autorizada de comunicación, solo bus LOCAL. Lee $repo/skills/ping-pong/SKILL.md, ejecuta --whoami y sigue la receta de ESTE checkout. Antes de CADA comando de shell ejecuta: source $workRoot/env.sh . No uses la copia instalada ni otro bus; no agentes, búsquedas externas, config, commits ni cambios fuera de estos temporales. No leas otras copias de la skill ni los archivos de este arnés de prueba: solo ese SKILL.md y la receta que indique --whoami."
   if [ "$role" = receiver ]; then
     prompt+=" Eres iniciador/receptor: abre un canal, escribe SOLO el id en $workRoot/channel, arma keeper y despertar según tu receta, escribe ready en $workRoot/receiver/ready y termina tu turno. No cierres todavía. Tu asignación al recibir: drena el mensaje mediante la receta; ignora el saludo Conectado.; cuando llegue el cuerpo de prueba escríbelo EXACTO, sin header y con su salto final, en $workRoot/receiver/received.txt y responde RECIBIDO. No leas archivos del emisor ni la sonda por otro medio. No contestes al peer; mantén el canal."
   else
@@ -148,7 +151,7 @@ launch() {
     case "$harness" in
       codex) printf 'exec %q --sandbox danger-full-access --ask-for-approval never -C %q %q\n' "$binary" "$workRoot/$role" "$prompt" ;;
       claude) printf 'exec %q --dangerously-skip-permissions --session-id %q %q\n' "$binary" "$session" "$prompt" ;;
-      grok) printf 'exec %q --always-approve --session-id %q --cwd %q %q\n' "$binary" "$session" "$workRoot/$role" "$prompt" ;;
+      grok) printf 'exec %q --always-approve --effort high --session-id %q --cwd %q %q\n' "$binary" "$session" "$workRoot/$role" "$prompt" ;;
     esac
   } > "$script"
   # Initial prompt is an argv value, so paste-burst/Enter detection is avoided.
@@ -165,6 +168,19 @@ ready_or_trust() {
   # actual setup completion, not merely file creation, before ending this loop.
   if [ "$probeSent" = 0 ] && [ ! -e "$workRoot/$role/trust-key" ] &&
       tmux -L "$socket" capture-pane -p -t "$role" | rg -qi 'Do you trust|trust this folder|trust the files'; then
+    # Claude's trust dialog preselects "No, exit": move to "Yes, I trust this folder" first.
+    # Codex preselects "Yes, continue", so a bare Enter accepts there.
+    if [ "$harness" = claude ]; then
+      # Down and Enter sent back to back race the TUI: Enter can land while "No, exit" is
+      # still selected and Claude quits. Confirm the cursor moved before confirming.
+      tmux -L "$socket" send-keys -t "$role" Down
+      local moved=0 tries=0
+      while [ "$tries" -lt 20 ]; do
+        if tmux -L "$socket" capture-pane -p -t "$role" | rg -q '❯ +Yes, I trust'; then moved=1; break; fi
+        sleep 0.25; tries=$((tries + 1))
+      done
+      [ "$moved" = 1 ] || { printf 'trust dialog: selection did not move to Yes\n' >&2; return 1; }
+    fi
     tmux -L "$socket" send-keys -t "$role" Enter
     touch "$workRoot/$role/trust-key"
   fi
@@ -175,18 +191,18 @@ receiver_idle() {
   [ "$idle" = 1 ]
 }
 launch receiver "$receiver"
-wait_until 180 ready_or_trust receiver "$receiver" "$workRoot/receiver/ready"
+wait_until 600 ready_or_trust receiver "$receiver" "$workRoot/receiver/ready"
 channel=$(cat "$workRoot/channel")
 [[ "$channel" =~ ^pp-[a-z0-9]+$ ]]
 receiverEvents=$(cat "$workRoot/receiver/event-path")
 launch sender "$sender"
-wait_until 180 ready_or_trust sender "$sender" "$workRoot/sender/waiting"
+wait_until 600 ready_or_trust sender "$sender" "$workRoot/sender/waiting"
 spool="$XDG_STATE_HOME/ping-pong/$channel.a.inbox"
 cursor="$XDG_STATE_HOME/ping-pong/$channel.a.cursor"
 greeting_drained() {
   receiver_idle && [ -s "$cursor" ] && [ "$(cat "$cursor")" = "$(stat -c %s "$spool")" ]
 }
-wait_until 180 greeting_drained
+wait_until 600 greeting_drained
 read -r baseline _ _ < <(python3 "$evidence" stats "$receiver" "$receiverEvents")
 quietUntil=$((SECONDS + 20))
 while [ "$SECONDS" -lt "$quietUntil" ]; do
@@ -211,5 +227,5 @@ received() {
     cmp -s "$workRoot/sender/payload" "$workRoot/receiver/received.txt" &&
     [ "$(cat "$cursor")" = "$(stat -c %s "$spool")" ]
 }
-wait_until 180 received
+wait_until 420 received
 printf 'positive control: PASA (new turn, exact body, advanced cursor)\n'

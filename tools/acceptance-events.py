@@ -27,8 +27,10 @@ def event_path(harness, cwd, session, since):
         path = home / ".grok/sessions" / quote(cwd, safe="") / session / "events.jsonl"
         return path if path.is_file() else None
     if harness == "claude":
-        path = home / ".claude/projects" / cwd.replace("/", "-") / (session + ".jsonl")
-        return path if path.is_file() else None
+        # Claude's project slug maps every non-alphanumeric character to "-" (a "." too),
+        # so do not rebuild it: the session id is a fresh UUID and is unique on its own.
+        matches = sorted((home / ".claude/projects").glob("*/" + session + ".jsonl"))
+        return matches[0] if len(matches) == 1 else None
     root = Path(os.environ.get("CODEX_HOME", home / ".codex")) / "sessions"
     matches = []
     for path in root.rglob("rollout-*.jsonl"):
