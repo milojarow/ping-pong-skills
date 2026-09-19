@@ -1296,14 +1296,23 @@ cmd_keep_run() {
   # itself becomes the error, which is how a clean shutdown ended up logging
   # "leash: unbound variable" as its last word.
   _PP_LEASH_PID=$!
-  trap 'kill "${_PP_LEASH_PID:-0}" 2>/dev/null || true' EXIT INT TERM HUP
+  _PP_KEEP_OWNER=$owner
+  _PP_KEEP_BIRTH=$birth
+  # Death can occur inside --listen, after the loop's life check. Every exit
+  # path must keep the main process alive until the leash finishes closing;
+  # otherwise systemd tears down the cgroup with the close still in flight.
+  trap '
+    if ! session_alive "$_PP_KEEP_OWNER" "$_PP_KEEP_BIRTH"; then
+      wait "$_PP_LEASH_PID" 2>/dev/null || true
+    fi
+    kill "$_PP_LEASH_PID" 2>/dev/null || true
+  ' EXIT
+  trap 'exit 0' INT TERM HUP
 
   local out rc drops=0 closed=0
   while :; do
     if ! session_alive "$owner" "$birth"; then
-      # Let the independent leash finish its close, including when death occurs
-      # between two reads rather than while a read is blocked.
-      wait "$_PP_LEASH_PID" 2>/dev/null || true
+      # The EXIT trap joins the leash, including on a later reader error.
       break
     fi
 
@@ -1351,8 +1360,6 @@ cmd_keep_run() {
     esac
   done
 
-  trap - EXIT INT TERM HUP
-  kill "${_PP_LEASH_PID:-0}" 2>/dev/null || true
   # The bus-side result, never a local existence test, establishes closure.
   # Keep the cursor and spool together so unread bytes remain recoverable.
   [ "$closed" != 1 ] || preserve_mail "$id"
