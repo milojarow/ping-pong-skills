@@ -658,9 +658,11 @@ install_old() {
 install_scan() {
   install_fixture
   env HOME="$installHome" "$pp" --install
+  export CODEX_HOME="$installHome/custom-codex"
   local root duplicate
   for root in "$installHome/.codex/skills" "$installHome/.claude/skills" \
-      "$installHome/.grok/skills" "$installHome/.agents/skills" "$(dirname "$canonical")"; do
+      "$installHome/.grok/skills" "$installHome/.agents/skills" \
+      "$CODEX_HOME/skills" "$(dirname "$canonical")"; do
     duplicate="$root/ping-pong.pre-link-123-456"
     mkdir -p "$root"
     cp -a "$canonical" "$duplicate"
@@ -670,6 +672,12 @@ install_scan() {
     gio trash "$duplicate"
     env HOME="$installHome" "$pp" --install --check
   done
+  # A customized state root must not put future backups back into discovery.
+  if env HOME="$installHome" XDG_STATE_HOME="$installHome/.codex/skills" \
+      "$pp" --install > "$caseRoot/unsafe-state.out" 2>&1; then return 1; fi
+  rg -q 'backup directory is inside a skill directory' "$caseRoot/unsafe-state.out"
+  test ! -e "$installHome/.codex/skills/ping-pong/backups"
+  env HOME="$installHome" "$pp" --install --check
 }
 
 install_refuse() {

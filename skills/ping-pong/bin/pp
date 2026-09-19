@@ -2239,8 +2239,23 @@ cmd_adopt() {
 cmd_install() {
   local check="$1" canonical="$HOME/.claude/plugins/marketplaces/ping-pong-skills/skills/ping-pong"
   local skill="$HOME/.codex/skills/ping-pong" binary="$HOME/.local/bin/pp" path target backup
+  local backupRoot root resolvedRoot
+  local skillRoots=("$HOME/.codex/skills" "${CODEX_HOME:-$HOME/.codex}/skills"
+    "$HOME/.claude/skills" "$HOME/.grok/skills" "$HOME/.agents/skills" "${canonical%/*}")
   [ -f "$canonical/SKILL.md" ] && [ -x "$canonical/bin/pp" ] ||
     die "canonical checkout missing: $canonical"
+  # Old adjacent backups remain discoverable skills, even when both links work.
+  # Report them without moving anything; recovery is an explicit operator action.
+  backupRoot=$(realpath -m "$STATE_DIR/backups") || return 1
+  for root in "${skillRoots[@]}"; do
+    resolvedRoot=$(realpath -m "$root") || return 1
+    [[ "$backupRoot/" != "$resolvedRoot/"* ]] ||
+      die "backup directory is inside a skill directory: $backupRoot (root: $root)"
+    for backup in "$root"/ping-pong.pre-link-*; do
+      [ -e "$backup" ] || [ -L "$backup" ] || continue
+      die "legacy skill backup at $backup; move it outside skill directories before installing or checking"
+    done
+  done
   local paths=("$skill" "$binary") targets=("$canonical" "$canonical/bin/pp") kinds=() index
   legacy_pp() {
     [ -f "$1" ] && [ ! -L "$1" ] &&
@@ -2276,7 +2291,8 @@ cmd_install() {
     [ "${kinds[index]}" != linked ] || continue
     mkdir -p "$(dirname "$path")" || return 1
     if [ "${kinds[index]}" = legacy ]; then
-      backup="$path.pre-link-$(date +%s)-$$"
+      mkdir -p "$backupRoot" || return 1
+      backup="$backupRoot/${path##*/}.pre-link-$(date +%s)-$$"
       [ ! -e "$backup" ] && [ ! -L "$backup" ] || die "backup already exists: $backup"
       mv -- "$path" "$backup" || return 1
       say "pp: legacy backup: $backup"

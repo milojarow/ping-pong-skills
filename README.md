@@ -57,9 +57,15 @@ Grok uses the Claude plugin path. The shared skill routes normal execution to th
 canonical binary even when Claude loaded a versioned plugin cache. An explicit
 operator-provided checkout takes precedence for development and acceptance.
 Installation is idempotent. Recognized old copies
-are moved to reported `*.pre-link-*` backups; unknown content and foreign links
-are refused before either destination changes. `--check` is read-only and exits
-nonzero for a missing or mismatched link. No agent configuration is edited.
+are moved to reported `*.pre-link-*` backups under
+`${XDG_STATE_HOME:-$HOME/.local/state}/ping-pong/backups/`, outside skill discovery.
+Unknown content and foreign links are refused before either destination changes.
+`--check` is read-only and exits nonzero for a missing or mismatched link, or for
+`ping-pong.pre-link-*` leftovers in the known skill roots: `~/.codex/skills`,
+`$CODEX_HOME/skills`, `~/.claude/skills`, `~/.grok/skills`, `~/.agents/skills`, and the
+canonical checkout's `skills/` directory. It reports the offending path for manual
+recovery. A backup root inside one of these directories is also rejected.
+No agent configuration is edited.
 
 Declare the bus once per machine:
 
