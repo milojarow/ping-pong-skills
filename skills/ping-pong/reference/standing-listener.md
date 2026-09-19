@@ -6,8 +6,9 @@ communicate. Do not create such a unit, a detached relaunch loop, or a resume qu
 
 Use `pp --keep` from a live Claude, Codex or Grok session and arm its receiver
 recipe. The keeper survives turns but is leashed to that process incarnation.
-A human shell remains `nosession`; it can recover pending mail and close channels,
-but it cannot create a session-leashed keeper without a recognized live owner.
+A human shell remains `nosession`; it can recover pending mail and close channels
+with no live owner. A live owner requires explicit `--adopt`. It
+cannot create a session-leashed keeper without a recognized live owner.
 
 ## Retiring an old guard on the operator's request
 

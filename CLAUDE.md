@@ -61,16 +61,20 @@ current instructions are SKILL.md and the three harness recipes.
 
 - **Identity is a process incarnation.** Claude, Codex and Grok use
   `<harness>:<pid>` plus boot id and process start ticks. PID reuse must not extend
-  a dead session's ownership. PP_SESSION remains an explicit override; whoami
-  routes by identity, never by a tool named Monitor.
+  a dead session's ownership. PP_SESSION is a checked declaration for supervised
+  units without an agent ancestor; it cannot replace a different detected agent.
+  A nosession caller must explicitly adopt before operating a live owner's endpoint.
+  Whoami routes by identity, never by a tool named Monitor.
 - **State belongs to an endpoint.** `<id>.<a|b>.*` separates two ends under one user.
   Legacy channel-only records are ignored. Mail append, await cursor commit and
   ownership adoption share a lock; restart never truncates the spool. Close keeps
   received mail recoverable rather than erasing it with the transport.
 - **The Codex bell is fixed local text.** Queue enters as a user turn, so no peer
   body, topic or label can enter its argv. A supervised unit is bound to the keeper
-  and the same birth fingerprint. It persists a three-attempt budget and one bell
-  per unread cursor, checks life just before queue, and stops on close/adoption.
+  and the same birth fingerprint. Queue runs outside the mailbox lock; only its
+  reservation and matching result are recorded under that lock. It persists a
+  three-attempt budget and one bell per unread cursor, checks life just before
+  queue, and stops on close/adoption.
   Queue success is not live-only atomic delivery: exiting during/after acceptance
   can leave a durable bell. No cancellation API is implemented here.
 - **Closed session means no communication.** No headless standing listener or

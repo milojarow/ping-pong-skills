@@ -54,13 +54,13 @@ bus_ssh=<alias>
 | Flag | Short | Applies to | Meaning |
 |---|---|---|---|
 | `--topic "..."` | `-t` | `--open` | Human-readable subject, shown in `--list` and `--info`. |
-| `--as <label>` | `-a` | any | Signature on your messages. Defaults to the short hostname. Sanitized to `[A-Za-z0-9._-]`, max 32 chars. |
+| `--as <label>` | `-a` | any | Signature on your messages. Uses `PP_LABEL` if set; otherwise `host:project` (host only in the home/root directory). Sanitized to `[A-Za-z0-9._:-]`, max 40 characters. |
 | `--message "..."` | `-m` | `--send` | The body. Without it, the body is read from **stdin**. |
 | `--wait N` | `-w` | `--listen`, `--await` | Give up after N seconds and exit **124** instead of blocking forever. |
 | `--close-abandoned` | — | `--gc` | Also **close** the channels whose owner session is gone. Never touches a channel whose owner is still alive. |
 | `--reason R` | — | `--session-end` | The SessionEnd reason, when not supplied on stdin. |
 | `--force` | `-f` | `--send` | Skip the listener check and write anyway. |
-| `--adopt` | — | open/join/listen/send/close | Override an ownership refusal and claim the channel for this session. |
+| `--adopt` | — | open/join/listen/send/close/keep/await/wake/unkeep/unwake | Override an ownership refusal and claim the channel for this session. |
 | `--direct` | — | `--open` / `--join` | Create or join a **direct** channel: no bus, peer-to-peer over a private mesh. |
 | `--peer <addr>` | — | `--open --direct` / `--join --direct` | The peer's mesh address. **Optional** when exactly one other machine is on the mesh — there is nothing to choose, and a relayed address is only an opportunity for a typo. Required once there are two or more. |
 
@@ -146,9 +146,9 @@ Environment: `PP_MESH_IP` sets the bind address explicitly — use it when the m
 
 ### Ownership, and how a session is identified
 
-`--open` and `--join` record the calling **session** as the channel's owner; `--listen`, `--send` and `--close` refuse when a different, still-live session on this machine owns it. The session is resolved by walking up the process tree to the agent process — its pid is stable for that session's lifetime and unique on the machine. Override it with `PP_SESSION` when scripting.
+`--open` and `--join` record the calling **session** as the channel's owner. Operations that consume or change the endpoint (`--await`, `--listen`, `--send`, `--keep`, `--unkeep`, `--wake`, `--unwake`, `--close`) refuse when a different, still-live session owns it, including calls from `nosession`. `--info`, `--list` and `--whoami` remain readable. The session is resolved by walking up the process tree to the agent process — its pid is stable for that session's lifetime and unique on the machine. `PP_SESSION` supplies an identity only without an agent ancestor, as in supervised units. With an agent ancestor it must match that process identity; a mismatch fails. A declared pid must be live with the matching comm, and `PP_SESSION_BIRTH`, when supplied, must match its incarnation.
 
-Three outcomes:
+Ownership outcomes:
 
 | Situation | What happens |
 |---|---|
@@ -156,7 +156,7 @@ Three outcomes:
 | Owner is this session | Proceeds |
 | Owner is another session, still alive | **Refused**, naming both sessions. `--adopt` overrides |
 | Owner session is gone | Adopted automatically, with a note on stderr |
-| Called from a plain shell, no agent ancestor | Checks are permissive — sessions cannot be told apart |
+| Called from a plain shell, no agent ancestor | Permissive only for an unowned endpoint or a dead owner. A live owner requires explicit `--adopt`. |
 
 ### `--list` is bus-wide, not session-scoped — and it prints other clients' topics
 
@@ -281,9 +281,9 @@ Read the `--send` command's own stdout, not just its exit status. Alongside `del
 |---|---|---|
 | `PP_BUS_ROOT` | `/tmp/ping-pong` | Channel root on the bus host. Must match on both sides. |
 | `PP_SEND_TIMEOUT` | `60` | Seconds `--send` waits for the write to complete before giving up. |
-| `PP_LABEL` | short hostname | Default `--as` label. |
+| `PP_LABEL` | `host:project` (host only in home/root) | Default `--as` label; sanitized to `[A-Za-z0-9._:-]`, max 40 characters. |
 | `PP_SIDE` | — | Forces the side (`a` or `b`), overriding local state. Needed when owner selection is ambiguous, including human recovery with both ends local. |
-| `PP_SESSION` | walked from `$PPID` | Session identity (`claude:<pid>`, `codex:<pid>` or `grok:<pid>`). Set explicitly inside the keeper unit, where the process tree no longer reaches the agent — without it the leash would have nothing to hold. |
+| `PP_SESSION` | walked from `$PPID` | Session identity (`claude:<pid>`, `codex:<pid>` or `grok:<pid>`). Accepted without an agent ancestor after checking pid/comm and optional `PP_SESSION_BIRTH`; with an ancestor it must match. Used by keeper and wake units. |
 | `CODEX_THREAD_ID` | TUI environment | Session UUID captured by `--wake`; never inferred from another session. |
 | `PP_WAKE_RETRY_DELAY` | `2` | Seconds between failed queue attempts, up to three attempts per cursor. |
 | `PP_WAKE_TIMEOUT` | `10` | Seconds allowed per queue call before termination. |
