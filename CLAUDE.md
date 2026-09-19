@@ -57,7 +57,7 @@ Activates when this session must talk to another agent session — the operator 
 
 Release contents prepared on this branch:
 
-- **Keeper exit joins the leash after owner death.** Reader errors cannot let systemd tear down an unfinished close; bus deletion, peer notification and retained mail finish before the unit stops.
+- **Keeper exit joins the leash after owner death.** Its reader cannot adopt or stop its own unit; reader errors wait for bus deletion, peer notification and retained mail before the unit stops.
 - **Backups stay outside skill discovery.** Install moves recognized old copies
   into `${XDG_STATE_HOME:-$HOME/.local/state}/ping-pong/backups/` and reports each
   path. It rejects adjacent `ping-pong.pre-link-*` leftovers in known skill roots,

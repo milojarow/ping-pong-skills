@@ -392,11 +392,14 @@ claim_channel() (
 # can attach to any channel this machine ever joined, because the side file is
 # machine-global.
 assert_owner() {
-  local id="$1" label="$2" adopt="$3"
+  local id="$1" label="$2" adopt="$3" may_claim="${4:-1}"
   local me; me=$(session_id) || return 1
   local f; f=$(owner_file "$id") || return 1
 
-  if [ ! -f "$f" ]; then claim_channel "$id" "$label"; return 0; fi
+  if [ ! -f "$f" ]; then
+    [ "$may_claim" = 1 ] || die "keeper session $me lost its owner record for $id"
+    claim_channel "$id" "$label"; return 0
+  fi
 
   local owner owner_label
   owner=$(sed -n 's/^session=//p' "$f" | tr -d '[:space:]')
@@ -406,6 +409,11 @@ assert_owner() {
     session_alive "$me" "$PP_SESSION_BIRTH" || die "session $me no longer has its recorded process incarnation"
   fi
   [ "$owner" = "$me" ] && owner_alive "$f" && return 0
+
+  # A keeper is bound to an existing owner; it must never adopt. Its owner can
+  # die between the checks above, and adoption would stop this very unit before
+  # the independent leash has finished closing the channel.
+  [ "$may_claim" = 1 ] || die "keeper session $me no longer owns a live endpoint $id"
 
   if [ "$adopt" = "1" ]; then
     cmd_unkeep "$id" >/dev/null 2>&1 || return 1
@@ -965,7 +973,7 @@ cmd_listen() {
   version_notice
   valid_id "$id" || die "invalid id: '$id'"
   local side; side=$(my_side "$id")
-  assert_owner "$id" "$label" "$adopt"
+  assert_owner "$id" "$label" "$adopt" "${5:-1}" || return 1
   require_channel "$id"
 
   # Self-heal: if MY previous listener on this side was orphaned (my local
@@ -1316,7 +1324,7 @@ cmd_keep_run() {
       break
     fi
 
-    out=$(cmd_listen "$id" 0 "$label" 0); rc=$?
+    out=$(cmd_listen "$id" 0 "$label" 0 0); rc=$?
     case "$rc" in
       0)
         if [ -n "$out" ]; then
