@@ -298,6 +298,157 @@ leash_mail() {
   rg -q '^survives-owner-death$' "$caseRoot/recovered"
 }
 
+whoami() {
+  local harness
+  for harness in claude codex grok; do
+    start_actor "$harness" "$harness"
+    request "$harness" "$pp" --whoami
+    rg -qx "harness=$harness" "$lastRequest.out"
+    rg -qx "session=$harness:$(cat "$caseRoot/$harness/pid")" "$lastRequest.out"
+    rg -q "/reference/harness-$harness.md$" "$lastRequest.out"
+  done
+  "$pp" --whoami > "$caseRoot/human"
+  rg -qx 'session=nosession' "$caseRoot/human"
+  env PP_SESSION=grok:123 "$pp" --whoami > "$caseRoot/override"
+  rg -qx 'session=grok:123' "$caseRoot/override"
+}
+
+setup_wake() {
+  start_actor codex receiver
+  open_actor receiver
+  request receiver "$pp" --keep "$channel"
+  mkdir -p "$caseRoot/fake-bin" "$caseRoot/sender"
+  # Record argv as JSON, without running an agent or touching its queue.
+  python3 - "$caseRoot" <<'FAKE'
+import pathlib, sys
+root=pathlib.Path(sys.argv[1])
+f=root/'fake-bin/codex'
+f.write_text("#!/usr/bin/python3\nimport json, pathlib, sys\nr=pathlib.Path("+repr(str(root))+" )\nwith (r/'queue.jsonl').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nmode=(r/'queue-mode').read_text().strip() if (r/'queue-mode').exists() else ''\ncount=len((r/'queue.jsonl').read_text().splitlines())\nsys.exit(1 if mode=='fail' or (mode=='once' and count==1) else 0)\n")
+f.chmod(0o755)
+FAKE
+  env XDG_STATE_HOME="$caseRoot/sender" PP_SESSION=nosession "$pp" --join "$channel" --as sender
+}
+arm_wake() {
+  request receiver env PATH="$caseRoot/fake-bin:$PATH" \
+    CODEX_THREAD_ID=11111111-2222-3333-4444-555555555555 \
+    PP_WAKE_RETRY_DELAY=1 PP_WAKE_TIMEOUT=2 PP_LEASH_POLL=1 \
+    "$pp" --wake "$channel"
+}
+queue_count() {
+  local count=0
+  [ ! -f "$caseRoot/queue.jsonl" ] || count=$(wc -l < "$caseRoot/queue.jsonl")
+  [ "$count" = "$1" ]
+}
+quiet_queue() {
+  local expected=$1 deadline=$((SECONDS + 3))
+  while [ "$SECONDS" -lt "$deadline" ]; do queue_count "$expected"; sleep 0.1; done
+}
+wake_batch() {
+  setup_wake
+  arm_wake
+  quiet_queue 0
+  send_mail 'PEER-BODY $(touch never) --message injected'
+  wait_until queue_count 1
+  send_mail second-undrained
+  quiet_queue 1
+  # Rearming a stopped unit must not ring again for the same cursor.
+  request receiver "$pp" --unwake "$channel"
+  arm_wake
+  quiet_queue 1
+  request receiver "$pp" --await "$channel" --wait 2
+  send_mail after-drain
+  wait_until queue_count 2
+  python3 - "$caseRoot/queue.jsonl" "$channel" <<'CHECK'
+import json, sys
+rows=[json.loads(x) for x in open(sys.argv[1])]
+expected=['queue','--thread','11111111-2222-3333-4444-555555555555','--message',f'Ping-pong: drain channel {sys.argv[2]} with pp --await {sys.argv[2]}.']
+assert rows == [expected, expected], rows
+CHECK
+}
+wake_retry() {
+  setup_wake
+  printf 'once\n' > "$caseRoot/queue-mode"
+  arm_wake
+  send_mail retry-once
+  wait_until queue_count 2
+  quiet_queue 2
+  request receiver "$pp" --await "$channel" --wait 2
+  printf 'fail\n' > "$caseRoot/queue-mode"
+  send_mail retry-exhausted
+  wait_until queue_count 5
+  quiet_queue 5
+  test -s "$XDG_STATE_HOME/ping-pong/$channel.a.inbox"
+}
+wake_dead() {
+  setup_wake
+  printf 'fail\n' > "$caseRoot/queue-mode"
+  arm_wake
+  send_mail pending-when-owner-dies
+  wait_until queue_count 1
+  kill -TERM "$(cat "$caseRoot/receiver/pid")"
+  wait_until inactive a
+  quiet_queue 1
+  local state pid
+  state=$(systemctl --user show "pp-wake-$channel-a.service" -p ActiveState --value)
+  pid=$(systemctl --user show "pp-wake-$channel-a.service" -p MainPID --value)
+  [ "$state" = inactive ] && [ "$pid" = 0 ]
+  env PP_SESSION=nosession "$pp" --await "$channel" > "$caseRoot/recovered"
+  rg -q '^pending-when-owner-dies$' "$caseRoot/recovered"
+}
+wake_reject() {
+  setup_wake
+  if request receiver env -u CODEX_THREAD_ID "$pp" --wake "$channel"; then return 1; fi
+  if request receiver env CODEX_THREAD_ID=not-a-uuid "$pp" --wake "$channel"; then return 1; fi
+  start_actor grok outsider
+  if request outsider env CODEX_THREAD_ID=11111111-2222-3333-4444-555555555555 "$pp" --wake "$channel"; then return 1; fi
+  queue_count 0
+  arm_wake
+  systemctl --user is-active --quiet "pp-wake-$channel-a.service"
+}
+
+install_fixture() {
+  installHome="$caseRoot/home"
+  canonical="$installHome/.claude/plugins/marketplaces/ping-pong-skills/skills/ping-pong"
+  mkdir -p "$(dirname "$canonical")"
+  cp -a "$repo/skills/ping-pong" "$canonical"
+}
+install_links() {
+  install_fixture
+  if env HOME="$installHome" "$pp" --install --check; then return 1; fi
+  env HOME="$installHome" "$pp" --install
+  env HOME="$installHome" "$pp" --install
+  env HOME="$installHome" "$pp" --install --check
+  test -L "$installHome/.local/bin/pp"
+  test -L "$installHome/.codex/skills/ping-pong"
+  test "$installHome/.local/bin/pp" -ef "$canonical/bin/pp"
+  test "$installHome/.codex/skills/ping-pong/SKILL.md" -ef "$canonical/SKILL.md"
+}
+install_old() {
+  install_fixture
+  mkdir -p "$installHome/.codex/skills" "$installHome/.local/bin"
+  cp -a "$canonical" "$installHome/.codex/skills/ping-pong"
+  cp "$canonical/bin/pp" "$installHome/.local/bin/pp"
+  env HOME="$installHome" "$pp" --install > "$caseRoot/install.out"
+  rg -q 'legacy.*backup' "$caseRoot/install.out"
+  env HOME="$installHome" "$pp" --install --check
+  local backups=("$installHome/.codex/skills/"ping-pong.pre-link-*)
+  [ "${#backups[@]}" = 1 ]
+  cmp "${backups[0]}/SKILL.md" "$canonical/SKILL.md"
+}
+install_refuse() {
+  install_fixture
+  mkdir -p "$installHome/.codex/skills/ping-pong" "$installHome/.local/bin"
+  printf 'unrelated\n' > "$installHome/.codex/skills/ping-pong/precious"
+  if env HOME="$installHome" "$pp" --install; then return 1; fi
+  test ! -e "$installHome/.local/bin/pp"
+  rg -qx unrelated "$installHome/.codex/skills/ping-pong/precious"
+  gio trash "$installHome/.codex/skills/ping-pong"
+  ln -s "$caseRoot" "$installHome/.local/bin/pp"
+  if env HOME="$installHome" "$pp" --install; then return 1; fi
+  [ "$(readlink "$installHome/.local/bin/pp")" = "$caseRoot" ]
+  test ! -e "$installHome/.codex/skills/ping-pong"
+}
+
 version() { bash "$repo/tools/check-version-chain.sh"; }
 
 cleanup_case() {
@@ -307,6 +458,8 @@ cleanup_case() {
   # that either cgroup has finished shutting down.
   if [ -n "$channel" ]; then
     for side in a b; do
+      systemctl --user stop "pp-wake-$channel-$side.service" >/dev/null 2>&1 || true
+      systemctl --user reset-failed "pp-wake-$channel-$side.service" >/dev/null 2>&1 || true
       systemctl --user stop "pp-keep-$channel-$side.service" >/dev/null 2>&1 || true
       systemctl --user reset-failed "pp-keep-$channel-$side.service" >/dev/null 2>&1 || true
       wait_until inactive "$side" || status=1
@@ -338,7 +491,8 @@ fi
 failures=0
 for caseName in identity_claude identity_codex identity_grok identity_human \
   keeper_codex keeper_grok same_machine mail_restart mail_concurrent mail_close pid_reuse \
-  stale_await adopt_during_drain protected_unkeep leash_mail version; do
+  stale_await adopt_during_drain protected_unkeep leash_mail version \
+  whoami wake_batch wake_retry wake_dead wake_reject install_links install_old install_refuse; do
   timeout --kill-after=10 60 "$repo/tools/selftest.sh" --case "$caseName" "$testRoot" > "$testRoot/$caseName.log" 2>&1 &
   casePid=$!
   if wait "$casePid"; then
