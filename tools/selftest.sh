@@ -133,6 +133,8 @@ same_machine() {
   request second "$pp" --join "$channel" --as second
   request first "$pp" --keep "$channel"
   request second "$pp" --keep "$channel"
+  test -f "$XDG_STATE_HOME/ping-pong/$channel.a.inbox"
+  test -f "$XDG_STATE_HOME/ping-pong/$channel.b.inbox"
   request first "$pp" --send "$channel" -m only-to-b
   request second "$pp" --await "$channel" --wait 3
   rg -q '^only-to-b$' "$lastRequest.out"

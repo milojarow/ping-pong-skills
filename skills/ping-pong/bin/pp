@@ -197,7 +197,9 @@ session_id() {
   local p="$PPID" d=0 c
   while [ "${p:-0}" -gt 1 ] && [ "$d" -lt 15 ]; do
     c=$(cat "/proc/$p/comm" 2>/dev/null || true)
-    if [ "$c" = "claude" ]; then printf 'claude:%s' "$p"; return 0; fi
+    case "$c" in
+      claude|codex|grok) printf '%s:%s' "$c" "$p"; return 0 ;;
+    esac
     p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
     d=$((d+1))
   done
@@ -206,11 +208,32 @@ session_id() {
   printf 'nosession'
 }
 
+session_birth() {
+  local identity="$1" pid harness stat boot
+  [[ "$identity" =~ ^(claude|codex|grok):([0-9]+)$ ]] || return 1
+  harness=${identity%%:*}; pid=${identity#*:}
+  [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "$harness" ] || return 1
+  IFS= read -r stat < "/proc/$pid/stat" 2>/dev/null || return 1
+  # Strip pid and comm before indexing: comm may contain spaces or parentheses.
+  stat=${stat##*) }
+  local fields; read -r -a fields <<< "$stat"
+  [ "${fields[0]:-Z}" != Z ] && [ -n "${fields[19]:-}" ] || return 1
+  IFS= read -r boot < /proc/sys/kernel/random/boot_id || return 1
+  printf '%s:%s' "$boot" "${fields[19]}"
+}
+
 session_alive() {
-  case "$1" in
-    claude:*) kill -0 "${1#claude:}" 2>/dev/null ;;
-    *) return 1 ;;
-  esac
+  local expected="${2:-}" actual
+  [ -n "$expected" ] || return 1
+  actual=$(session_birth "$1") || return 1
+  [ "$actual" = "$expected" ]
+}
+
+owner_alive() {
+  local file="$1" owner birth
+  owner=$(sed -n 's/^session=//p' "$file" 2>/dev/null)
+  birth=$(sed -n 's/^birth=//p' "$file" 2>/dev/null)
+  session_alive "$owner" "$birth"
 }
 
 # A session keeps the build it resolved at startup, and the guards live in this
@@ -235,9 +258,14 @@ version_notice() {
   return 0
 }
 
-side_file()     { printf '%s/%s.side' "$STATE_DIR" "$1"; }
-owner_file()    { printf '%s/%s.owner' "$STATE_DIR" "$1"; }
-listener_file() { printf '%s/%s.listener' "$STATE_DIR" "$1"; }
+state_file() {
+  local side
+  side=$(my_side "$1") || return 1
+  printf '%s/%s.%s.%s' "$STATE_DIR" "$1" "$side" "$2"
+}
+side_file()     { state_file "$1" side; }
+owner_file()    { state_file "$1" owner; }
+listener_file() { state_file "$1" listener; }
 
 # The spool is what breaks the old trade-off. A listener that survives the turn
 # has to live outside the session's process tree, and then its output no longer
@@ -247,8 +275,8 @@ listener_file() { printf '%s/%s.listener' "$STATE_DIR" "$1"; }
 # woken. The cursor is what makes --await resumable: it is a byte offset, so a
 # message that arrived while no waker was up is delivered on the next --await
 # instead of being skipped.
-spool_file()    { printf '%s/%s.inbox' "$STATE_DIR" "$1"; }
-cursor_file()   { printf '%s/%s.cursor' "$STATE_DIR" "$1"; }
+spool_file()    { state_file "$1" inbox; }
+cursor_file()   { state_file "$1" cursor; }
 # The SIDE is part of the name, not just the channel. Two sessions on one machine
 # can be the two ends of one channel over a local bus, and with a channel-only
 # unit name the second --keep matches the first one's unit and reports "already
@@ -275,7 +303,7 @@ have_user_systemd() {
 
 keeper_state() {
   have_user_systemd || { printf 'unsupported'; return 0; }
-  local side; side=$(tr -d '[:space:]' < "$(side_file "$1")" 2>/dev/null || true)
+  local side; side=$(my_side "$1" 2>/dev/null) || { printf 'unknown'; return 0; }
   [ -n "$side" ] || { printf 'unknown'; return 0; }
   systemctl --user is-active "$(keeper_unit "$1" "$side")" 2>/dev/null || true
 }
@@ -283,13 +311,26 @@ keeper_state() {
 self_path() { readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$0"; }
 
 my_side() {
-  local id="$1"
-  if [ -n "${PP_SIDE:-}" ]; then printf '%s' "$PP_SIDE"; return 0; fi
-  local f; f=$(side_file "$id")
-  [ -r "$f" ] || die "channel $id is not registered on this machine.
-    If you opened it, you are on the wrong machine.
-    If someone handed you the id, join first:  pp --join $id"
-  tr -d '[:space:]' < "$f"
+  local id="$1" side me owner
+  valid_id "$id" || die "invalid id: '$id'"
+  if [ -n "${PP_SIDE:-}" ]; then
+    case "$PP_SIDE" in a|b) printf '%s' "$PP_SIDE"; return 0 ;; esac
+    die "PP_SIDE must be a or b"
+  fi
+  me=$(session_id)
+  local mine=() registered=()
+  for side in a b; do
+    [ -r "$STATE_DIR/$id.$side.owner" ] || continue
+    registered+=("$side")
+    owner=$(sed -n 's/^session=//p' "$STATE_DIR/$id.$side.owner")
+    [ "$owner" != "$me" ] || mine+=("$side")
+  done
+  if [ "${#mine[@]}" = 1 ]; then printf '%s' "${mine[0]}"; return 0; fi
+  if [ "${#registered[@]}" = 1 ]; then printf '%s' "${registered[0]}"; return 0; fi
+  if [ "${#registered[@]}" -gt 1 ]; then
+    die "channel $id has two local sides; select one with PP_SIDE=a or PP_SIDE=b"
+  fi
+  die "channel $id is not registered on this machine; join first: pp --join $id"
 }
 
 other_side() { [ "$1" = "a" ] && printf 'b' || printf 'a'; }
@@ -306,9 +347,15 @@ require_channel() {
 
 claim_channel() {
   local id="$1" label="$2"
+  local owner birth file temporary
+  owner=$(session_id)
+  birth=$(session_birth "$owner" || true)
+  file=$(owner_file "$id") || return 1
   mkdir -p "$STATE_DIR"
-  printf 'session=%s\nlabel=%s\nclaimed=%s\n' \
-    "$(session_id)" "$label" "$(date -u +%FT%TZ)" > "$(owner_file "$id")"
+  temporary=$(mktemp "$STATE_DIR/.owner-XXXXXXXX") || return 1
+  printf 'session=%s\nharness=%s\nbirth=%s\nlabel=%s\nclaimed=%s\n' \
+    "$owner" "${owner%%:*}" "$birth" "$label" "$(date -u +%FT%TZ)" > "$temporary"
+  mv -f -- "$temporary" "$file"
 }
 
 # Refuse to operate on a channel that belongs to a DIFFERENT live session on this
@@ -318,7 +365,7 @@ claim_channel() {
 assert_owner() {
   local id="$1" label="$2" adopt="$3"
   local me; me=$(session_id)
-  local f; f=$(owner_file "$id")
+  local f; f=$(owner_file "$id") || return 1
 
   if [ ! -f "$f" ]; then claim_channel "$id" "$label"; return 0; fi
 
@@ -326,16 +373,20 @@ assert_owner() {
   owner=$(sed -n 's/^session=//p' "$f" | tr -d '[:space:]')
   owner_label=$(sed -n 's/^label=//p' "$f" | tr -d '[:space:]')
 
-  [ "$owner" = "$me" ] && return 0
   [ "$me" = "nosession" ] && return 0   # a human shell cannot be told apart; allow
+  if [ -n "${PP_SESSION_BIRTH:-}" ]; then
+    session_alive "$me" "$PP_SESSION_BIRTH" || die "session $me no longer has its recorded process incarnation"
+  fi
+  [ "$owner" = "$me" ] && owner_alive "$f" && return 0
 
   if [ "$adopt" = "1" ]; then
+    cmd_unkeep "$id" >/dev/null 2>&1 || return 1
     claim_channel "$id" "$label"
     note "adopted channel $id from session $owner (label: ${owner_label:-?})"
     return 0
   fi
 
-  if session_alive "$owner"; then
+  if owner_alive "$f"; then
     die "channel $id belongs to ANOTHER LIVE session on this machine.
     owner: $owner  (label: ${owner_label:-?})
     You are: $me
@@ -344,6 +395,7 @@ assert_owner() {
     If this channel really is yours, take it over deliberately:  pp --adopt $id"
   fi
 
+  cmd_unkeep "$id" >/dev/null 2>&1 || return 1
   claim_channel "$id" "$label"
   note "previous owner session ($owner) is gone - channel $id adopted by $me"
 }
@@ -435,8 +487,8 @@ cmd_setup() {
 #     the presence check. "Connection refused" is ground truth, not a claim that
 #     can go stale - the failure mode markers were invented to survive.
 
-direct_file() { printf '%s/%s.direct' "$STATE_DIR" "$1"; }
-is_direct()   { [ -r "$(direct_file "${1:-}")" ]; }
+direct_file() { state_file "$1" direct; }
+is_direct()   { local file; file=$(direct_file "${1:-}" 2>/dev/null) && [ -r "$file" ]; }
 
 # Both sides derive the SAME port from the SAME channel id, so nothing extra has
 # to be carried across. Different channels land on different ports, which is what
@@ -652,6 +704,7 @@ created=%s
 }
 
 cmd_open_direct() {
+  local PP_SIDE=a
   local peer="$1" topic="$2" label="$3"
   peer=$(resolve_peer "$peer") || exit 1
   local ip; ip=$(mesh_ip)
@@ -688,6 +741,7 @@ cmd_open_direct() {
 }
 
 cmd_join_direct() {
+  local PP_SIDE=b
   local id="$1" peer="$2" label="$3" adopt="$4"
   valid_id "$id" || die "invalid id: '$id' (expected form: pp-xxxxxx)"
   peer=$(resolve_peer "$peer") || exit 1
@@ -793,6 +847,7 @@ cmd_close_direct() {
 }
 
 cmd_open() {
+  local PP_SIDE=a
   local topic="$1" label="$2"
   need_config
   version_notice
@@ -829,6 +884,7 @@ cmd_open() {
 }
 
 cmd_join() {
+  local PP_SIDE=b
   local id="$1" label="$2" adopt="$3"
   need_config
   version_notice
@@ -872,6 +928,7 @@ cmd_join() {
 # blocks and removes it on exit; that marker is the only reliable presence signal.
 cmd_listen() {
   local id="$1" wait_for="$2" label="$3" adopt="$4"
+  local PP_SIDE="${PP_SIDE:-}"; PP_SIDE=$(my_side "$id") || return 1
   is_direct "$id" && { cmd_listen_direct "$@"; return $?; }
   need_config
   version_notice
@@ -922,7 +979,9 @@ cmd_listen() {
     exit \$rc"
   fi
 
-  bus_listen_stream "m='$BUS_ROOT/$id/listening-$side'
+  bus_listen_stream "exec 9>'$BUS_ROOT/$id/reader-$side.lock' || exit 1
+    flock -n 9 || { echo 'pp: this side already has a reader' >&2; exit 1; }
+    m='$BUS_ROOT/$id/listening-$side'
     printf '%s pid=%s token=%s since=%s\n' '$label' \"\$\$\" '$tok' \"\$(date -u +%FT%TZ)\" > \"\$m\"
     trap 'rm -f \"\$m\"' EXIT INT TERM HUP
     $body"
@@ -1073,20 +1132,23 @@ cmd_listen_retry() {
 #
 # The output problem that used to make this trade-off painful - a process outside
 # the tree cannot notify the harness - is solved by the spool: the keeper writes
-# every message to $STATE_DIR/<id>.inbox, and --await blocks on that file and
+# every message to $STATE_DIR/<id>.<side>.inbox, and --await blocks on that file and
 # exits when it grows. The agent is woken exactly as before, but now forgetting
 # to relaunch the waker costs a notification, not a message.
 
 cmd_keep() {
   local id="$1" label="$2" adopt="$3"
+  local PP_SIDE="${PP_SIDE:-}"; PP_SIDE=$(my_side "$id") || return 1
   need_config
   require_channel "$id"
   assert_owner "$id" "$label" "$adopt"
 
   local owner; owner=$(session_id)
+  local birth; birth=$(session_birth "$owner") || die "keeper requires a live claude, codex or grok session (got $owner)"
   local side; side=$(my_side "$id")
   local unit; unit=$(keeper_unit "$id" "$side")
   local self; self=$(self_path)
+  [ ! -e "$(state_file "$id" closed)" ] || die "channel $id is closed; unread mail is still available with --await"
 
   case "$(keeper_state "$id")" in
     active|activating)
@@ -1096,7 +1158,7 @@ cmd_keep() {
   esac
 
   mkdir -p "$STATE_DIR"
-  : > "$(spool_file "$id")" 2>/dev/null || true
+  touch "$(spool_file "$id")" || return 1
 
   if ! have_user_systemd; then
     note "no user systemd here - running the keeper in the FOREGROUND.
@@ -1122,6 +1184,8 @@ cmd_keep() {
     --description="ping-pong keeper for $id (session $owner)" \
     --property=Restart=no \
     --setenv=PP_SESSION="$owner" \
+    --setenv=PP_SESSION_BIRTH="$birth" \
+    --setenv=PP_SIDE="$side" \
     --setenv=PP_BUS_ROOT="$BUS_ROOT" \
     --setenv=PP_LEASH_POLL="$PP_LEASH_POLL" \
     --setenv=PP_RETRY_DELAY="$PP_RETRY_DELAY" \
@@ -1161,6 +1225,9 @@ $(journalctl --user -u "$unit" --no-pager -n 5 -o cat 2>/dev/null | sed 's/^/   
 # or the leash going slack.
 cmd_keep_run() {
   local id="$1" label="$2" owner="${3:-$(session_id)}"
+  local PP_SIDE="${PP_SIDE:-}"; PP_SIDE=$(my_side "$id") || return 1
+  local birth="${PP_SESSION_BIRTH:-}"
+  [ -n "$birth" ] || birth=$(session_birth "$owner") || return 1
   local spool; spool=$(spool_file "$id")
   mkdir -p "$STATE_DIR"; touch "$spool"
 
@@ -1178,9 +1245,13 @@ cmd_keep_run() {
   (
     while :; do
       sleep "$PP_LEASH_POLL"
-      if ! session_alive "$owner"; then
+      if ! session_alive "$owner" "$birth"; then
         note "owner session $owner is gone - closing channel $id and stopping the keeper"
-        PP_SESSION="$owner" "$(self_path)" --close "$id" --as "$label" >/dev/null 2>&1 || true
+        if [ "$(sed -n 's/^session=//p' "$(owner_file "$id")")" = "$owner" ] &&
+           [ "$(sed -n 's/^birth=//p' "$(owner_file "$id")")" = "$birth" ]; then
+          PP_SESSION=nosession PP_SESSION_BIRTH= PP_SIDE="$PP_SIDE" \
+            "$(self_path)" --close "$id" --as "$label" >&2 || true
+        fi
         if have_user_systemd; then
           systemctl --user stop "$(keeper_unit "$id" "$(my_side "$id" 2>/dev/null || echo x)")" >/dev/null 2>&1 || true
         fi
@@ -1198,7 +1269,12 @@ cmd_keep_run() {
 
   local out rc drops=0 closed=0
   while :; do
-    session_alive "$owner" || { note "owner session $owner is gone - keeper stops"; break; }
+    if ! session_alive "$owner" "$birth"; then
+      # Let the independent leash finish its close, including when death occurs
+      # between two reads rather than while a read is blocked.
+      wait "$_PP_LEASH_PID" 2>/dev/null || true
+      break
+    fi
 
     out=$(cmd_listen "$id" 0 "$label" 0); rc=$?
     case "$rc" in
@@ -1206,7 +1282,10 @@ cmd_keep_run() {
         if [ -n "$out" ]; then
           # Append, never truncate: the spool is the only copy of anything that
           # arrived while no waker was up.
-          printf '%s\n' "$out" >> "$spool"
+          (
+            flock -x 8 || exit 1
+            printf '%s\n' "$out" >> "$spool"
+          ) 8>"$(state_file "$id" mail-lock)" || return 1
           drops=0
           continue
         fi
@@ -1243,50 +1322,21 @@ cmd_keep_run() {
 
   trap - EXIT INT TERM HUP
   kill "${_PP_LEASH_PID:-0}" 2>/dev/null || true
-  # If the channel is gone, so is the point of its spool - and whatever landed in
-  # it last is the closing notice this keeper wrote to itself. Drop it here so a
-  # clean shutdown leaves nothing for the next --gc to explain.
-  #
-  # The flag, not a filesystem test: $BUS_ROOT is a path on the BUS, and under
-  # bus_mode=ssh it does not exist locally at all - a local `[ -d ]` would call
-  # every live channel gone and delete a spool with unread mail in it.
-  #
-  # UNREAD MAIL IS NOT DROPPED. The spool is the only copy of what arrived, and the
-  # close is the PEER's call - it can land seconds after a MAIL event, before the
-  # agent has drained. Deleting here turned "I did not drain in time" into "there is
-  # nothing left to read", with no trace anywhere. Whatever is past the cursor is
-  # kept under <id>.inbox.unread so it can still be read after the fact.
-  if [ "$closed" = "1" ]; then
-    local _drained=0 _size=0
-    [ -r "$(cursor_file "$id")" ] && _drained=$(tr -dc '0-9' < "$(cursor_file "$id")")
-    [ -n "$_drained" ] || _drained=0
-    _size=$(stat -c %s "$spool" 2>/dev/null || echo 0)
-    if [ "$_size" -gt "$_drained" ]; then
-      tail -c "+$((_drained + 1))" "$spool" > "$spool.unread" 2>/dev/null || true
-      note "channel $id closed with $((_size - _drained)) bytes of UNREAD mail
-    kept at: $spool.unread"
-    fi
-    rm -f "$spool" "$(cursor_file "$id")"
-  fi
+  # The bus-side result, never a local existence test, establishes closure.
+  # Keep the cursor and spool together so unread bytes remain recoverable.
+  [ "$closed" != 1 ] || preserve_mail "$id"
   return 0
 }
 
-# Stops every keeper for this channel, matched by PREFIX rather than by exact
-# name. --close removes the local .side before this runs (it has to: stopping the
-# unit can kill the caller), so by then there is no side left to build the exact
-# name from. The prefix is what survives that ordering.
+# Stop only this endpoint; the peer may share the same user manager.
 cmd_unkeep() {
-  local id="$1" found=0 u
+  local id="$1" u side
   have_user_systemd || { say "pp: no keeper running for $id"; return 0; }
-  for u in $(systemctl --user list-units --all --no-legend "$(keeper_unit "$id" '*').service" 2>/dev/null | awk '{print $1}' | sed 's/^[^a-zA-Z0-9]*//'); do
-    [ -n "$u" ] || continue
-    systemctl --user stop "$u" >/dev/null 2>&1 || true
-    # A stopped transient unit lingers until reset; without this a later --keep
-    # on the same channel and side is refused for a name systemd already knows.
-    systemctl --user reset-failed "$u" >/dev/null 2>&1 || true
-    found=1
-  done
-  [ "$found" = "1" ] && say "pp: keeper stopped for $id" || say "pp: no keeper running for $id"
+  side=$(my_side "$id") || return 1
+  u="$(keeper_unit "$id" "$side").service"
+  systemctl --user stop "$u" >/dev/null 2>&1 || true
+  systemctl --user reset-failed "$u" >/dev/null 2>&1 || true
+  say "pp: keeper stopped for $id side $side"
   return 0
 }
 
@@ -1298,50 +1348,66 @@ cmd_unkeep() {
 # relaunch, and forgetting costs a notification rather than a message. The keeper
 # is still holding the reader, so the peer's sends keep succeeding and everything
 # that arrives is in the spool waiting for the next --await.
-cmd_await() {
-  local id="$1" wait_for="${2:-0}"
+cmd_await() (
+  local id="$1" wait_for="${2:-0}" PP_SIDE="${PP_SIDE:-}"
   need_config
-  local spool cursor; spool=$(spool_file "$id"); cursor=$(cursor_file "$id")
-  mkdir -p "$STATE_DIR"; touch "$spool"
-
-  local cur=0
-  [ -r "$cursor" ] && cur=$(tr -dc '0-9' < "$cursor")
-  [ -n "$cur" ] || cur=0
-
-  # A truncated or replaced spool (a --close, a reboot) must not leave the cursor
-  # pointing past the end - that would swallow every future message in silence.
-  local size; size=$(stat -c %s "$spool" 2>/dev/null || echo 0)
-  [ "$size" -lt "$cur" ] && cur=0
-
-  local waited=0
+  PP_SIDE=$(my_side "$id") || return 1
+  assert_owner "$id" "$(default_label)" 0 || return 1
+  local spool cursor cur size temporary started=$SECONDS
+  spool=$(spool_file "$id"); cursor=$(cursor_file "$id")
+  touch "$spool" || return 1
+  exec 8>"$(state_file "$id" mail-lock)" || return 1
   while :; do
-    size=$(stat -c %s "$spool" 2>/dev/null || echo 0)
+    # Writers share this lock, so the snapshot ends at a complete append.
+    # Release it while idle so each reader can honour its own timeout.
+    flock -x 8 || return 1
+    cur=$(cat "$cursor" 2>/dev/null || echo 0)
+    [[ "$cur" =~ ^[0-9]+$ ]] || return 1
+    size=$(stat -c %s "$spool") || return 1
+    [ "$size" -ge "$cur" ] || cur=0
     if [ "$size" -gt "$cur" ]; then
-      tail -c "+$((cur + 1))" "$spool"
-      printf '%s\n' "$size" > "$cursor"
+      dd if="$spool" iflag=skip_bytes,count_bytes skip="$cur" count="$((size - cur))" status=none || return 1
+      temporary=$(mktemp "$cursor.XXXXXXXX") || return 1
+      printf '%s\n' "$size" > "$temporary" && mv -f -- "$temporary" "$cursor" || return 1
       return 0
     fi
-
-    # No keeper, no mail is ever coming. Say so instead of blocking forever on a
-    # file nobody writes - that silence is indistinguishable from a quiet peer.
+    flock -u 8
+    if [ -e "$(state_file "$id" closed)" ]; then
+      note "channel $id is closed; no unread mail remains on side $PP_SIDE"
+      return 3
+    fi
     case "$(keeper_state "$id")" in
       active|activating|unsupported) : ;;
-      *)
-        note "no keeper is running for $id - nothing will ever land in the spool.
-    Start one with:  pp --keep $id"
-        return 3 ;;
+      *) note "no keeper is running for $id; start one with: pp --keep $id"; return 3 ;;
     esac
-
-    if [ "$wait_for" -gt 0 ] 2>/dev/null; then
-      waited=$((waited + PP_AWAIT_POLL))
-      if [ "$waited" -ge "$wait_for" ]; then
-        say "pp: nothing arrived within ${wait_for}s (channel $id is still open)"
-        return 124
-      fi
+    if [ "$wait_for" -gt 0 ] && [ "$((SECONDS - started))" -ge "$wait_for" ]; then
+      note "nothing arrived within ${wait_for}s (channel $id is still open)"
+      return 124
     fi
     sleep "$PP_AWAIT_POLL"
   done
-}
+)
+
+# Closing ends transport, not custody of received mail. Keep terminal records
+# so --await can recover the pending bytes without recreating the channel.
+# GC uses this same path and never deletes the retained mail.
+preserve_mail() (
+  local id="$1" spool cursor cur size
+  spool=$(spool_file "$id") || return 1
+  cursor=$(cursor_file "$id") || return 1
+  exec 8>"$(state_file "$id" mail-lock)" || return 1
+  flock -x 8 || return 1
+  touch "$(state_file "$id" closed)" || return 1
+  cur=$(cat "$cursor" 2>/dev/null || echo 0)
+  size=$(stat -c %s "$spool" 2>/dev/null || echo 0)
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+  [ "$size" -ge "$cur" ] || cur=0
+  if [ "$size" -gt "$cur" ]; then
+    note "channel $id side $(my_side "$id") has $((size - cur)) bytes of UNREAD mail
+    kept at: $spool (cursor: $cursor)
+    recover with: PP_SIDE=$(my_side "$id") pp --await $id"
+  fi
+)
 
 # ---------------------------------------------------------------------- watch
 #
@@ -1392,7 +1458,7 @@ cmd_watch() {
   local sname; sname=$(basename "$spool")
   mkdir -p "$STATE_DIR"; touch "$spool"
 
-  local wf="$STATE_DIR/$id.watch"
+  local wf; wf=$(state_file "$id" watch)
   printf 'pid=%s\nsession=%s\nsince=%s\n' "$$" "$(session_id)" "$(date -u +%FT%TZ)" > "$wf"
 
   local last=-1 inw=""
@@ -1563,22 +1629,18 @@ cmd_list() {
     say "pp: no open channels on the bus ($(bus_label):$BUS_ROOT)"
     return 0
   fi
-  local me; me=$(session_id)
   local stale_s=$(( ${PP_STALE_HOURS:-24} * 3600 ))
   say "Open channels on $(bus_label):$BUS_ROOT"
   printf '%s\n' "$out" | while IFS=$'\t' read -r id sides live sil age topic; do
-    local mine="" owner flag="" owner_dead=0 keep=""
-    if [ -r "$(side_file "$id")" ]; then
-      mine=" (this machine: side $(tr -d '[:space:]' < "$(side_file "$id")")"
-      owner=$(sed -n 's/^session=//p' "$(owner_file "$id")" 2>/dev/null | tr -d '[:space:]')
-      if [ -z "$owner" ]; then mine="$mine, unclaimed)"
-      elif [ "$owner" = "$me" ]; then mine="$mine, YOURS)"
-      else
-        mine="$mine, owned by $owner)"
-        session_alive "$owner" || owner_dead=1
-      fi
-      case "$(keeper_state "$id")" in active|activating) keep="  keeper:up" ;; esac
-    fi
+    local mine="" owner flag="" owner_dead=0 keep="" localSide ownerPath
+    for localSide in a b; do
+      ownerPath="$STATE_DIR/$id.$localSide.owner"
+      [ -r "$ownerPath" ] || continue
+      owner=$(sed -n 's/^session=//p' "$ownerPath")
+      mine="$mine (local side $localSide, owner $owner)"
+      [ "$owner" = nosession ] || owner_alive "$ownerPath" || owner_dead=1
+      case "$(PP_SIDE="$localSide" keeper_state "$id")" in active|activating) keep="  keeper:up" ;; esac
+    done
 
     # Judge the OWNER, not the listener. A live listener whose owning session is
     # dead is not evidence of health - it is the decoy: something outside every
@@ -1619,8 +1681,8 @@ cmd_info() {
   local o; o=$(owner_file "$id")
   if [ -r "$o" ]; then
     local ow; ow=$(sed -n 's/^session=//p' "$o" | tr -d '[:space:]')
-    if [ "$ow" = "$(session_id)" ]; then say "  owned by THIS session ($ow)"
-    elif session_alive "$ow"; then say "  owned by another LIVE session on this machine ($ow)"
+    if [ "$ow" = "$(session_id)" ] && { [ "$ow" = nosession ] || owner_alive "$o"; }; then say "  owned by THIS session ($ow)"
+    elif owner_alive "$o"; then say "  owned by another LIVE session on this machine ($ow)"
     else say "  owner session $ow is gone (adoptable)"; fi
   fi
   # Report the marker's TRUTH, not its existence. A marker whose process is dead
@@ -1644,6 +1706,7 @@ cmd_info() {
 # marker before deleting.
 cmd_close() {
   local id="$1" label="$2" adopt="$3"
+  local PP_SIDE="${PP_SIDE:-}"; PP_SIDE=$(my_side "$id") || return 1
   is_direct "$id" && { cmd_close_direct "$id" "$label" "$adopt"; return $?; }
   need_config
   valid_id "$id" || die "invalid id: '$id'"
@@ -1655,18 +1718,13 @@ cmd_close() {
       fi
     done
     rm -rf '$BUS_ROOT/$id'" || die "could not delete the channel on the bus"
-  # ORDER MATTERS, and it is not the obvious one. The local files go FIRST.
-  #
-  # The keeper has to go with the channel: it lives outside the session's process
-  # tree on purpose, so nothing else here will stop it, and one left re-attaching
-  # to a deleted id is the immortal-orphan shape all over again. But stopping it
-  # means `systemctl --user stop`, which kills the whole unit cgroup - and the
-  # leash calls this very function FROM INSIDE that cgroup when the owner session
-  # dies. Unkeeping first therefore kills the caller mid-close, and the local
-  # state files survive a "successful" close. Measured: .owner/.side/.inbox left
-  # behind on every leash-triggered close until this was reordered.
-  rm -f "$(side_file "$id")" "$(owner_file "$id")" "$(listener_file "$id")" \
-        "$(spool_file "$id")" "$(cursor_file "$id")"
+  # Preserve state before stopping the unit: a leash-triggered close runs
+  # inside that unit and stopping it also terminates this very command.
+  local localSide
+  for localSide in a b; do
+    [ -f "$STATE_DIR/$id.$localSide.owner" ] || continue
+    PP_SIDE="$localSide" preserve_mail "$id" || return 1
+  done
   say "pp: channel $id closed and deleted from the bus (active listeners were notified)"
   cmd_unkeep "$id" >/dev/null 2>&1 || true
 }
@@ -1705,24 +1763,26 @@ cmd_session_end() {
   [ "$me" = "nosession" ] && return 0
 
   mkdir -p "$STATE_DIR"
-  local closed=0 f id owner
-  for f in "$STATE_DIR"/*.owner; do
+  local closed=0 f id owner stem side
+  for f in "$STATE_DIR"/*.a.owner "$STATE_DIR"/*.b.owner; do
     [ -e "$f" ] || continue
     owner=$(sed -n 's/^session=//p' "$f" 2>/dev/null | tr -d '[:space:]')
     [ "$owner" = "$me" ] || continue
-    id=$(basename "$f" .owner)
+    stem=$(basename "$f" .owner); side=${stem##*.}; id=${stem%.*}
     valid_id "$id" || continue
+    owner_alive "$f" || continue
+    [ ! -e "$STATE_DIR/$id.$side.closed" ] || continue
     # --close signals the peer's blocked listener before deleting the FIFOs, so
     # the other session wakes with an empty read and learns the conversation is
     # over. That is the whole of "destroyed by both sides": the channel is ONE
     # object on ONE bus, so closing it here IS closing it there. Nothing has to
     # be relayed through the other agent, which is just as well - its listener is
     # normally down between turns, so a message would have bounced.
-    if cmd_close "$id" "$(default_label)" 0 >/dev/null 2>&1; then
+    if PP_SIDE="$side" cmd_close "$id" "$(default_label)" 0 >/dev/null 2>&1; then
       note "closed channel $id (session ended, reason=${reason:-unknown})"
       closed=$((closed + 1))
     else
-      cmd_unkeep "$id" >/dev/null 2>&1 || true
+      PP_SIDE="$side" cmd_unkeep "$id" >/dev/null 2>&1 || true
     fi
   done
   [ "$closed" -gt 0 ] && note "session end: $closed channel(s) closed"
@@ -1764,10 +1824,12 @@ cmd_gc() {
   mkdir -p "$STATE_DIR"
   say "pp: sweeping this machine's ping-pong state"
 
-  for lf in "$STATE_DIR"/*.listener; do
+  local lf stem side
+  for lf in "$STATE_DIR"/*.a.listener "$STATE_DIR"/*.b.listener; do
     [ -e "$lf" ] || continue
-    local id; id=$(basename "$lf" .listener)
-    gc_channel "$id" && true
+    local id; stem=$(basename "$lf" .listener); side=${stem##*.}; id=${stem%.*}
+    valid_id "$id" || continue
+    PP_SIDE="$side" gc_channel "$id" && true
     n=$((n+1))
   done
 
@@ -1820,23 +1882,21 @@ cmd_gc() {
     done
   fi
 
-  # Local records for channels that no longer exist on the bus.
-  # The spool and cursor are scanned too, not just side/owner. A close triggered
-  # from inside the keeper's own unit races its own closing notice: --close
-  # writes that notice into BOTH sides' FIFOs, the keeper's reader receives it,
-  # and the loop appends it to a spool that was deleted a moment earlier. The
-  # result is a lone 65-byte .inbox for a channel that no longer exists - which
-  # a scan over side/owner alone would never see.
-  local alive; alive=$(bus "ls -1 '$BUS_ROOT' 2>/dev/null | grep '^pp-' || true")
-  for f in "$STATE_DIR"/*.side "$STATE_DIR"/*.owner "$STATE_DIR"/*.inbox "$STATE_DIR"/*.cursor; do
+  # Only a successful bus snapshot can establish that a channel is gone.
+  # A transport failure must never turn live endpoints into closed records.
+  local alive
+  alive=$(bus "if [ -d '$BUS_ROOT' ]; then
+    for d in '$BUS_ROOT'/pp-*; do [ ! -d \"\$d\" ] || basename \"\$d\"; done
+    fi") || return 1
+  for f in "$STATE_DIR"/*.a.owner "$STATE_DIR"/*.b.owner; do
     [ -e "$f" ] || continue
-    local id; id=$(basename "$f"); id="${id%.*}"
+    local id; stem=$(basename "$f" .owner); side=${stem##*.}; id=${stem%.*}
     valid_id "$id" || continue
-    [ -e "$STATE_DIR/$id.side" ] || [ -e "$STATE_DIR/$id.owner" ] || [ -e "$STATE_DIR/$id.inbox" ] || [ -e "$STATE_DIR/$id.cursor" ] || continue
+    [ ! -e "$STATE_DIR/$id.$side.closed" ] || continue
+    PP_SIDE="$side" is_direct "$id" && continue
     if ! printf '%s\n' "$alive" | grep -qx "$id"; then
-      rm -f "$STATE_DIR/$id.side" "$STATE_DIR/$id.owner" "$STATE_DIR/$id.listener" \
-            "$STATE_DIR/$id.inbox" "$STATE_DIR/$id.cursor"
-      say "  dropped stale local state for $id (channel no longer on the bus)"
+      PP_SIDE="$side" preserve_mail "$id"
+      say "  retained closed local state for $id side $side (channel no longer on the bus)"
       s=$((s+1))
     fi
   done
@@ -1882,12 +1942,14 @@ cmd_gc() {
     while IFS=$'\t' read -r aid alive aage atopic; do
       [ -n "$aid" ] || continue
       local aowner="" dead=0
-      if [ -r "$(owner_file "$aid")" ]; then
-        aowner=$(sed -n 's/^session=//p' "$(owner_file "$aid")" 2>/dev/null | tr -d '[:space:]')
-        [ -n "$aowner" ] && ! session_alive "$aowner" && dead=1
-      fi
+      for side in a b; do
+        local ownerPath="$STATE_DIR/$aid.$side.owner"
+        [ -r "$ownerPath" ] || continue
+        aowner=$(sed -n 's/^session=//p' "$ownerPath")
+        if [ "$aowner" != nosession ] && ! owner_alive "$ownerPath"; then dead=1; break; fi
+      done
       if [ "$dead" = "1" ]; then
-        orphans="${orphans}${aid}\t${alive}\t${aowner}\t${atopic}\n"
+        orphans="${orphans}${aid}\t${alive}\t${aowner}\t${side}\t${atopic}\n"
       elif [ "${alive:-0}" = "0" ] && [ "${aage:--1}" -ge "$stale_s" ] 2>/dev/null; then
         quiet="${quiet}${aid}\t${atopic}\n"
       fi
@@ -1897,7 +1959,7 @@ cmd_gc() {
   if [ -n "$orphans" ]; then
     say ""
     say "pp: channels whose OWNER SESSION on this machine is gone:"
-    printf '%b' "$orphans" | while IFS=$'\t' read -r aid alive aowner atopic; do
+    printf '%b' "$orphans" | while IFS=$'\t' read -r aid alive aowner side atopic; do
       [ -n "$aid" ] || continue
       if [ "${alive:-0}" != "0" ]; then
         say "  $aid  (owner $aowner gone, but $alive listener(s) still up - held from OUTSIDE any session)  ${atopic:-<no topic>}"
@@ -1907,13 +1969,13 @@ cmd_gc() {
     done
     if [ "$close_abandoned" = "1" ]; then
       say "  --close-abandoned given: closing them now."
-      printf '%b' "$orphans" | while IFS=$'\t' read -r aid alive aowner atopic; do
+      printf '%b' "$orphans" | while IFS=$'\t' read -r aid alive aowner side atopic; do
         [ -n "$aid" ] || continue
         # A keeper that lost its leash would resurrect the marker between the
         # notify and the delete, so it goes first. Stopping it is safe here by
         # construction: its owner session is already gone.
-        cmd_unkeep "$aid" >/dev/null 2>&1 || true
-        if cmd_close "$aid" "$(default_label)" 1 >/dev/null 2>&1; then
+        PP_SIDE="$side" cmd_unkeep "$aid" >/dev/null 2>&1 || true
+        if PP_SIDE="$side" cmd_close "$aid" "$(default_label)" 1 >/dev/null 2>&1; then
           say "    closed $aid"
         else
           say "    could NOT close $aid - close it by hand: pp --close $aid --adopt"
@@ -1937,7 +1999,7 @@ cmd_gc() {
     say "  call, not a sweep. Confirm with the operator, then: pp --close <id>"
   fi
 
-  say "pp: checked $n listener record(s), dropped $s stale channel record(s)"
+  say "pp: checked $n listener record(s), retained $s closed endpoint record(s)"
 }
 
 gc_quiet() { cmd_gc >/dev/null 2>&1 || true; }
@@ -1946,6 +2008,7 @@ cmd_adopt() {
   local id="$1" label="$2"
   need_config
   valid_id "$id" || die "invalid id: '$id'"
+  cmd_unkeep "$id" >/dev/null 2>&1 || return 1
   claim_channel "$id" "$label"
   say "pp: channel $id is now owned by this session ($(session_id), label $label)"
 }
@@ -2030,7 +2093,8 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   -V, --version   version
 
   Env: PP_BUS_ROOT (default /tmp/ping-pong), PP_SEND_TIMEOUT (60),
-       PP_LABEL, PP_SIDE (force side a|b), PP_SESSION (override session identity),
+       PP_LABEL, PP_SIDE (select side a|b), PP_SESSION (override session identity),
+       PP_SESSION_BIRTH (internal boot-id:start-time leash fingerprint),
        PP_STALE_HOURS (24), PP_LEASH_POLL (15), PP_AWAIT_POLL (1),
        PP_WATCH_PULSE (30), PP_WATCH_PROBE (300), PP_SEND_GRACE (10),
        PP_KEEP_ON_END (SessionEnd reasons that do NOT close: "resume clear").
