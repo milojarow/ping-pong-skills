@@ -316,17 +316,18 @@ leash_mail() {
   rg -q '^survives-owner-death$' "$caseRoot/recovered"
 }
 
-leash_close_race() {
+leash_race() {
   # Keep production untouched: gate two existing operations in a private copy.
   pp="$caseRoot/pp"
   cp "$repo/skills/ping-pong/bin/pp" "$pp"
-  python3 - "$pp" <<'GATES'
+  python3 - "$pp" "$1" <<'GATES'
 from pathlib import Path
 import sys
 p=Path(sys.argv[1]); text=p.read_text()
 start=text.index('assert_owner() {'); end=text.index('\n# ',start)
 part=text[start:end]
-anchor='  if [ -n "${PP_SESSION_BIRTH:-}" ]; then\n'
+anchor=('  if [ -n "${PP_SESSION_BIRTH:-}" ]; then\n' if sys.argv[2]=='before-birth'
+        else '  [ "$owner" = "$me" ] && owner_alive "$f" && return 0\n')
 assert part.count(anchor)==1
 part=part.replace(anchor,'''  if [ -n "${PP_SESSION:-}" ] && [ -e "$STATE_DIR/test-listen-hold" ]; then
     touch "$STATE_DIR/test-listen-held"
@@ -342,6 +343,9 @@ text=text.replace(anchor,anchor+'''  touch "$STATE_DIR/test-close-entered"
 anchor='  say "pp: channel $id closed and deleted from the bus (active listeners were notified)"\n'
 assert text.count(anchor)==1
 text=text.replace(anchor,'  touch "$STATE_DIR/test-close-completed"\n'+anchor)
+anchor='cmd_unkeep() {\n'
+assert text.count(anchor)==1
+text=text.replace(anchor,anchor+'  printf "%s\\n" "${FUNCNAME[*]}" >> "$STATE_DIR/test-unkeep-callers"\n')
 p.write_text(text)
 GATES
   testCloseRelease="$XDG_STATE_HOME/ping-pong/test-close-release"
@@ -363,6 +367,7 @@ GATES
     if ! active a; then
       echo 'keeper stopped before close was released' >&2
       test ! -d "$PP_BUS_ROOT/$channel" || echo 'channel still exists on the local bus' >&2
+      [ ! -f "$XDG_STATE_HOME/ping-pong/test-unkeep-callers" ] || cat "$XDG_STATE_HOME/ping-pong/test-unkeep-callers" >&2
       journalctl --user -u "pp-keep-$channel-a.service" --no-pager -n 12 -o cat >&2
       return 1
     fi
@@ -380,6 +385,8 @@ GATES
   "$pp" --await "$channel" --wait 2 > "$caseRoot/recovered"
   rg -qx retained-through-slow-close "$caseRoot/recovered"
 }
+leash_close_race() { leash_race before-birth; }
+leash_self_adopt() { leash_race after-birth; }
 
 whoami() {
   local harness
@@ -813,7 +820,7 @@ caseNames=(identity_claude identity_codex identity_grok identity_human \
   stale_await adopt_during_drain protected_unkeep leash_mail version \
   whoami wake_batch wake_retry wake_dead wake_reject install_links install_old install_refuse \
   nosession_live identity_spoof identity_override wake_nonblocking mail_sigkill wake_reject_grok wake_reject_claude \
-  install_scan identity_missing_birth session_end_hook leash_close_race)
+  install_scan identity_missing_birth session_end_hook leash_close_race leash_self_adopt)
 if [ "${1:-}" = --only ]; then
   shift
   [ "$#" -gt 0 ] || exit 2
