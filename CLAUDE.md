@@ -97,6 +97,28 @@ never a prompt echoed on screen. Its dry-run launches no agent. Historical
 standing-listener and direct feeder recipes were retired, not replaced by hidden
 background services.
 
+## Known gap: `--watch` is not ownership-checked
+
+**Not built.** 1.4.0 put the live-owner guard in front of every command that consumes or alters
+an endpoint (`--await`, `--listen`, `--send`, `--keep`, `--unkeep`, `--wake`, `--unwake`,
+`--close`), but `cmd_watch` never calls `assert_owner`. A caller that is not the owner can arm a
+watch on a live owner's endpoint and see its `MAIL <id> unread=N` rings. It cannot read a body and
+it does not move the cursor, so the owner still drains everything; what leaks is the timing and
+size of the traffic. Found by adversarial review, measured on a local bus. The fix is the same
+guard at the top of `cmd_watch`, plus a `nosession_live`-style case that includes `--watch`.
+**Do not document `--watch` as owner-only until the guard ships.**
+
+## Known gap: a caller with no agent ancestor can declare `PP_SESSION` without a birth fingerprint
+
+**Not built.** 1.4.0 refuses a declared `PP_SESSION` whenever the process has an agent ancestor
+that differs from it, which closes agent-to-agent impersonation. A process with NO agent ancestor
+(a script, a systemd unit) is still believed when it declares a live owner's id, even without
+`PP_SESSION_BIRTH`: that is the path the keeper and wake units use, and `identity_override` pins
+it. Measured: such a caller drained a live owner's mail and its `--session-end` closed the
+channel. The tightening is to require the birth fingerprint whenever `PP_SESSION` is declared
+(the units already pass both) and to refuse a bare declaration. Same-user processes are not a
+security boundary here; the point is that an identity is never accepted on its name alone.
+
 ## Shipped in 0.2.0: ownership + the reaper
 
 Both of the gaps recorded here were closed in 0.2.0 and are now documented in the skill:
