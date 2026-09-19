@@ -50,13 +50,20 @@ wait_until() {
     sleep 0.25
   done
 }
+tuis_gone() {
+  local d
+  for d in /proc/[0-9]*; do
+    case "$(readlink "$d/cwd" 2>/dev/null)" in "$workRoot"/receiver|"$workRoot"/sender) return 1 ;; esac
+  done
+  return 0
+}
 unit_stopped() {
   [ "$(systemctl --user show "$1" -p ActiveState --value)" = inactive ] &&
     [ "$(systemctl --user show "$1" -p MainPID --value)" = 0 ]
 }
 cleanup() {
   local result=$? side id unit
-  trap - EXIT INT TERM HUP
+  trap - EXIT INT TERM HUP ERR   # polling helpers return 1 by design during cleanup
   # Find every channel this test created, even if setup failed before recording id.
   local ids=()
   for path in "$PP_BUS_ROOT"/pp-* "$XDG_STATE_HOME"/ping-pong/*.a.owner; do
@@ -64,8 +71,13 @@ cleanup() {
     id=${path##*/}; id=${id%.a.owner}
     [[ "$id" =~ ^pp-[a-z0-9]+$ ]] && ids+=("$id")
   done
+  # End the TUIs first: since 1.4.0 a caller that is not the owner cannot close a LIVE owner's
+  # channel, and a declared PP_SESSION must match the detected agent. With the owners gone the
+  # operator-side cleanup adopts explicitly instead of forging an identity.
+  tmux -L "$socket" kill-server >/dev/null 2>&1 || true
+  wait_until 15 tuis_gone || result=1
   for id in "${ids[@]}"; do
-    env PP_SESSION=nosession PP_SIDE=a "$pp" --close "$id" > "$workRoot/close-$id.log" 2>&1 || result=1
+    env -u PP_SESSION -u PP_SESSION_BIRTH PP_SIDE=a "$pp" --close "$id" --adopt > "$workRoot/close-$id.log" 2>&1 || result=1
     for side in a b; do
       for kind in wake keep; do
         unit="pp-$kind-$id-$side.service"
