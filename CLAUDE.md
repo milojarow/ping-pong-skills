@@ -53,11 +53,27 @@ Activates when this session must talk to another agent session — the operator 
 - Keep the docs free of real hostnames, aliases, and usernames. The bus is always `<alias>` / "the bus host".
 - **The version chain has three links, and they move together:** `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `PP_VERSION` in `skills/ping-pong/bin/pp`. Two past releases bumped the manifests and left the constant behind, so `--version` reported a stale version in two different builds — and "check which version you are running" stopped being a usable diagnostic exactly when it was needed to tell a build with guards from one without. If the executable prints its own version, that string is part of the release, not a comment.
 
+## Shipped in 1.4.1
+
+Release contents prepared on this branch:
+
+- **Backups stay outside skill discovery.** Install moves recognized old copies
+  into `${XDG_STATE_HOME:-$HOME/.local/state}/ping-pong/backups/` and reports each
+  path. It rejects adjacent `ping-pong.pre-link-*` leftovers in known skill roots,
+  including during `--check`, because a copied SKILL.md loads obsolete instructions.
+- **Watch checks ownership.** The same live-owner guard now runs before watch
+  exposes mailbox timing or byte counts; an unrelated shell must explicitly adopt.
+- **Declared identities require their birth fingerprint.** Every nonempty
+  PP_SESSION needs a matching PP_SESSION_BIRTH. Keeper and wake already supply it;
+  leash cleanup clears both declarations, and SessionEnd detects its real ancestor.
+  Same-user processes can read the fingerprint; this check prevents accepting a
+  process name and pid alone.
+
 ## Shipped in 1.4.0
 
-These changes are on the development branch; this heading records the release
-content, not evidence of publication. The older design sections below are history;
-current instructions are SKILL.md and the three harness recipes.
+Version 1.4.0 is published and installed on both machines, as confirmed by the
+operator. The older design sections below are history; current instructions are
+SKILL.md and the three harness recipes.
 
 - **Identity is a process incarnation.** Claude, Codex and Grok use
   `<harness>:<pid>` plus boot id and process start ticks. PID reuse must not extend
@@ -96,28 +112,6 @@ operator-run real-TUI gate; event files and exact body/cursor checks decide it,
 never a prompt echoed on screen. Its dry-run launches no agent. Historical
 standing-listener and direct feeder recipes were retired, not replaced by hidden
 background services.
-
-## Known gap: `--watch` is not ownership-checked
-
-**Not built.** 1.4.0 put the live-owner guard in front of every command that consumes or alters
-an endpoint (`--await`, `--listen`, `--send`, `--keep`, `--unkeep`, `--wake`, `--unwake`,
-`--close`), but `cmd_watch` never calls `assert_owner`. A caller that is not the owner can arm a
-watch on a live owner's endpoint and see its `MAIL <id> unread=N` rings. It cannot read a body and
-it does not move the cursor, so the owner still drains everything; what leaks is the timing and
-size of the traffic. Found by adversarial review, measured on a local bus. The fix is the same
-guard at the top of `cmd_watch`, plus a `nosession_live`-style case that includes `--watch`.
-**Do not document `--watch` as owner-only until the guard ships.**
-
-## Known gap: a caller with no agent ancestor can declare `PP_SESSION` without a birth fingerprint
-
-**Not built.** 1.4.0 refuses a declared `PP_SESSION` whenever the process has an agent ancestor
-that differs from it, which closes agent-to-agent impersonation. A process with NO agent ancestor
-(a script, a systemd unit) is still believed when it declares a live owner's id, even without
-`PP_SESSION_BIRTH`: that is the path the keeper and wake units use, and `identity_override` pins
-it. Measured: such a caller drained a live owner's mail and its `--session-end` closed the
-channel. The tightening is to require the birth fingerprint whenever `PP_SESSION` is declared
-(the units already pass both) and to refuse a bare declaration. Same-user processes are not a
-security boundary here; the point is that an identity is never accepted on its name alone.
 
 ## Shipped in 0.2.0: ownership + the reaper
 
