@@ -76,6 +76,8 @@ open_actor() {
   [[ "$channel" =~ ^pp-[a-z0-9]+$ ]]
 }
 
+owner_birth() { sed -n 's/^birth=//p' "$XDG_STATE_HOME/ping-pong/$channel.a.owner"; }
+
 active() { systemctl --user is-active --quiet "pp-keep-$channel-$1.service"; }
 inactive() {
   local unit="pp-keep-$channel-$1.service" state pid
@@ -93,12 +95,12 @@ setup_receiver() {
   open_actor receiver
   request receiver "$pp" --keep "$channel"
   mkdir -p "$caseRoot/sender"
-  env XDG_STATE_HOME="$caseRoot/sender" PP_SESSION=nosession \
+  env XDG_STATE_HOME="$caseRoot/sender" \
     "$pp" --join "$channel" --as sender
 }
 
 send_mail() {
-  env XDG_STATE_HOME="$caseRoot/sender" PP_SESSION=nosession \
+  env XDG_STATE_HOME="$caseRoot/sender" \
     "$pp" --send "$channel" --as sender -m "$1"
   wait_until has_mail "$1"
 }
@@ -172,10 +174,10 @@ mail_restart() {
 mail_concurrent() {
   setup_receiver
   local owner="claude:$(cat "$caseRoot/receiver/pid")" first second deadline count
-  env PP_SESSION="$owner" "$pp" --await "$channel" --wait 4 > "$caseRoot/read-1" 2>&1 &
+  env PP_SESSION="$owner" PP_SESSION_BIRTH="$(owner_birth)" "$pp" --await "$channel" --wait 4 > "$caseRoot/read-1" 2>&1 &
   first=$!
   actorPids+=("$first")
-  env PP_SESSION="$owner" "$pp" --await "$channel" --wait 4 > "$caseRoot/read-2" 2>&1 &
+  env PP_SESSION="$owner" PP_SESSION_BIRTH="$(owner_birth)" "$pp" --await "$channel" --wait 4 > "$caseRoot/read-2" 2>&1 &
   second=$!
   actorPids+=("$second")
   # Both readers must remain blocked before the positive probe.
@@ -215,7 +217,7 @@ pid_reuse() {
 stale_await() {
   setup_receiver
   local oldReader oldOwner="claude:$(cat "$caseRoot/receiver/pid")" deadline
-  env PP_SESSION="$oldOwner" PP_AWAIT_POLL=10 "$pp" --await "$channel" --wait 40 > "$caseRoot/old-reader.out" 2>&1 &
+  env PP_SESSION="$oldOwner" PP_SESSION_BIRTH="$(owner_birth)" PP_AWAIT_POLL=10 "$pp" --await "$channel" --wait 40 > "$caseRoot/old-reader.out" 2>&1 &
   oldReader=$!
   actorPids+=("$oldReader")
   # Pause in the idle sleep, not halfway through keeper_state: a suspended
@@ -262,12 +264,12 @@ adopt_during_drain() {
   start_actor claude replacement
   local owner="claude:$(cat "$caseRoot/receiver/pid")" drainer adopter
   { printf 'held-drain\n'; head -c 262144 /dev/zero | tr '\0' x; printf '\n'; } > "$caseRoot/large-message"
-  env XDG_STATE_HOME="$caseRoot/sender" PP_SESSION=nosession \
+  env XDG_STATE_HOME="$caseRoot/sender" \
     "$pp" --send "$channel" < "$caseRoot/large-message"
   wait_until has_mail held-drain
   # Real stdout backpressure holds dd inside the drain transaction.
   (
-    env PP_SESSION="$owner" "$pp" --await "$channel" --wait 3 |
+    env PP_SESSION="$owner" PP_SESSION_BIRTH="$(owner_birth)" "$pp" --await "$channel" --wait 3 |
       { IFS= read -r header; printf '%s\n' "$header" > "$caseRoot/drain-started"
         wait_until test -f "$caseRoot/release-drain"
         cat > "$caseRoot/drained-body"; }
@@ -310,7 +312,7 @@ leash_mail() {
     rg -q "^pp: channel $channel side a .*UNREAD" "$caseRoot/keeper-journal"
   }
   wait_until journal_has_pending
-  env PP_SESSION=nosession "$pp" --await "$channel" --wait 2 > "$caseRoot/recovered"
+  env "$pp" --await "$channel" --wait 2 > "$caseRoot/recovered"
   rg -q '^survives-owner-death$' "$caseRoot/recovered"
 }
 
@@ -325,8 +327,9 @@ whoami() {
   done
   "$pp" --whoami > "$caseRoot/human"
   rg -qx 'session=nosession' "$caseRoot/human"
+  open_actor grok
   local declared="grok:$(cat "$caseRoot/grok/pid")"
-  env PP_SESSION="$declared" "$pp" --whoami > "$caseRoot/override"
+  env PP_SESSION="$declared" PP_SESSION_BIRTH="$(owner_birth)" "$pp" --whoami > "$caseRoot/override"
   rg -qx "session=$declared" "$caseRoot/override"
 }
 
@@ -343,7 +346,7 @@ f=root/'fake-bin/codex'
 f.write_text("#!/usr/bin/python3\nimport json, pathlib, sys\nr=pathlib.Path("+repr(str(root))+" )\nwith (r/'queue.jsonl').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\nmode=(r/'queue-mode').read_text().strip() if (r/'queue-mode').exists() else ''\ncount=len((r/'queue.jsonl').read_text().splitlines())\nsys.exit(1 if mode=='fail' or (mode=='once' and count==1) else 0)\n")
 f.chmod(0o755)
 FAKE
-  env XDG_STATE_HOME="$caseRoot/sender" PP_SESSION=nosession "$pp" --join "$channel" --as sender
+  env XDG_STATE_HOME="$caseRoot/sender" "$pp" --join "$channel" --as sender
 }
 arm_wake() {
   request receiver env PATH="$caseRoot/fake-bin:$PATH" \
@@ -409,7 +412,7 @@ wake_dead() {
   state=$(systemctl --user show "pp-wake-$channel-a.service" -p ActiveState --value)
   pid=$(systemctl --user show "pp-wake-$channel-a.service" -p MainPID --value)
   [ "$state" = inactive ] && [ "$pid" = 0 ]
-  env PP_SESSION=nosession "$pp" --await "$channel" > "$caseRoot/recovered"
+  env "$pp" --await "$channel" > "$caseRoot/recovered"
   rg -q '^pending-when-owner-dies$' "$caseRoot/recovered"
 }
 wake_reject() {
@@ -439,20 +442,28 @@ nosession_live() {
   local owner="claude:$(cat "$caseRoot/receiver/pid")" operation
   no_agent "$pp" --whoami > "$caseRoot/outsider-identity"
   rg -qx 'session=nosession' "$caseRoot/outsider-identity"
-  for operation in --await --listen --send --keep --unkeep --wake --unwake --close; do
+  for operation in --await --listen --send --keep --unkeep --wake --unwake --close --watch; do
     local args=("$operation" "$channel")
     case "$operation" in
       --await|--listen) args+=(--wait 1) ;;
       --send) args+=(-m forbidden-sender) ;;
     esac
-    if no_agent "$pp" "${args[@]}" > "$caseRoot/refusal" 2>&1; then
+    if no_agent timeout --kill-after=1 2 "$pp" "${args[@]}" > "$caseRoot/refusal" 2>&1; then
       echo "unexpected success: nosession $operation" >&2
       return 1
     fi
-    rg -q 'LIVE session' "$caseRoot/refusal"
+    rg -q 'LIVE session' "$caseRoot/refusal" || {
+      printf 'missing ownership refusal: %s\n' "$operation" >&2
+      cat "$caseRoot/refusal" >&2
+      return 1
+    }
     rg -q --fixed-strings "$owner" "$caseRoot/refusal"
     active a
   done
+  # A real owner still receives watch events; neither watching nor timing out drains.
+  if request receiver timeout --kill-after=1 2 "$pp" --watch "$channel"; then return 1; fi
+  rg -q "^MAIL $channel " "$lastRequest.out"
+  active a
   no_agent "$pp" --info "$channel" > "$caseRoot/info"
   no_agent "$pp" --list > "$caseRoot/list"
   request receiver "$pp" --await "$channel" --wait 2
@@ -471,7 +482,7 @@ identity_spoof() {
   for operation in --whoami --await; do
     local args=("$operation")
     [ "$operation" = --whoami ] || args+=("$channel" --wait 1)
-    if request attacker env PP_SESSION="$owner" "$pp" "${args[@]}"; then return 1; fi
+    if request attacker env PP_SESSION="$owner" PP_SESSION_BIRTH="$(owner_birth)" "$pp" "${args[@]}"; then return 1; fi
     rg -q 'declared session.*does not match.*process session' "$lastRequest.out"
   done
   if request attacker env PP_SESSION=nosession "$pp" --whoami; then return 1; fi
@@ -489,10 +500,43 @@ identity_override() {
   no_agent env PP_SESSION="$owner" PP_SESSION_BIRTH="$birth" "$pp" --whoami > "$caseRoot/valid-override"
   rg -qx "session=$owner" "$caseRoot/valid-override"
   for declared in "grok:$(cat "$caseRoot/receiver/pid")" "claude:$$" invalid; do
-    if no_agent env PP_SESSION="$declared" "$pp" --whoami > "$caseRoot/invalid" 2>&1; then return 1; fi
+    if no_agent env PP_SESSION="$declared" PP_SESSION_BIRTH="$birth" "$pp" --whoami > "$caseRoot/invalid" 2>&1; then return 1; fi
   done
   if no_agent env PP_SESSION="$owner" PP_SESSION_BIRTH=wrong "$pp" --whoami > "$caseRoot/birth" 2>&1; then return 1; fi
   rg -q 'birth|incarnation' "$caseRoot/birth"
+}
+
+identity_missing_birth() {
+  setup_receiver
+  send_mail protected-without-birth
+  local owner="claude:$(cat "$caseRoot/receiver/pid")" operation
+  for operation in --whoami --await --session-end; do
+    local args=("$operation")
+    case "$operation" in
+      --await) args+=("$channel" --wait 1) ;;
+      --session-end) args+=(--reason logout) ;;
+    esac
+    if no_agent env PP_SESSION="$owner" "$pp" "${args[@]}" > "$caseRoot/no-birth" 2>&1; then
+      echo "unexpected success without birth: $operation" >&2
+      return 1
+    fi
+    rg -q 'PP_SESSION requires PP_SESSION_BIRTH' "$caseRoot/no-birth"
+    active a
+  done
+  request receiver "$pp" --await "$channel" --wait 2
+  rg -qx protected-without-birth "$lastRequest.out"
+}
+
+session_end_hook() {
+  setup_receiver
+  send_mail retained-after-hook
+  printf '%s\n' '{"reason":"logout"}' > "$caseRoot/session-end.json"
+  request receiver env CLAUDE_PLUGIN_ROOT="$repo" bash -c '"$1" < "$2"' _ \
+    "$repo/hooks/sessionend-close-channels.sh" "$caseRoot/session-end.json"
+  test ! -d "$PP_BUS_ROOT/$channel"
+  wait_until inactive a
+  request receiver "$pp" --await "$channel" --wait 2
+  rg -qx retained-after-hook "$lastRequest.out"
 }
 
 wake_nonblocking() {
@@ -511,7 +555,7 @@ SLOW
   send_mail first-during-queue
   wait_until test -e "$caseRoot/queue-started"
   for body in second-during-queue third-during-queue; do
-    env XDG_STATE_HOME="$caseRoot/sender" PP_SESSION=nosession PP_SEND_GRACE=2 \
+    env XDG_STATE_HOME="$caseRoot/sender" PP_SEND_GRACE=2 \
       "$pp" --send "$channel" --as sender -m "$body"
   done
   wait_until has_mail third-during-queue
@@ -544,7 +588,7 @@ root=Path(sys.argv[1]); fake=root/'cut-bin/mv'
 fake.write_text('#!/bin/bash\ncase "${!#}" in *.cursor)\n  touch '+repr(str(root/'before-cursor'))+'\n  while [ ! -e '+repr(str(root/'release-cursor'))+' ]; do sleep 0.1; done ;;\nesac\nexec /usr/bin/mv "$@"\n')
 fake.chmod(0o755)
 CUT
-  setsid env PP_SESSION="$owner" PATH="$caseRoot/cut-bin:$PATH" \
+  setsid env PP_SESSION="$owner" PP_SESSION_BIRTH="$(owner_birth)" PATH="$caseRoot/cut-bin:$PATH" \
     "$pp" --await "$channel" --wait 2 > "$caseRoot/first-delivery" &
   drainer=$!; actorPids+=("$drainer"); testGroups+=("$drainer")
   wait_until test -e "$caseRoot/before-cursor"
@@ -571,6 +615,7 @@ wake_reject_claude() { wake_wrong_harness claude; }
 
 install_fixture() {
   installHome="$caseRoot/home"
+  export CODEX_HOME="$installHome/.codex"
   canonical="$installHome/.claude/plugins/marketplaces/ping-pong-skills/skills/ping-pong"
   mkdir -p "$(dirname "$canonical")"
   cp -a "$repo/skills/ping-pong" "$canonical"
@@ -594,10 +639,39 @@ install_old() {
   env HOME="$installHome" "$pp" --install > "$caseRoot/install.out"
   rg -q 'legacy.*backup' "$caseRoot/install.out"
   env HOME="$installHome" "$pp" --install --check
-  local backups=("$installHome/.codex/skills/"ping-pong.pre-link-*)
+  local backups=("$XDG_STATE_HOME/ping-pong/backups/"ping-pong.pre-link-*)
+  [ "${#backups[@]}" = 1 ]
+  cmp "${backups[0]}/SKILL.md" "$canonical/SKILL.md"
+  rg -qF "legacy backup: ${backups[0]}" "$caseRoot/install.out"
+  local binaries=("$XDG_STATE_HOME/ping-pong/backups/"pp.pre-link-*)
+  [ "${#binaries[@]}" = 1 ]
+  cmp "${binaries[0]}" "$canonical/bin/pp"
+  [ -z "$(find "$installHome/.codex/skills" -maxdepth 1 -name 'ping-pong.pre-link-*' -print)" ]
+  # The default state root is also outside skills when XDG_STATE_HOME is unset.
+  gio trash "$installHome/.codex/skills/ping-pong"
+  cp -a "$canonical" "$installHome/.codex/skills/ping-pong"
+  env -u XDG_STATE_HOME HOME="$installHome" "$pp" --install > "$caseRoot/default-backup.out"
+  backups=("$installHome/.local/state/ping-pong/backups/"ping-pong.pre-link-*)
   [ "${#backups[@]}" = 1 ]
   cmp "${backups[0]}/SKILL.md" "$canonical/SKILL.md"
 }
+install_scan() {
+  install_fixture
+  env HOME="$installHome" "$pp" --install
+  local root duplicate
+  for root in "$installHome/.codex/skills" "$installHome/.claude/skills" \
+      "$installHome/.grok/skills" "$installHome/.agents/skills" "$(dirname "$canonical")"; do
+    duplicate="$root/ping-pong.pre-link-123-456"
+    mkdir -p "$root"
+    cp -a "$canonical" "$duplicate"
+    if env HOME="$installHome" "$pp" --install --check > "$caseRoot/duplicate.out" 2>&1; then return 1; fi
+    rg -qF "$duplicate" "$caseRoot/duplicate.out"
+    cmp "$duplicate/SKILL.md" "$canonical/SKILL.md"
+    gio trash "$duplicate"
+    env HOME="$installHome" "$pp" --install --check
+  done
+}
+
 install_refuse() {
   install_fixture
   mkdir -p "$installHome/.codex/skills/ping-pong" "$installHome/.local/bin"
@@ -664,7 +738,8 @@ caseNames=(identity_claude identity_codex identity_grok identity_human \
   keeper_codex keeper_grok same_machine mail_restart mail_concurrent mail_close pid_reuse \
   stale_await adopt_during_drain protected_unkeep leash_mail version \
   whoami wake_batch wake_retry wake_dead wake_reject install_links install_old install_refuse \
-  nosession_live identity_spoof identity_override wake_nonblocking mail_sigkill wake_reject_grok wake_reject_claude)
+  nosession_live identity_spoof identity_override wake_nonblocking mail_sigkill wake_reject_grok wake_reject_claude \
+  install_scan identity_missing_birth session_end_hook)
 if [ "${1:-}" = --only ]; then
   shift
   [ "$#" -gt 0 ] || exit 2
