@@ -236,6 +236,19 @@ owner_alive() {
   session_alive "$owner" "$birth"
 }
 
+cmd_whoami() {
+  local identity harness recipe=none
+  identity=$(session_id)
+  harness=${identity%%:*}
+  case "$harness" in
+    claude|codex|grok) recipe="$(dirname "$(self_path)")/../reference/harness-$harness.md"
+      recipe=$(realpath -m "$recipe") ;;
+    nosession) : ;;
+    *) harness=unknown ;;
+  esac
+  printf 'harness=%s\nsession=%s\nrecipe=%s\n' "$harness" "$identity" "$recipe"
+}
+
 # A session keeps the build it resolved at startup, and the guards live in this
 # binary rather than in the skill text - so a session started before a fix exists
 # keeps suffering the bug it closes, silently. Say so, and hand over the exact
@@ -738,8 +751,8 @@ cmd_open_direct() {
   say "needed from you."
   say "--8<---------------------------------------------------------------------------"
   say ""
-  say "Then keep your listener running IN THE BACKGROUND:"
-  say "    pp --listen $id"
+  say "DIRECT mode is degraded. When assigned to wait, run in the foreground:"
+  say "    pp --listen $id --wait 30"
 }
 
 cmd_join_direct() {
@@ -760,8 +773,8 @@ cmd_join_direct() {
   say "  peer:      $peer:$port"
   say "  me:        side b  (label: $label, session $(session_id))"
   say ""
-  say "Keep your listener running IN THE BACKGROUND, then greet the peer:"
-  say "    pp --listen $id"
+  say "DIRECT mode is degraded. Use a bounded foreground wait:"
+  say "    pp --listen $id --wait 30"
   say "    pp --send $id -m \"<greeting>\""
 }
 
@@ -881,8 +894,8 @@ cmd_open() {
   say "Hand THIS line to the other session:"
   say "    /ping-pong $id"
   say ""
-  say "Then keep your listener running IN THE BACKGROUND:"
-  say "    pp --listen $id"
+  say "Next: pp --whoami, follow the receiver recipe, and start:"
+  say "    pp --keep $id"
 }
 
 cmd_join() {
@@ -921,8 +934,8 @@ cmd_join() {
   topic=$(bus "sed -n 's/^topic=//p' '$BUS_ROOT/$id/meta' 2>/dev/null")
   [ -n "$topic" ] && say "  topic: $topic"
   say ""
-  say "Now keep your listener running IN THE BACKGROUND:"
-  say "    pp --listen $id"
+  say "Next: pp --whoami, follow the receiver recipe, and start:"
+  say "    pp --keep $id"
 }
 
 # A reader blocked in open(2) on a FIFO does not hold a file descriptor yet, so
@@ -1220,7 +1233,7 @@ $(journalctl --user -u "$unit" --no-pager -n 5 -o cat 2>/dev/null | sed 's/^/   
   say "pp: keeper up for $id (unit $unit, leashed to session $owner)"
   say "    it holds a reader on the bus for as long as this session lives, so the"
   say "    peer's sends never bounce and nothing is lost between turns."
-  say "    wake up on new mail with:  pp --await $id     (run it in the background)"
+  say "    arm this harness's wake recipe: pp --whoami"
 }
 
 # The loop itself. Runs inside the unit. Two things end it: the channel closing,
@@ -1335,12 +1348,168 @@ cmd_unkeep() {
   local id="$1" u side
   have_user_systemd || { say "pp: no keeper running for $id"; return 0; }
   side=$(my_side "$id") || return 1
+  cmd_unwake "$id" >/dev/null 2>&1 || true
   u="$(keeper_unit "$id" "$side").service"
   systemctl --user stop "$u" >/dev/null 2>&1 || true
   systemctl --user reset-failed "$u" >/dev/null 2>&1 || true
   say "pp: keeper stopped for $id side $side"
   return 0
 }
+
+# A Codex bell is an operator-level turn. Only a validated channel id enters
+# the fixed message; peer labels, topics and bodies never enter queue argv.
+wake_unit() { printf 'pp-wake-%s-%s' "$1" "$2"; }
+
+cmd_unwake() {
+  local side unit
+  side=$(my_side "$1") || return 1
+  unit=$(wake_unit "$1" "$side")
+  systemctl --user stop "$unit" >/dev/null 2>&1 || true
+  systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+}
+
+cmd_wake() {
+  local id="$1" PP_SIDE="${PP_SIDE:-}" owner birth thread binary unit keeper ready
+  valid_id "$id" || die "invalid id: '$id'"
+  PP_SIDE=$(my_side "$id") || return 1
+  is_direct "$id" && die "--wake requires a bus keeper; direct mode is degraded"
+  assert_owner "$id" "$(default_label)" 0 || return 1
+  owner=$(session_id)
+  [[ "$owner" = codex:* ]] || die "--wake is for a live Codex receiver; use --whoami"
+  birth=$(session_birth "$owner") || die "owner session is gone"
+  thread=${CODEX_THREAD_ID:-}
+  [[ "$thread" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] ||
+    die "--wake needs CODEX_THREAD_ID from this live TUI"
+  binary=$(command -v codex) || die "codex is not on PATH; use bounded foreground --await"
+  binary=$(realpath "$binary") || return 1
+  have_user_systemd || die "--wake requires user systemd; use bounded foreground --await"
+  [ "$(keeper_state "$id")" = active ] || die "start --keep $id before --wake"
+  [ ! -e "$(state_file "$id" closed)" ] || die "channel is closed; recover mail with --await"
+  local delay=${PP_WAKE_RETRY_DELAY:-2} limit=${PP_WAKE_TIMEOUT:-10}
+  [[ "$delay" =~ ^[1-9][0-9]*$ && "$limit" =~ ^[1-9][0-9]*$ ]] || die "wake delay/timeout must be positive seconds"
+  unit=$(wake_unit "$id" "$PP_SIDE")
+  keeper=$(keeper_unit "$id" "$PP_SIDE")
+  ready=$(state_file "$id" wake-ready)
+  if systemctl --user is-active --quiet "$unit"; then
+    [ "$(cat "$ready" 2>/dev/null)" = "$owner $birth $thread" ] || die "a different wake binding is already active"
+    say "pp: wake already armed for $id"
+    return 0
+  fi
+  systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+  systemd-run --user --quiet --unit="$unit" \
+    --description="ping-pong Codex bell for $id" \
+    --property=Restart=no --property="BindsTo=$keeper.service" \
+    --property="After=$keeper.service" --property="PartOf=$keeper.service" \
+    --setenv=PP_SESSION="$owner" --setenv=PP_SESSION_BIRTH="$birth" \
+    --setenv=PP_SIDE="$PP_SIDE" --setenv=CODEX_THREAD_ID="$thread" \
+    --setenv=PP_CODEX_BIN="$binary" --setenv=PP_BUS_ROOT="$BUS_ROOT" \
+    --setenv=PP_LEASH_POLL="$PP_LEASH_POLL" \
+    --setenv=PP_WAKE_RETRY_DELAY="$delay" --setenv=PP_WAKE_TIMEOUT="$limit" \
+    --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
+    --setenv=CODEX_HOME="${CODEX_HOME:-$HOME/.codex}" \
+    --setenv=XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}" \
+    --setenv=XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
+    -- "$(self_path)" --wake-run "$id" || return 1
+  local deadline=$((SECONDS + 5))
+  # The ready record can survive a previous run; bind it to this MainPID too.
+  until [ "$(cat "$ready" 2>/dev/null)" = "$owner $birth $thread" ] &&
+      [ "$(cat "$(state_file "$id" wake-pid)" 2>/dev/null)" = "$(systemctl --user show "$unit" -p MainPID --value)" ] &&
+      systemctl --user is-active --quiet "$unit"; do
+    [ "$SECONDS" -lt "$deadline" ] || die "wake failed to arm; inspect journalctl --user -u $unit"
+    sleep 0.1
+  done
+  say "pp: wake armed for $id (session $owner, unit $unit)"
+}
+
+cmd_wake_run() (
+  local id="$1" owner="${PP_SESSION:-}" birth="${PP_SESSION_BIRTH:-}"
+  local thread="${CODEX_THREAD_ID:-}" binary="${PP_CODEX_BIN:-}"
+  local PP_SIDE="${PP_SIDE:-}" ownerPath spool cursor ledger ready key
+  valid_id "$id" || return 1
+  [[ "$owner" = codex:* && "$thread" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || return 1
+  [ -x "$binary" ] || return 1
+  PP_SIDE=$(my_side "$id") || return 1
+  ownerPath=$(owner_file "$id"); spool=$(spool_file "$id"); cursor=$(cursor_file "$id")
+  ledger=$(state_file "$id" wake-state); ready=$(state_file "$id" wake-ready)
+  key="$owner $birth $thread"
+  exec 9>"$(state_file "$id" wake-lock)"
+  flock -n -x 9 || return 1
+  wake_live() {
+    [ ! -e "$(state_file "$id" closed)" ] &&
+      [ "$(sed -n 's/^session=//p' "$ownerPath")" = "$owner" ] &&
+      [ "$(sed -n 's/^birth=//p' "$ownerPath")" = "$birth" ] &&
+      session_alive "$owner" "$birth"
+  }
+  wake_live || return 0
+  local inw="" event savedKey="" savedCursor=-1 attempts=0 delivered=0 cur size temporary rc
+  # Watch cursor renames too. A write can arrive during a drain, with no later
+  # inbox event; the new cursor must release the next batch's bell.
+  if command -v inotifywait >/dev/null 2>&1; then
+    exec 3< <(inotifywait -m -q -e close_write,moved_to,create --format '%f' "$STATE_DIR")
+    inw=$!
+  else
+    note "wake: inotifywait unavailable; checking state every ${PP_LEASH_POLL}s"
+  fi
+  trap '[ -z "$inw" ] || kill "$inw" 2>/dev/null || true' EXIT
+  trap 'exit 0' TERM INT HUP
+  printf '%s\n' "$key" > "$ready"
+  printf '%s\n' "$$" > "$(state_file "$id" wake-pid)"
+  exec 8>"$(state_file "$id" mail-lock)"
+  while wake_live; do
+    flock -x 8 || return 1
+    wake_live || return 0
+    cur=$(cat "$cursor" 2>/dev/null || echo 0)
+    size=$(stat -c %s "$spool") || return 1
+    [[ "$cur" =~ ^[0-9]+$ ]] || return 1
+    savedKey= savedCursor=-1 attempts=0 delivered=0
+    if [ -r "$ledger" ]; then
+      IFS=$'\t' read -r savedKey savedCursor attempts delivered < "$ledger" || return 1
+      [[ "$attempts" =~ ^[0-3]$ && "$delivered" =~ ^[01]$ ]] || return 1
+    fi
+    if [ "$savedKey" != "$key" ] || [ "$savedCursor" != "$cur" ]; then
+      attempts=0; delivered=0
+    fi
+    if [ "$size" -gt "$cur" ] && [ "$delivered" = 0 ] && [ "$attempts" -lt 3 ]; then
+      attempts=$((attempts + 1))
+      # Persist the budget BEFORE attempting: restarts do not reset failures.
+      temporary=$(mktemp "$ledger.XXXXXXXX") || return 1
+      printf '%s\t%s\t%s\t0\n' "$key" "$cur" "$attempts" > "$temporary"
+      mv -f -- "$temporary" "$ledger" || return 1
+      # Last check immediately before queue. No peer data reaches this command.
+      wake_live || return 0
+      timeout --kill-after=1 "${PP_WAKE_TIMEOUT:-10}" "$binary" queue --thread "$thread" \
+        --message "Ping-pong: drain channel $id with pp --await $id." >/dev/null 2>&1
+      rc=$?
+      if [ "$rc" = 0 ]; then
+        temporary=$(mktemp "$ledger.XXXXXXXX") || return 1
+        printf '%s\t%s\t%s\t1\n' "$key" "$cur" "$attempts" > "$temporary"
+        mv -f -- "$temporary" "$ledger" || return 1
+      else
+        note "wake $id: queue failed (exit $rc, attempt $attempts/3); mail remains in spool"
+        flock -u 8
+        if [ "$attempts" -lt 3 ]; then
+          sleep "${PP_WAKE_RETRY_DELAY:-2}"
+          continue
+        fi
+      fi
+    fi
+    flock -u 8
+    # Readiness is not an event. Only spool/cursor/closure changes matter;
+    # self-written ledger and lock events never become bells.
+    if [ -n "$inw" ]; then
+      while read -t "$PP_LEASH_POLL" -r -u 3 event; do
+        wake_live || return 0
+        case "$event" in "$id.$PP_SIDE.inbox"|"$id.$PP_SIDE.cursor"|"$id.$PP_SIDE.closed"|"$id.$PP_SIDE.owner") break ;; esac
+      done
+      if ! kill -0 "$inw" 2>/dev/null; then
+        note "wake $id: inotify ended; stopping (rearm with --wake)"
+        return 1
+      fi
+    else
+      sleep "$PP_LEASH_POLL"
+    fi
+  done
+)
 
 # The waker. Blocks until the spool grows past the cursor, prints exactly what is
 # new, and exits - the same contract --listen has with the harness, so the agent
@@ -1430,7 +1599,7 @@ preserve_mail() (
 # --await still has to be relaunched every turn: it exits on delivery, and a
 # background task is reaped when the turn closes. --watch is the persistent
 # waker for a harness that can stream EVENTS from a long-running process (Claude
-# Code's Monitor tool). It never prints a message body: it emits one short line
+# and Grok's monitor tool). It never prints a message body: it emits one short line
 # per event on stdout, and the agent drains the spool with --await when it wakes.
 #
 #   MAIL   <id> unread=<bytes> spool=<path>   new bytes past the read cursor
@@ -1455,9 +1624,7 @@ preserve_mail() (
 cmd_watch() {
   local id="$1"
   is_direct "$id" && die "--watch needs a keeper's spool, and DIRECT mode has no keeper.
-    Run the feeder loop from the skill's reference/inotify-wake.md under the
-    harness's persistent Monitor instead (pp --listen $id --retry, appended to a
-    spool, one line per delivery)."
+    Direct mode is degraded: use an explicit foreground pp --listen $id --wait N."
   need_config
   valid_id "$id" || die "invalid id: '$id'"
   local side; side=$(my_side "$id")
@@ -1727,6 +1894,13 @@ cmd_close() {
   need_config
   valid_id "$id" || die "invalid id: '$id'"
   assert_owner "$id" "$label" "$adopt"
+  # Suppress local bells before tearing down transport or retaining pending mail.
+  # Both endpoints can belong to this machine's user manager.
+  local closingSide
+  for closingSide in a b; do
+    [ -f "$STATE_DIR/$id.$closingSide.owner" ] || continue
+    PP_SIDE="$closingSide" cmd_unwake "$id" || return 1
+  done
   bus "for s in a b; do
       if [ -f '$BUS_ROOT/$id/listening-'\$s ]; then
         printf '=== ping-pong %s | the other side CLOSED this channel ===\n' '$id' |
@@ -2061,7 +2235,7 @@ pp - ping-pong: an isolated message channel between two agent sessions.
 
   pp --keep <id>                  hold a reader for as long as THIS session lives
   pp --watch <id>                 persistent waker: one line per EVENT, never a body
-                                  (run it under the harness's Monitor; needs --keep)
+                                  (run under Grok monitor; use --whoami for your recipe)
   pp --await <id>                 BLOCK until new mail is in the spool, print, exit
   pp --unkeep <id>                stop the keeper, leave the channel open
 
@@ -2074,9 +2248,10 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   --await is what wakes the agent from there. Forgetting to relaunch --await
   costs a notification, not a message.
 
-  --watch removes the relaunching too: armed ONCE under a persistent Monitor, it
-  emits MAIL / KEEPER / GONE lines as events and the agent drains with --await.
-  Nothing has to be relaunched per turn and nothing is ever polled by a timer.
+  Receiver recipes: Claude backgrounds --await and reads its completed output;
+  Grok monitors --watch persistently and drains MAIL with --await; Codex arms
+  --wake and drains its fixed bell with --await. Local health checks do not
+  generate model turns without an event. Use --whoami to select the recipe.
 
   DIRECT MODE (no bus, no shell): both devices on a private mesh talk peer to
   peer over TCP. Your inbox is a port on YOUR machine, bound to the mesh
@@ -2104,6 +2279,9 @@ pp - ping-pong: an isolated message channel between two agent sessions.
   --close-abandoned  with --gc: close the channels whose owner session is gone
   --session-end [--reason R]  close every channel THIS session owns (SessionEnd hook)
 
+  --whoami        print harness, session identity and receiver recipe path
+  --wake <id>     arm Codex's supervised fixed bell (needs CODEX_THREAD_ID + --keep)
+  --unwake <id>   stop this side's bell; keep receiving into its spool
   --install       copy this script to ~/.local/bin/pp
   -h, --help      this help
   -V, --version   version
@@ -2115,7 +2293,8 @@ pp - ping-pong: an isolated message channel between two agent sessions.
        PP_WATCH_PULSE (30), PP_WATCH_PROBE (300), PP_SEND_GRACE (10),
        PP_KEEP_ON_END (SessionEnd reasons that do NOT close: "resume clear").
 
-  GOLDEN RULE: after being woken, DRAIN with --await, do the work, then reply.
+  Scope: maintain reception, handle information within the operator assignment.
+  Claude background await already drained; Codex/Grok drain after the bell.
   With a bare --listen (no keeper) relaunch it BEFORE you reply instead.
   A channel belongs to the SESSION that opened or joined it, not to the machine.
 EOF
@@ -2148,6 +2327,10 @@ while [ $# -gt 0 ]; do
     --setup) op="setup" ;;
     --mesh) op="mesh" ;;
     --install) op="install" ;;
+    --whoami) op="whoami" ;;
+    --wake) op="wake" ;;
+    --wake-run) op="wake-run" ;;
+    --unwake) op="unwake" ;;
     --bus-local|--bus-ssh) setup_args+=("$1") ;;
     -t|--topic) shift; topic="${1:-}" ;;
     -m|--message) shift; body="${1:-}" ;;
@@ -2178,6 +2361,15 @@ done
 case "$op" in
   setup) cmd_setup "${setup_args[@]:-}" "${id:-}" ;;
   install) cmd_install ;;
+  whoami) cmd_whoami ;;
+  wake|wake-run|unwake)
+    [ -n "$id" ] || die "--$op needs the channel id"
+    case "$op" in
+      wake) cmd_wake "$id" ;;
+      wake-run) cmd_wake_run "$id" ;;
+      unwake) assert_owner "$id" "$label" 0 && cmd_unwake "$id" ;;
+    esac
+    ;;
   mesh) cmd_mesh ;;
   gc) cmd_gc "$close_abandoned" ;;
   session-end) cmd_session_end "$reason" ;;

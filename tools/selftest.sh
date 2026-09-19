@@ -215,25 +215,41 @@ pid_reuse() {
 stale_await() {
   setup_receiver
   local oldReader oldOwner="claude:$(cat "$caseRoot/receiver/pid")" deadline
-  env PP_SESSION="$oldOwner" "$pp" --await "$channel" --wait 10 > "$caseRoot/old-reader.out" 2>&1 &
+  env PP_SESSION="$oldOwner" PP_AWAIT_POLL=10 "$pp" --await "$channel" --wait 40 > "$caseRoot/old-reader.out" 2>&1 &
   oldReader=$!
   actorPids+=("$oldReader")
-  deadline=$((SECONDS + 2))
-  while [ "$SECONDS" -lt "$deadline" ]; do kill -0 "$oldReader"; sleep 0.1; done
-  # Pause only outside the critical section, otherwise adoption would correctly
-  # wait for the suspended reader to release its lock.
-  deadline=$((SECONDS + 5))
-  while :; do
-    kill -STOP "$oldReader"
-    if flock -n "$XDG_STATE_HOME/ping-pong/$channel.a.mail-lock" true; then break; fi
-    kill -CONT "$oldReader"
-    [ "$SECONDS" -lt "$deadline" ]
-    sleep 0.1
-  done
+  # Pause in the idle sleep, not halfway through keeper_state: a suspended
+  # command substitution can otherwise cache "inactive" during adoption and
+  # exit 3 before exercising the ownership recheck at all.
+  local pauseTarget=
+  reader_sleeping() {
+    pauseTarget=$(python3 - "$oldReader" <<'TREE'
+from pathlib import Path
+import sys
+pending=[int(sys.argv[1])]
+while pending:
+    pid=pending.pop()
+    try:
+        children=Path(f'/proc/{pid}/task/{pid}/children').read_text().split()
+        for child in children:
+            if Path(f'/proc/{child}/comm').read_text().strip() == 'sleep':
+                print(pid)
+                raise SystemExit(0)
+            pending.append(int(child))
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+raise SystemExit(1)
+TREE
+    )
+  }
+  wait_until reader_sleeping
+  actorPids+=("$pauseTarget")
+  kill -STOP "$pauseTarget"
+  flock -n "$XDG_STATE_HOME/ping-pong/$channel.a.mail-lock" true
   start_actor claude replacement
   request replacement "$pp" --adopt "$channel"
   request replacement "$pp" --keep "$channel"
-  kill -CONT "$oldReader"
+  kill -CONT "$pauseTarget"
   send_mail belongs-to-replacement
   wait "$oldReader" || [ "$?" = 1 ]
   assert_absent '^belongs-to-replacement$' "$caseRoot/old-reader.out"
@@ -460,6 +476,10 @@ cleanup_case() {
     for side in a b; do
       systemctl --user stop "pp-wake-$channel-$side.service" >/dev/null 2>&1 || true
       systemctl --user reset-failed "pp-wake-$channel-$side.service" >/dev/null 2>&1 || true
+      local wakeState wakePid
+      wakeState=$(systemctl --user show "pp-wake-$channel-$side.service" -p ActiveState --value)
+      wakePid=$(systemctl --user show "pp-wake-$channel-$side.service" -p MainPID --value)
+      [ "$wakeState" = inactive ] && [ "$wakePid" = 0 ] || status=1
       systemctl --user stop "pp-keep-$channel-$side.service" >/dev/null 2>&1 || true
       systemctl --user reset-failed "pp-keep-$channel-$side.service" >/dev/null 2>&1 || true
       wait_until inactive "$side" || status=1
