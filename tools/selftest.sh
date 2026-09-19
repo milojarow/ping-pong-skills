@@ -316,6 +316,71 @@ leash_mail() {
   rg -q '^survives-owner-death$' "$caseRoot/recovered"
 }
 
+leash_close_race() {
+  # Keep production untouched: gate two existing operations in a private copy.
+  pp="$caseRoot/pp"
+  cp "$repo/skills/ping-pong/bin/pp" "$pp"
+  python3 - "$pp" <<'GATES'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); text=p.read_text()
+start=text.index('assert_owner() {'); end=text.index('\n# ',start)
+part=text[start:end]
+anchor='  if [ -n "${PP_SESSION_BIRTH:-}" ]; then\n'
+assert part.count(anchor)==1
+part=part.replace(anchor,'''  if [ -n "${PP_SESSION:-}" ] && [ -e "$STATE_DIR/test-listen-hold" ]; then
+    touch "$STATE_DIR/test-listen-held"
+    until [ -e "$STATE_DIR/test-listen-release" ]; do sleep 0.05; done
+  fi
+'''+anchor)
+text=text[:start]+part+text[end:]
+anchor='cmd_close() {\n'
+assert text.count(anchor)==1
+text=text.replace(anchor,anchor+'''  touch "$STATE_DIR/test-close-entered"
+  until [ -e "$STATE_DIR/test-close-release" ]; do sleep 0.05; done
+''')
+anchor='  say "pp: channel $id closed and deleted from the bus (active listeners were notified)"\n'
+assert text.count(anchor)==1
+text=text.replace(anchor,'  touch "$STATE_DIR/test-close-completed"\n'+anchor)
+p.write_text(text)
+GATES
+  testCloseRelease="$XDG_STATE_HOME/ping-pong/test-close-release"
+  setup_receiver
+  touch "$XDG_STATE_HOME/ping-pong/test-listen-hold"
+  send_mail retained-through-slow-close
+  wait_until test -e "$XDG_STATE_HOME/ping-pong/test-listen-held"
+  # A real peer listener must receive the close notice before the unit vanishes.
+  env XDG_STATE_HOME="$caseRoot/sender" "$pp" --listen "$channel" --wait 15 > "$caseRoot/peer-notice" &
+  local peerReader=$! deadline
+  actorPids+=("$peerReader")
+  wait_until test -f "$PP_BUS_ROOT/$channel/listening-b"
+  kill -TERM "$(cat "$caseRoot/receiver/pid")"
+  wait_until test -e "$XDG_STATE_HOME/ping-pong/test-close-entered"
+  touch "$XDG_STATE_HOME/ping-pong/test-listen-release"
+  # Negative control: a held close cannot coexist with a stopped keeper.
+  deadline=$((SECONDS + 2))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if ! active a; then
+      echo 'keeper stopped before close was released' >&2
+      test ! -d "$PP_BUS_ROOT/$channel" || echo 'channel still exists on the local bus' >&2
+      journalctl --user -u "pp-keep-$channel-a.service" --no-pager -n 12 -o cat >&2
+      return 1
+    fi
+    test -d "$PP_BUS_ROOT/$channel"
+    test ! -e "$XDG_STATE_HOME/ping-pong/test-close-completed"
+    sleep 0.05
+  done
+  touch "$testCloseRelease"
+  wait_until inactive a
+  test ! -d "$PP_BUS_ROOT/$channel"
+  test -e "$XDG_STATE_HOME/ping-pong/test-close-completed"
+  test -e "$XDG_STATE_HOME/ping-pong/$channel.a.closed"
+  wait "$peerReader"
+  rg -q 'the other side CLOSED this channel' "$caseRoot/peer-notice"
+  "$pp" --await "$channel" --wait 2 > "$caseRoot/recovered"
+  rg -qx retained-through-slow-close "$caseRoot/recovered"
+}
+
 whoami() {
   local harness
   for harness in claude codex grok; do
@@ -698,6 +763,7 @@ version() { bash "$repo/tools/check-version-chain.sh"; }
 
 cleanup_case() {
   local side pid status=0
+  [ -z "${testCloseRelease:-}" ] || touch "$testCloseRelease"
   # The channel may already have been deleted by a successful close/leash.
   # Its recorded id still names both units; a missing bus directory is not proof
   # that either cgroup has finished shutting down.
@@ -747,7 +813,7 @@ caseNames=(identity_claude identity_codex identity_grok identity_human \
   stale_await adopt_during_drain protected_unkeep leash_mail version \
   whoami wake_batch wake_retry wake_dead wake_reject install_links install_old install_refuse \
   nosession_live identity_spoof identity_override wake_nonblocking mail_sigkill wake_reject_grok wake_reject_claude \
-  install_scan identity_missing_birth session_end_hook)
+  install_scan identity_missing_birth session_end_hook leash_close_race)
 if [ "${1:-}" = --only ]; then
   shift
   [ "$#" -gt 0 ] || exit 2
