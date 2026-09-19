@@ -193,19 +193,30 @@ touch_activity() {
 # sessions share one user and one state dir, so the machine cannot distinguish
 # them. Walk up to the agent process; its pid is stable for that session's life.
 session_id() {
-  if [ -n "${PP_SESSION:-}" ]; then printf '%s' "$PP_SESSION"; return 0; fi
-  local p="$PPID" d=0 c
+  local p="$PPID" d=0 c detected=nosession identity birth
   while [ "${p:-0}" -gt 1 ] && [ "$d" -lt 15 ]; do
     c=$(cat "/proc/$p/comm" 2>/dev/null || true)
     case "$c" in
-      claude|codex|grok) printf '%s:%s' "$c" "$p"; return 0 ;;
+      claude|codex|grok) detected="$c:$p"; break ;;
     esac
     p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
     d=$((d+1))
   done
-  # Not launched from an agent session (a human at a shell). Ownership checks
-  # stay permissive rather than locking the operator out of his own channels.
-  printf 'nosession'
+  # A supervisor has no agent ancestor and must declare its live owner.
+  # An agent ancestor, however, cannot use that declaration to impersonate one.
+  if [ -n "${PP_SESSION:-}" ] && [ "$detected" != nosession ] && [ "$PP_SESSION" != "$detected" ]; then
+    die "declared session $PP_SESSION does not match process session $detected"
+  fi
+  identity=${PP_SESSION:-$detected}
+  if [ "$identity" != nosession ]; then
+    birth=$(session_birth "$identity") || die "declared session $identity is not a live process with the matching harness"
+    if [ -n "${PP_SESSION_BIRTH:-}" ] && [ "$birth" != "$PP_SESSION_BIRTH" ]; then
+      die "session $identity no longer has its declared birth fingerprint (process incarnation changed)"
+    fi
+  elif [ -n "${PP_SESSION_BIRTH:-}" ]; then
+    die "nosession cannot have a process birth fingerprint"
+  fi
+  printf '%s' "$identity"
 }
 
 session_birth() {
@@ -238,7 +249,7 @@ owner_alive() {
 
 cmd_whoami() {
   local identity harness recipe=none
-  identity=$(session_id)
+  identity=$(session_id) || return 1
   harness=${identity%%:*}
   case "$harness" in
     claude|codex|grok) recipe="$(dirname "$(self_path)")/../reference/harness-$harness.md"
@@ -379,7 +390,7 @@ claim_channel() (
 # machine-global.
 assert_owner() {
   local id="$1" label="$2" adopt="$3"
-  local me; me=$(session_id)
+  local me; me=$(session_id) || return 1
   local f; f=$(owner_file "$id") || return 1
 
   if [ ! -f "$f" ]; then claim_channel "$id" "$label"; return 0; fi
@@ -388,7 +399,6 @@ assert_owner() {
   owner=$(sed -n 's/^session=//p' "$f" | tr -d '[:space:]')
   owner_label=$(sed -n 's/^label=//p' "$f" | tr -d '[:space:]')
 
-  [ "$me" = "nosession" ] && return 0   # a human shell cannot be told apart; allow
   if [ -n "${PP_SESSION_BIRTH:-}" ]; then
     session_alive "$me" "$PP_SESSION_BIRTH" || die "session $me no longer has its recorded process incarnation"
   fi
@@ -410,6 +420,9 @@ assert_owner() {
     If this channel really is yours, take it over deliberately:  pp --adopt $id"
   fi
 
+  # A human can recover dead/unowned endpoints without claiming a live process
+  # or stopping the leash that is currently completing its own close.
+  [ "$me" = nosession ] && return 0
   cmd_unkeep "$id" >/dev/null 2>&1 || return 1
   claim_channel "$id" "$label"
   note "previous owner session ($owner) is gone - channel $id adopted by $me"
@@ -1369,11 +1382,11 @@ cmd_unwake() {
 }
 
 cmd_wake() {
-  local id="$1" PP_SIDE="${PP_SIDE:-}" owner birth thread binary unit keeper ready
+  local id="$1" adopt="${2:-0}" PP_SIDE="${PP_SIDE:-}" owner birth thread binary unit keeper ready
   valid_id "$id" || die "invalid id: '$id'"
   PP_SIDE=$(my_side "$id") || return 1
   is_direct "$id" && die "--wake requires a bus keeper; direct mode is degraded"
-  assert_owner "$id" "$(default_label)" 0 || return 1
+  assert_owner "$id" "$(default_label)" "$adopt" || return 1
   owner=$(session_id)
   [[ "$owner" = codex:* ]] || die "--wake is for a live Codex receiver; use --whoami"
   birth=$(session_birth "$owner") || die "owner session is gone"
@@ -1520,10 +1533,10 @@ cmd_wake_run() (
 # is still holding the reader, so the peer's sends keep succeeding and everything
 # that arrives is in the spool waiting for the next --await.
 cmd_await() (
-  local id="$1" wait_for="${2:-0}" PP_SIDE="${PP_SIDE:-}"
+  local id="$1" wait_for="${2:-0}" adopt="${3:-0}" PP_SIDE="${PP_SIDE:-}"
   need_config
   PP_SIDE=$(my_side "$id") || return 1
-  assert_owner "$id" "$(default_label)" 0 || return 1
+  assert_owner "$id" "$(default_label)" "$adopt" || return 1
   local readerOwner readerBirth ownerPath
   readerOwner=$(session_id)
   ownerPath=$(owner_file "$id")
@@ -1538,7 +1551,12 @@ cmd_await() (
     flock -x 8 || return 1
     # Adoption and draining share the same lock. An old waiter must not read
     # mail after ownership has moved, even if its process survived the handoff.
-    if [ "$readerOwner" != nosession ]; then
+    if [ "$readerOwner" = nosession ]; then
+      if owner_alive "$ownerPath"; then
+        note "channel $id belongs to a LIVE session ($(sed -n 's/^session=//p' "$ownerPath")); this waiter stops"
+        return 1
+      fi
+    else
       if [ "$(sed -n 's/^session=//p' "$ownerPath")" != "$readerOwner" ] ||
          [ "$(sed -n 's/^birth=//p' "$ownerPath")" != "$readerBirth" ] ||
          ! session_alive "$readerOwner" "$readerBirth"; then
@@ -2403,6 +2421,9 @@ done
 
 [ -n "$label" ] || label=$(default_label)
 [ "$install_check" = 0 ] || [ "$op" = install ] || die "--check only applies to --install"
+# Fail in the main shell before any operation: errors inside $(session_id)
+# otherwise exit only the substitution and can be ignored by its caller.
+session_id >/dev/null || exit 1
 
 case "$op" in
   setup) cmd_setup "${setup_args[@]:-}" "${id:-}" ;;
@@ -2411,9 +2432,9 @@ case "$op" in
   wake|wake-run|unwake)
     [ -n "$id" ] || die "--$op needs the channel id"
     case "$op" in
-      wake) cmd_wake "$id" ;;
+      wake) cmd_wake "$id" "$adopt" ;;
       wake-run) cmd_wake_run "$id" ;;
-      unwake) assert_owner "$id" "$label" 0 && cmd_unwake "$id" ;;
+      unwake) assert_owner "$id" "$label" "$adopt" && cmd_unwake "$id" ;;
     esac
     ;;
   mesh) cmd_mesh ;;
@@ -2429,12 +2450,12 @@ case "$op" in
     ;;
   unkeep)
     [ -n "$id" ] || die "--unkeep needs the channel id"
-    assert_owner "$id" "$label" 0 || exit 1
+    assert_owner "$id" "$label" "$adopt" || exit 1
     cmd_unkeep "$id"
     ;;
   await)
     [ -n "$id" ] || die "--await needs the channel id"
-    cmd_await "$id" "$wait_for"
+    cmd_await "$id" "$wait_for" "$adopt"
     ;;
   watch)
     [ -n "$id" ] || die "--watch needs the channel id"
