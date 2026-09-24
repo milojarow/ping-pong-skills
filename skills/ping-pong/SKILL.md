@@ -1,6 +1,6 @@
 ---
 name: ping-pong
-description: Open or join an isolated live channel between Claude, Codex or Grok sessions; handle peer information within the operator's assignment and diagnose delivery failures on request.
+description: Open or join an isolated live channel between Claude, Codex, Grok or Hermes sessions; handle peer information within the operator's assignment and diagnose delivery failures on request.
 when_to_use: Trigger phrases — "abre un canal", "comunícate con la otra terminal", "habla con <la otra máquina>", "ping-pong", "🏓", "trabajen en conjunto", "se cayó la shell", or the operator hands over a `pp-xxxxxx` channel id to join.
 argument-hint: "[pp-xxxxxx] [--direct --peer <mesh-ip>]"
 arguments: [channel]
@@ -40,8 +40,9 @@ Usa el bus para todas las parejas, incluso en la misma máquina y usuario. Sin i
 | Claude Code | `--open`/`--join`, `--keep`; `--await` en Bash con `run_in_background: true` | Aviso de tarea con salida o ruta. Leer esa salida: ya contiene el cuerpo drenado. | Un nuevo await de fondo tras cada entrega. Cierre y propiedad según la receta. Sin Bash de fondo: await acotado en primer plano. |
 | Codex | `--open`/`--join`, `--keep`, `--wake` desde su TUI con `CODEX_THREAD_ID` | Turno de usuario con timbre fijo local. Drenar con `--await`. El cuerpo del peer llega como salida de herramienta. | El disparador permanece armado, un timbre por cursor sin drenar. Sin queue/thread/systemd: await acotado, sin despertar automático. |
 | Grok | `--open`/`--join`, `--keep`; `monitor` con `persistent: true` sobre `--watch` | Evento `MAIL` con texto dentro. Drenar con await en primer plano. | Monitor permanece armado. Si termina y el canal sigue vivo, rearmar. Sin monitor: await acotado; el fin de comando de fondo exige pedir su salida. |
+| Hermes | `--open`/`--join`, `--keep`; `--await` en `terminal` con `background: true, notify: true` | Aviso `[IMPORTANT: Background process …]` cuyo `Output:` ya trae el cuerpo drenado. | Un nuevo await de fondo tras cada entrega. Gateway y `-q` no distinguen sesiones o no drenan avisos: modo degradado. |
 
-Claude↔Claude, Codex↔Codex y Grok↔Grok aplican la misma fila en ambos extremos. Claude↔Codex, Claude↔Grok y Codex↔Grok son la suma de las dos filas correspondientes: cada receptor mantiene su propia receta.
+Dos receptores iguales aplican la misma fila en ambos extremos. Un par mixto (p. ej. Claude↔Hermes) es la suma de las dos filas correspondientes: cada receptor mantiene su propia receta.
 
 ## Enviar y cerrar
 
@@ -59,7 +60,7 @@ El modo directo solo se usa si el operador lo pide: sin keeper, spool ni dispara
 
 ## Referencias
 
-- Recetas: [Claude](reference/harness-claude.md), [Codex](reference/harness-codex.md), [Grok](reference/harness-grok.md).
+- Recetas: [Claude](reference/harness-claude.md), [Codex](reference/harness-codex.md), [Grok](reference/harness-grok.md), [Hermes](reference/harness-hermes.md).
 - Primera configuración o flags: [CLI](reference/pp-cli.md).
 - Un envío no llegó: [diagnóstico](reference/troubleshooting.md).
 - Semántica del bus: [protocolo](reference/protocol.md).

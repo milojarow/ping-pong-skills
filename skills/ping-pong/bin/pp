@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-PP_VERSION="1.4.1"
+PP_VERSION="1.5.0"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ping-pong"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -197,7 +197,7 @@ session_id() {
   while [ "${p:-0}" -gt 1 ] && [ "$d" -lt 15 ]; do
     c=$(cat "/proc/$p/comm" 2>/dev/null || true)
     case "$c" in
-      claude|codex|grok) detected="$c:$p"; break ;;
+      claude|codex|grok|hermes) detected="$c:$p"; break ;;
     esac
     p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
     d=$((d+1))
@@ -224,7 +224,7 @@ session_id() {
 
 session_birth() {
   local identity="$1" pid harness stat boot
-  [[ "$identity" =~ ^(claude|codex|grok):([0-9]+)$ ]] || return 1
+  [[ "$identity" =~ ^(claude|codex|grok|hermes):([0-9]+)$ ]] || return 1
   harness=${identity%%:*}; pid=${identity#*:}
   [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "$harness" ] || return 1
   IFS= read -r stat < "/proc/$pid/stat" 2>/dev/null || return 1
@@ -255,7 +255,7 @@ cmd_whoami() {
   identity=$(session_id) || return 1
   harness=${identity%%:*}
   case "$harness" in
-    claude|codex|grok) recipe="$(dirname "$(self_path)")/../reference/harness-$harness.md"
+    claude|codex|grok|hermes) recipe="$(dirname "$(self_path)")/../reference/harness-$harness.md"
       recipe=$(realpath -m "$recipe") ;;
     nosession) : ;;
     *) harness=unknown ;;
@@ -1183,7 +1183,7 @@ cmd_keep() {
   assert_owner "$id" "$label" "$adopt"
 
   local owner; owner=$(session_id)
-  local birth; birth=$(session_birth "$owner") || die "keeper requires a live claude, codex or grok session (got $owner)"
+  local birth; birth=$(session_birth "$owner") || die "keeper requires a live claude, codex, grok or hermes session (got $owner)"
   local side; side=$(my_side "$id")
   local unit; unit=$(keeper_unit "$id" "$side")
   local self; self=$(self_path)

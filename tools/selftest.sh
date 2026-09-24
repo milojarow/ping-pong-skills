@@ -31,7 +31,7 @@ while IFS= read -r request <&3; do
   printf '%s\n' "$?" > "$request.rc"
 done
 ACTOR
-for harness in claude codex grok; do
+for harness in claude codex grok hermes; do
   cp "$testRoot/bin/actor" "$testRoot/bin/$harness"
   chmod +x "$testRoot/bin/$harness"
 done
@@ -114,6 +114,7 @@ identity() {
 identity_claude() { identity claude; }
 identity_codex() { identity codex; }
 identity_grok() { identity grok; }
+identity_hermes() { identity hermes; }
 identity_human() {
   "$pp" --open --topic human > "$caseRoot/human.out"
   rg -q 'session nosession' "$caseRoot/human.out"
@@ -136,6 +137,7 @@ keeper() {
 }
 keeper_codex() { keeper codex; }
 keeper_grok() { keeper grok; }
+keeper_hermes() { keeper hermes; }
 
 same_machine() {
   start_actor claude first
@@ -390,7 +392,7 @@ leash_self_adopt() { leash_race after-birth; }
 
 whoami() {
   local harness
-  for harness in claude codex grok; do
+  for harness in claude codex grok hermes; do
     start_actor "$harness" "$harness"
     request "$harness" "$pp" --whoami
     rg -qx "harness=$harness" "$lastRequest.out"
@@ -815,8 +817,8 @@ if [ "${1:-}" = --case ]; then
 fi
 
 failures=0
-caseNames=(identity_claude identity_codex identity_grok identity_human \
-  keeper_codex keeper_grok same_machine mail_restart mail_concurrent mail_close pid_reuse \
+caseNames=(identity_claude identity_codex identity_grok identity_hermes identity_human \
+  keeper_codex keeper_grok keeper_hermes same_machine mail_restart mail_concurrent mail_close pid_reuse \
   stale_await adopt_during_drain protected_unkeep leash_mail version \
   whoami wake_batch wake_retry wake_dead wake_reject install_links install_old install_refuse \
   nosession_live identity_spoof identity_override wake_nonblocking mail_sigkill wake_reject_grok wake_reject_claude \

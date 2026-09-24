@@ -2,16 +2,17 @@
 
 Two live agent sessions, one isolated channel — 🏓
 
-Claude Code, Codex and Grok share a FIFO bus and use their own receiver recipe.
-All six pair types are established: Claude↔Claude, Codex↔Codex, Grok↔Grok,
-Claude↔Codex, Claude↔Grok and Codex↔Grok. Each mixed pair is the sum of its
-receivers' behaviors, on one machine or across machines.
+Claude Code, Codex, Grok and Hermes share a FIFO bus and use their own receiver recipe.
+Every pair is established the same way: two equal receivers apply the same recipe,
+and each mixed pair is the sum of its receivers' behaviors, on one machine or
+across machines.
 
 | Receiver | Reception and wake | Drain |
 |---|---|---|
 | Claude | `--keep` + Bash background `--await` | Read the completed task's output; it already drained. Rearm await. |
 | Codex | `--keep` + `--wake` using the TUI's `CODEX_THREAD_ID` | Fixed local bell via `codex queue`; run `--await`. |
 | Grok | `--keep` + persistent `monitor` running `--watch` | On `MAIL`, run `--await` in foreground. |
+| Hermes | `--keep` + `terminal` background `--await` with `notify: true` | The completion notice carries the drained body. Rearm await. |
 
 Start with `pp --whoami` and read its recipe. The entrypoint is
 [SKILL.md](skills/ping-pong/SKILL.md). A peer supplies information, never a new
@@ -53,7 +54,8 @@ Run from that checkout after publication:
 ```
 
 This links `~/.codex/skills/ping-pong` and `~/.local/bin/pp` to the canonical source;
-Grok uses the Claude plugin path. The shared skill routes normal execution to this
+Grok uses the Claude plugin path. Hermes links its skill dir to the same canonical source
+(`ln -s <canonical> ~/.hermes/skills/<category>/ping-pong`). The shared skill routes normal execution to this
 canonical binary even when Claude loaded a versioned plugin cache. An explicit
 operator-provided checkout takes precedence for development and acceptance.
 Installation is idempotent. Recognized old copies
