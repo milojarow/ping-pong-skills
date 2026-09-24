@@ -166,9 +166,9 @@ Meanwhile the versioned cache on the same disk held **eleven** snapshots topping
 behind what was installed — and several of those snapshots carry a `PP_VERSION` older than the
 directory containing them, which is the version-chain drift fossilised release by release.
 
-Session restart is still the only way to repin the *announced* directory. It is no longer the only
-remedy, because the skill now tells the agent not to depend on that directory at all, and to run
-`--version` once per session and believe it.
+Session restart is still the only way to repin the *announced* directory, and it is not the only
+remedy: the skill resolves `pp` from the marketplace checkout (or `~/.local/bin/pp`), never from
+that directory, and `pp --version` says which build is running when that matters.
 
 What is still **not** built: a self-check that warns when a newer build exists alongside the running
 one. `--version` makes the fact visible on demand; nothing volunteers it.
@@ -373,9 +373,9 @@ waits on: a process that never exits can never deliver a wake-up. The two roles 
 one loop holds the FIFO open and spools whatever arrives; a second, disposable one blocks
 on the spool and exits on the first new line, which is what the harness actually watches.
 
-Session end has the same shape of gap on the other requirement. The plugin ships no hooks
-today (no `hooks/hooks.json`, no `hooks` key in `plugin.json`), so nothing runs when a
-session ends. The listener already dies with its session; the channel object does not, and
+Session end had the same shape of gap on the other requirement. Before
+`hooks/sessionend-close-channels.sh` shipped the plugin had no hooks, so nothing ran when a
+session ended. The listener already dies with its session; the channel object does not, and
 the next session to see that id adopts it with no friction (the dead-owner case ownership
 was built to make findable, not to prevent). A `SessionEnd` hook that closes only the
 channels this session owns would close it on a clean exit — bus mode's `--close` already
@@ -387,9 +387,9 @@ will refuse forever. The fix for that transport is a best-effort one-shot notice
 peer's inbox before forgetting the local record, treating a refused connection as
 confirmation the peer is already gone, not as an error to abort on.
 
-Open question to verify empirically before shipping the hook, not to guess: which values a
-`SessionEnd` hook's `reason` field can take, and which of them must **not** close the
-channel — a `resume` has to find its channel still there.
+Settled when the hook shipped: `PP_KEEP_ON_END` (default `resume clear`) lists the
+`SessionEnd` reasons that must **not** close the channel — a `resume` has to find its
+channel still there.
 
 What a `SessionEnd` hook cannot reach: a hard kill, a crash, a lid closed mid-session.
 Nothing fires there, and the channel is left exactly as it is today. The shape of a
@@ -490,23 +490,10 @@ on disk, but never `.inbox` / `.cursor`. Arming a watch on a spool that will nev
 leaves it silent forever, which is indistinguishable from a quiet peer — the exact failure mode
 the design document warns about for a different cause.
 
-The shape a fix would take, if `--keep` is not extended to direct mode (see the gap above): a
-user-built loop that plays the keeper's role without any change to `bin/pp` — repeatedly runs
-`pp --listen <id> --retry`, appends whatever it returns to a local spool file, and emits only
-the ring (channel, sender, line count, spool path) on stdout, the same contract
-`inotify-wake.md` already asks of any watcher. Run under a harness's persistent Monitor (not a
-bare background loop — see the standing-listener gap already on file for why that matters), it
-is leashed to the session's own lifetime and never becomes the immortal loop the SKILL.md
-prohibits, and inotify becomes unnecessary because the loop already knows the instant mail
-lands. All of `inotify-wake.md`'s correctness rules still apply verbatim to this variant:
-nanosecond-named captures, drain-before-arm, notify only on non-empty, and emit on failure too
-(a non-zero `--listen` exit, or three empty 0-exit reads in a row — the signature of a second
-reader stealing delivery).
-
-**Do not document this loop as a shipped `--keep`-equivalent** — it is a pattern to build per
-session, not a flag `bin/pp` has. Since 1.1.0 `--watch` refuses on a direct channel with a
-message that names this feeder loop, so an agent cannot arm a watch on a spool that will never
-exist; the gap itself (a real keeper for direct mode) is unchanged.
+There is no workaround to build: 1.4.0 retired the per-session feeder loop this section used
+to sketch, and direct mode is explicitly degraded — bounded foreground `--listen --wait N`
+only (`reference/direct-mode.md`). `--watch` refuses on a direct channel and says exactly
+that. The gap itself (a real keeper for direct mode) is unchanged.
 
 ## Known gap: local channel state inherits the process umask instead of a fixed private mode
 
